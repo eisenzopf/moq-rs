@@ -59,8 +59,10 @@ pub struct PublishNamespace {
 }
 
 impl PublishNamespace {
+    /// Create a PublishNamespace without sending on the control stream.
+    /// The caller sends via a bidi request stream (draft-18).
     pub(super) fn new(
-        mut publisher: Publisher,
+        publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,
     ) -> (PublishNamespace, PublishNamespaceRecv) {
@@ -68,13 +70,23 @@ impl PublishNamespace {
             request_id,
             namespace: namespace.clone(),
         };
+        Self::from_parts(publisher, info, request_id)
+    }
 
-        publisher.send_message(message::PublishNamespace {
-            id: request_id,
-            track_namespace: namespace.clone(),
+    /// Return the wire message to send on the request stream.
+    pub(super) fn wire_message(&self) -> message::PublishNamespace {
+        message::PublishNamespace {
+            id: self.info.request_id,
+            track_namespace: self.info.namespace.clone(),
             params: Default::default(),
-        });
+        }
+    }
 
+    fn from_parts(
+        publisher: Publisher,
+        info: PublishNamespaceInfo,
+        request_id: u64,
+    ) -> (PublishNamespace, PublishNamespaceRecv) {
         let (send, recv) = State::default().split();
 
         let send = Self {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -19,8 +19,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishNamespace, PublishNamespaceRecv, RequestId, RequestIdAllocation, Session, SessionError,
-    Subscribed, SubscribedRecv, TrackStatusRequested,
+    PublishNamespace, PublishNamespaceRecv, RequestId, Session, SessionError, Subscribed,
+    SubscribedRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -58,6 +58,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Channel for sending spawned bidi reader task handles to Session::run.
+    bidi_task_tx: super::BidiTaskSender,
 }
 
 impl Publisher {
@@ -66,6 +69,7 @@ impl Publisher {
         webtransport: web_transport::Session,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
+        bidi_task_tx: super::BidiTaskSender,
     ) -> Self {
         Self {
             webtransport,
@@ -77,6 +81,7 @@ impl Publisher {
             outgoing,
             request_id,
             mlog,
+            bidi_task_tx,
         }
     }
 
@@ -98,33 +103,74 @@ impl Publisher {
 
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
     /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
+    ///
+    /// Draft-18: sends PUBLISH_NAMESPACE on a new bidi request stream and reads
+    /// responses from the same stream.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        let publish_ns = match self
-            .publish_namespaces
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .entry(tracks.namespace.clone())
-        {
-            // Duplicate PUBLISH_NAMESPACE for the same namespace is a protocol error.
-            hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
+        // Phase 1: allocate under lock, release before any await.
+        let (publish_ns, wire_msg, request_id) = {
+            let mut namespaces = self
+                .publish_namespaces
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
 
-            hash_map::Entry::Vacant(entry) => {
-                // Allocate a request ID, enforcing the peer-advertised maximum.
-                let request_id = match self.request_id.allocate()? {
-                    RequestIdAllocation::Allocated(id) => id,
-                    blocked @ RequestIdAllocation::Blocked { .. } => {
-                        if let Some(msg) = blocked.requests_blocked() {
-                            let _ = self.outgoing.push(msg.into());
-                        }
-                        return Err(SessionError::TooManyRequests);
-                    }
-                };
-                let (send, recv) =
-                    PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
-                entry.insert(recv);
-                send
+            if namespaces.contains_key(&tracks.namespace) {
+                return Err(ServeError::Duplicate.into());
+            }
+
+            let request_id = self.request_id.allocate()?;
+            let (send, recv) =
+                PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
+            namespaces.insert(tracks.namespace.clone(), recv);
+            let wire_msg: Message = send.wire_message().into();
+            (send, wire_msg, request_id)
+        };
+        // Lock released here.
+
+        // Phase 2: open bidi stream and send (async, no lock held).
+        // If open_bi fails, remove the entry we inserted in Phase 1.
+        let (send_stream, recv_stream) = match self.webtransport.open_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                if let Ok(mut ns) = self.publish_namespaces.lock() {
+                    ns.remove(&tracks.namespace);
+                }
+                return Err(e.into());
             }
         };
+        let mut writer = super::Writer::new(send_stream);
+        if let Err(e) = writer.encode(&wire_msg).await {
+            if let Ok(mut ns) = self.publish_namespaces.lock() {
+                ns.remove(&tracks.namespace);
+            }
+            return Err(e.into());
+        }
+
+        // Spawn a reader task for responses on this bidi stream.
+        // Draft-18: responses omit Request ID (the stream identity provides it).
+        // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
+        let mut this = self.clone();
+        let bidi_request_id = request_id;
+        let handle = tokio::spawn(async move {
+            let mut reader = super::Reader::new(recv_stream);
+            loop {
+                match Session::decode_bidi_response(&mut reader, bidi_request_id).await {
+                    Ok(msg) => {
+                        if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
+                            if let Err(e) = this.recv_message(sub_msg) {
+                                tracing::warn!(error = %e, "error handling bidi response");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, bidi_request_id, "bidi response reader ended");
+                        break;
+                    }
+                }
+            }
+        });
+        let _ = self.bidi_task_tx.send(handle);
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
