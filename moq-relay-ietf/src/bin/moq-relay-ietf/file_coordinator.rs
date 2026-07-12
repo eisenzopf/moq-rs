@@ -7,7 +7,7 @@
 //! namespace registration across multiple relay instances. No separate
 //! server process is required.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,12 +22,12 @@ use fs2::FileExt;
 use moq_native_ietf::quic::Client;
 use moq_transport::coding::{TrackNamespace, TupleField};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorError, CoordinatorResult, NamespaceInfo, NamespaceOrigin,
-    NamespaceRegistration, NamespaceSubscription,
+    NamespaceRegistration, NamespaceSubscription, NamespaceUpdate, NamespaceUpdateSender,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +68,8 @@ struct FileCoordinatorCapacityError {
 const COORDINATOR_DATA_VERSION: u8 = 1;
 const NAMESPACE_KEY_PREFIX: &str = "v1:";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const NAMESPACE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_NAMESPACE_UPDATE_QUEUE_CAPACITY: usize = 256;
 
 /// Data stored in the shared file
 #[derive(Debug, Serialize, Deserialize)]
@@ -222,6 +224,17 @@ struct NamespaceUnregisterHandle {
     worker: Arc<FileCleanupWorker>,
 }
 
+/// Cancels a bounded namespace watcher when the owning subscription drops.
+struct NamespaceSubscriptionHandle {
+    cancel: watch::Sender<bool>,
+}
+
+impl Drop for NamespaceSubscriptionHandle {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+    }
+}
+
 impl Drop for NamespaceUnregisterHandle {
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
@@ -321,6 +334,118 @@ fn read_data(file: &File, limits: FileCoordinatorLimits) -> Result<CoordinatorDa
     Ok(data)
 }
 
+fn matching_namespaces_sync(
+    file_path: &Path,
+    scope_key: &str,
+    prefix: &TrackNamespace,
+    limits: FileCoordinatorLimits,
+) -> Result<Vec<NamespaceInfo>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(file_path)?;
+    file.lock_shared()?;
+    let data = read_data(&file, limits)?;
+    let mut matches = Vec::new();
+    if let Some(bucket) = data.namespaces.get(scope_key) {
+        for key in bucket.keys() {
+            let namespace = CoordinatorData::namespace_from_key(key)?;
+            let is_match = prefix.fields.len() <= namespace.fields.len()
+                && prefix
+                    .fields
+                    .iter()
+                    .zip(&namespace.fields)
+                    .all(|(expected, actual)| expected == actual);
+            if is_match {
+                matches.push(NamespaceInfo::new(namespace));
+            }
+        }
+    }
+    file.unlock()?;
+    matches.sort_by(|left, right| {
+        left.namespace
+            .to_utf8_path()
+            .cmp(&right.namespace.to_utf8_path())
+    });
+    Ok(matches)
+}
+
+struct NamespaceWatcherConfig {
+    file_path: PathBuf,
+    scope_key: String,
+    prefix: TrackNamespace,
+    limits: FileCoordinatorLimits,
+}
+
+async fn supervise_namespace_updates(
+    config: NamespaceWatcherConfig,
+    mut known: HashSet<TrackNamespace>,
+    updates: NamespaceUpdateSender,
+    mut cancel: watch::Receiver<bool>,
+    _capacity: OwnedSemaphorePermit,
+) {
+    let mut interval = tokio::time::interval(NAMESPACE_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {}
+        }
+
+        let poll_path = config.file_path.clone();
+        let poll_scope = config.scope_key.clone();
+        let poll_prefix = config.prefix.clone();
+        let limits = config.limits;
+        let current = match tokio::task::spawn_blocking(move || {
+            matching_namespaces_sync(&poll_path, &poll_scope, &poll_prefix, limits)
+        })
+        .await
+        {
+            Ok(Ok(current)) => current,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "namespace subscription polling failed closed");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "namespace subscription polling task failed closed");
+                return;
+            }
+        };
+        let current: HashSet<_> = current.into_iter().map(|info| info.namespace).collect();
+
+        let mut added: Vec<_> = current.difference(&known).cloned().collect();
+        let mut removed: Vec<_> = known.difference(&current).cloned().collect();
+        added.sort_by_key(TrackNamespace::to_utf8_path);
+        removed.sort_by_key(TrackNamespace::to_utf8_path);
+
+        for namespace in added {
+            if updates
+                .try_send(NamespaceUpdate::Added(NamespaceInfo::new(namespace)))
+                .is_err()
+            {
+                return;
+            }
+        }
+        for namespace in removed {
+            if updates
+                .try_send(NamespaceUpdate::Removed(NamespaceInfo::new(namespace)))
+                .is_err()
+            {
+                return;
+            }
+        }
+        known = current;
+    }
+}
+
 /// Write coordinator data to file
 fn write_data(file: &File, data: &CoordinatorData, limits: FileCoordinatorLimits) -> Result<()> {
     anyhow::ensure!(
@@ -357,6 +482,7 @@ pub struct FileCoordinator {
     relay_url: Url,
     limits: FileCoordinatorLimits,
     cleanup_capacity: Arc<Semaphore>,
+    subscription_capacity: Arc<Semaphore>,
     cleanup_worker: Arc<FileCleanupWorker>,
     #[cfg(test)]
     registration_commit_hook: Option<RegistrationCommitHook>,
@@ -373,6 +499,7 @@ impl FileCoordinator {
         Ok(Self {
             cleanup_worker: FileCleanupWorker::new(file_path.clone(), limits)?,
             cleanup_capacity: Arc::new(Semaphore::new(limits.max_entries)),
+            subscription_capacity: Arc::new(Semaphore::new(limits.max_entries)),
             file_path,
             relay_url,
             limits,
@@ -583,55 +710,63 @@ impl Coordinator for FileCoordinator {
         scope: Option<&str>,
         prefix: &TrackNamespace,
     ) -> CoordinatorResult<NamespaceSubscription> {
+        let capacity = self
+            .subscription_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::CapacityExhausted {
+                resource: "file_namespace_subscriptions",
+            })?;
         let prefix = prefix.clone();
         let scope_key = CoordinatorData::scope_key(scope);
         let file_path = self.file_path.clone();
         let limits = self.limits;
 
-        let existing = tokio::task::spawn_blocking(move || -> Result<Vec<NamespaceInfo>> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&file_path)?;
-            file.lock_shared()?;
-            let data = read_data(&file, limits)?;
-            let mut matches = Vec::new();
-            if let Some(bucket) = data.namespaces.get(&scope_key) {
-                for key in bucket.keys() {
-                    let namespace = CoordinatorData::namespace_from_key(key)?;
-                    let is_match = prefix.fields.len() <= namespace.fields.len()
-                        && prefix
-                            .fields
-                            .iter()
-                            .zip(&namespace.fields)
-                            .all(|(expected, actual)| expected == actual);
-                    if is_match {
-                        matches.push(NamespaceInfo::new(namespace));
-                    }
-                }
-            }
-            file.unlock()?;
-            matches.sort_by(|left, right| {
-                left.namespace
-                    .to_utf8_path()
-                    .cmp(&right.namespace.to_utf8_path())
-            });
-            Ok(matches)
+        let initial_path = file_path.clone();
+        let initial_scope = scope_key.clone();
+        let initial_prefix = prefix.clone();
+        let existing = tokio::task::spawn_blocking(move || {
+            matching_namespaces_sync(&initial_path, &initial_scope, &initial_prefix, limits)
         })
         .await??;
+        let known = existing.iter().map(|info| info.namespace.clone()).collect();
+        let (cancel, cancel_receiver) = watch::channel(false);
+        let update_capacity = limits
+            .max_entries
+            .clamp(1, MAX_NAMESPACE_UPDATE_QUEUE_CAPACITY);
+        let (subscription, updates) = NamespaceSubscription::bounded(
+            existing,
+            NamespaceSubscriptionHandle { cancel },
+            update_capacity,
+        );
+        tokio::spawn(supervise_namespace_updates(
+            NamespaceWatcherConfig {
+                file_path,
+                scope_key,
+                prefix,
+                limits,
+            },
+            known,
+            updates,
+            cancel_receiver,
+            capacity,
+        ));
 
-        // The file coordinator currently provides a consistent current
-        // snapshot. The returned lease keeps the API ready for a persistent
-        // cross-relay interest registration without changing callers.
-        Ok(NamespaceSubscription::new(existing, ()))
+        Ok(subscription)
     }
 
     async fn shutdown(&self) -> CoordinatorResult<()> {
         let wait = async {
-            while self.cleanup_capacity.available_permits() < self.limits.max_entries {
-                self.cleanup_worker.notify.notified().await;
+            loop {
+                if self.cleanup_capacity.available_permits() == self.limits.max_entries
+                    && self.subscription_capacity.available_permits() == self.limits.max_entries
+                {
+                    return;
+                }
+                tokio::select! {
+                    _ = self.cleanup_worker.notify.notified() => {},
+                    _ = tokio::time::sleep(NAMESPACE_POLL_INTERVAL) => {},
+                }
             }
         };
         tokio::time::timeout(CLEANUP_TIMEOUT, wait)
@@ -748,6 +883,85 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.existing_namespaces.len(), 1);
         assert_eq!(snapshot.existing_namespaces[0].namespace, matching);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_subscription_streams_file_additions_and_removals() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = FileCoordinator::with_limits(
+            directory.path().join("coordinator.json"),
+            relay_url(),
+            FileCoordinatorLimits::default(),
+        )
+        .unwrap();
+        let prefix = TrackNamespace::from_utf8_path("shows/live");
+        let namespace = TrackNamespace::from_utf8_path("shows/live/clock");
+        let mut subscription = coordinator
+            .subscribe_namespace(Some("tenant-a"), &prefix)
+            .await
+            .unwrap();
+        assert!(subscription.existing_namespaces.is_empty());
+
+        let registration = coordinator
+            .register_namespace(Some("tenant-a"), &namespace)
+            .await
+            .unwrap();
+        let added = tokio::time::timeout(Duration::from_secs(2), subscription.next_update())
+            .await
+            .expect("file watcher did not publish namespace addition")
+            .unwrap();
+        assert_eq!(
+            added,
+            NamespaceUpdate::Added(NamespaceInfo::new(namespace.clone()))
+        );
+
+        drop(registration);
+        let removed = tokio::time::timeout(Duration::from_secs(2), subscription.next_update())
+            .await
+            .expect("file watcher did not publish namespace removal")
+            .unwrap();
+        assert_eq!(
+            removed,
+            NamespaceUpdate::Removed(NamespaceInfo::new(namespace))
+        );
+        drop(subscription);
+        coordinator.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn namespace_subscription_capacity_is_bounded_and_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = FileCoordinator::with_limits(
+            directory.path().join("coordinator.json"),
+            relay_url(),
+            FileCoordinatorLimits {
+                max_entries: 1,
+                max_bytes: 4_096,
+            },
+        )
+        .unwrap();
+        let prefix = TrackNamespace::from_utf8_path("shows/live");
+        let first = coordinator
+            .subscribe_namespace(Some("tenant-a"), &prefix)
+            .await
+            .unwrap();
+        assert!(matches!(
+            coordinator
+                .subscribe_namespace(Some("tenant-a"), &prefix)
+                .await,
+            Err(CoordinatorError::CapacityExhausted {
+                resource: "file_namespace_subscriptions"
+            })
+        ));
+
+        drop(first);
+        coordinator.shutdown().await.unwrap();
+        let second = coordinator
+            .subscribe_namespace(Some("tenant-a"), &prefix)
+            .await
+            .unwrap();
+        drop(second);
+        coordinator.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

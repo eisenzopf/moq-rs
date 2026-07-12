@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
+use tokio::sync::{mpsc, watch};
 use url::Url;
 
 use crate::AdmissionDecision;
@@ -217,8 +218,14 @@ pub struct ScopeConfig {
 /// On drop, cleanup is performed (e.g., unregistering from the coordinator).
 pub struct NamespaceSubscription {
     /// Namespaces that currently match the subscribed prefix.
-    /// The relay should send PUBLISH_NAMESPACE for each of these.
+    /// The relay should send NAMESPACE for each of these after accepting the
+    /// SUBSCRIBE_NAMESPACE request.
     pub existing_namespaces: Vec<NamespaceInfo>,
+
+    /// Bounded stream of namespace additions and withdrawals after the
+    /// initial snapshot. The relay must keep consuming this stream for the
+    /// lifetime of the request.
+    updates: NamespaceUpdateReceiver,
 
     /// RAII handle — drop triggers unsubscription cleanup.
     _registration: Box<dyn Send + Sync>,
@@ -226,19 +233,161 @@ pub struct NamespaceSubscription {
 
 impl Default for NamespaceSubscription {
     fn default() -> Self {
+        let (updates, registration) = NamespaceUpdateReceiver::pending();
         Self {
             existing_namespaces: vec![],
-            _registration: Box::new(()),
+            updates,
+            _registration: Box::new(registration),
         }
     }
 }
 
 impl NamespaceSubscription {
-    /// Create a new subscription with existing namespaces and a cleanup handle.
+    /// Create a snapshot-only subscription with a cleanup handle.
+    ///
+    /// This compatibility constructor keeps the update stream pending. New
+    /// coordinator implementations should use [`Self::bounded`] so namespace
+    /// changes are delivered for the full request lifetime.
     pub fn new<T: Send + Sync + 'static>(existing: Vec<NamespaceInfo>, inner: T) -> Self {
+        let (updates, pending) = NamespaceUpdateReceiver::pending();
         Self {
             existing_namespaces: existing,
-            _registration: Box::new(inner),
+            updates,
+            _registration: Box::new((inner, pending)),
+        }
+    }
+
+    /// Create a subscription backed by a bounded update stream.
+    ///
+    /// Returns the subscription and a clonable non-blocking sender for the
+    /// coordinator. If the consumer falls behind and the bounded queue fills,
+    /// the stream fails closed instead of silently omitting discovery state.
+    pub fn bounded<T: Send + Sync + 'static>(
+        existing: Vec<NamespaceInfo>,
+        inner: T,
+        capacity: usize,
+    ) -> (Self, NamespaceUpdateSender) {
+        let (updates, sender) = NamespaceUpdateReceiver::bounded(capacity);
+        (
+            Self {
+                existing_namespaces: existing,
+                updates,
+                _registration: Box::new(inner),
+            },
+            sender,
+        )
+    }
+
+    /// Wait for the next namespace addition or withdrawal.
+    ///
+    /// A closed producer or a full update queue is an error. Continuing with
+    /// stale discovery state would be unsafe, so callers should terminate the
+    /// corresponding SUBSCRIBE_NAMESPACE request.
+    pub async fn next_update(&mut self) -> CoordinatorResult<NamespaceUpdate> {
+        self.updates.recv().await
+    }
+}
+
+/// A change to a long-lived namespace-prefix subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NamespaceUpdate {
+    /// A matching namespace became available.
+    Added(NamespaceInfo),
+    /// A previously announced matching namespace is no longer available.
+    Removed(NamespaceInfo),
+}
+
+/// Error returned when publishing into a namespace update stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NamespaceUpdateSendError {
+    /// The bounded queue is full. The subscription has been failed closed.
+    #[error("namespace update queue is full")]
+    Full,
+    /// The subscription no longer exists.
+    #[error("namespace update subscription is closed")]
+    Closed,
+}
+
+/// Non-blocking sender for a bounded namespace update stream.
+#[derive(Clone)]
+pub struct NamespaceUpdateSender {
+    sender: mpsc::Sender<NamespaceUpdate>,
+    overflow: watch::Sender<bool>,
+}
+
+impl NamespaceUpdateSender {
+    /// Publish an update without ever blocking a coordinator mutation.
+    ///
+    /// Queue overflow permanently fails the receiving subscription. This
+    /// avoids delivering a partial sequence that could leave the peer with a
+    /// stale set of advertised namespaces.
+    pub fn try_send(&self, update: NamespaceUpdate) -> Result<(), NamespaceUpdateSendError> {
+        if *self.overflow.borrow() {
+            return Err(NamespaceUpdateSendError::Full);
+        }
+        match self.sender.try_send(update) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.overflow.send_replace(true);
+                Err(NamespaceUpdateSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(NamespaceUpdateSendError::Closed),
+        }
+    }
+
+    /// Whether this subscription has already failed because its queue filled.
+    pub fn is_overflowed(&self) -> bool {
+        *self.overflow.borrow()
+    }
+}
+
+struct NamespaceUpdateReceiver {
+    receiver: mpsc::Receiver<NamespaceUpdate>,
+    overflow: watch::Receiver<bool>,
+}
+
+impl NamespaceUpdateReceiver {
+    fn bounded(capacity: usize) -> (Self, NamespaceUpdateSender) {
+        assert!(capacity > 0, "namespace update capacity must be positive");
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (overflow, overflow_receiver) = watch::channel(false);
+        (
+            Self {
+                receiver,
+                overflow: overflow_receiver,
+            },
+            NamespaceUpdateSender { sender, overflow },
+        )
+    }
+
+    fn pending() -> (Self, NamespaceUpdateSender) {
+        Self::bounded(1)
+    }
+
+    async fn recv(&mut self) -> CoordinatorResult<NamespaceUpdate> {
+        if *self.overflow.borrow() {
+            return Err(CoordinatorError::CapacityExhausted {
+                resource: "namespace_update_stream",
+            });
+        }
+
+        tokio::select! {
+            biased;
+            changed = self.overflow.changed() => {
+                match changed {
+                    Ok(()) if *self.overflow.borrow() => Err(CoordinatorError::CapacityExhausted {
+                        resource: "namespace_update_stream",
+                    }),
+                    Ok(()) => unreachable!("namespace overflow state only transitions to true"),
+                    Err(_) => Err(CoordinatorError::Other(anyhow::anyhow!(
+                        "namespace update overflow monitor closed"
+                    ))),
+                }
+            }
+            update = self.receiver.recv() => update.ok_or_else(|| CoordinatorError::Other(
+                anyhow::anyhow!("namespace update stream closed")
+            )),
         }
     }
 }
@@ -247,7 +396,7 @@ impl NamespaceSubscription {
 ///
 /// Returned in [`NamespaceSubscription`] to describe namespaces matching
 /// a SUBSCRIBE_NAMESPACE prefix.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NamespaceInfo {
     /// The namespace identity.
@@ -564,7 +713,9 @@ pub trait Coordinator: Send + Sync {
     /// should:
     /// 1. Record that this relay is interested in the prefix
     /// 2. Return currently-matching namespaces
-    /// 3. Return an RAII handle for cleanup on disconnect
+    /// 3. Stream later matching additions and withdrawals through a bounded
+    ///    [`NamespaceUpdateSender`]
+    /// 4. Return an RAII handle for cleanup on disconnect
     ///
     /// When publishers later register namespaces matching this prefix, the
     /// relay uses [`lookup_namespace_subscribers()`] to find interested relays
@@ -577,7 +728,7 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Default Implementation
     ///
-    /// Returns an empty subscription (no existing namespaces, no-op cleanup).
+    /// Returns an empty subscription whose update stream remains pending.
     ///
     /// [`lookup_namespace_subscribers()`]: Coordinator::lookup_namespace_subscribers
     async fn subscribe_namespace(
@@ -880,6 +1031,12 @@ mod tests {
         /// Maps scope → SUBSCRIBE_NAMESPACE prefixes → list of relay URLs
         namespace_subscribers: HashMap<String, HashMap<TrackNamespace, Vec<String>>>,
 
+        /// Scope-bound bounded update streams for active namespace-prefix
+        /// subscriptions.
+        namespace_update_subscribers: HashMap<String, HashMap<u64, MockNamespaceUpdateSubscriber>>,
+
+        next_namespace_subscription_id: u64,
+
         /// Maps scope → subscribed tracks → list of relay URLs
         /// Key: (namespace, track_name)
         track_subscribers: HashMap<String, HashMap<(TrackNamespace, String), Vec<String>>>,
@@ -899,6 +1056,33 @@ mod tests {
         fn track_key(namespace: &TrackNamespace, track: &str) -> (TrackNamespace, String) {
             (namespace.clone(), track.to_string())
         }
+
+        fn notify_namespace_update(
+            &self,
+            scope_key: &str,
+            namespace: &TrackNamespace,
+            added: bool,
+        ) {
+            let Some(subscribers) = self.namespace_update_subscribers.get(scope_key) else {
+                return;
+            };
+            for subscriber in subscribers.values() {
+                if ns_has_prefix(namespace, &subscriber.prefix) {
+                    let info = NamespaceInfo::new(namespace.clone());
+                    let update = if added {
+                        NamespaceUpdate::Added(info)
+                    } else {
+                        NamespaceUpdate::Removed(info)
+                    };
+                    let _ = subscriber.sender.try_send(update);
+                }
+            }
+        }
+    }
+
+    struct MockNamespaceUpdateSubscriber {
+        prefix: TrackNamespace,
+        sender: NamespaceUpdateSender,
     }
 
     /// Drop-based handle for namespace unregistration.
@@ -912,7 +1096,9 @@ mod tests {
         fn drop(&mut self) {
             let mut state = self.state.lock().unwrap();
             if let Some(bucket) = state.namespaces.get_mut(&self.scope_key) {
-                bucket.remove(&self.namespace);
+                if bucket.remove(&self.namespace).is_some() {
+                    state.notify_namespace_update(&self.scope_key, &self.namespace, false);
+                }
             }
         }
     }
@@ -939,6 +1125,7 @@ mod tests {
         scope_key: String,
         prefix: TrackNamespace,
         relay_url: String,
+        subscription_id: u64,
     }
 
     impl Drop for MockNamespaceSubHandle {
@@ -948,6 +1135,9 @@ mod tests {
                 if let Some(relays) = bucket.get_mut(&self.prefix) {
                     relays.retain(|r| r != &self.relay_url);
                 }
+            }
+            if let Some(subscribers) = state.namespace_update_subscribers.get_mut(&self.scope_key) {
+                subscribers.remove(&self.subscription_id);
             }
         }
     }
@@ -989,6 +1179,8 @@ mod tests {
                     namespaces: HashMap::new(),
                     tracks: HashMap::new(),
                     namespace_subscribers: HashMap::new(),
+                    namespace_update_subscribers: HashMap::new(),
+                    next_namespace_subscription_id: 0,
                     track_subscribers: HashMap::new(),
                     scope_configs: HashMap::new(),
                     path_to_scope: HashMap::new(),
@@ -1054,6 +1246,7 @@ mod tests {
                     return Err(CoordinatorError::NamespaceAlreadyRegistered);
                 }
                 bucket.insert(namespace.clone(), relay_url);
+                state.notify_namespace_update(&scope_key, namespace, true);
             }
 
             let handle = MockNamespaceHandle {
@@ -1072,7 +1265,9 @@ mod tests {
             let scope_key = MockState::scope_key(scope);
             let mut state = self.state.lock().unwrap();
             if let Some(bucket) = state.namespaces.get_mut(&scope_key) {
-                bucket.remove(namespace);
+                if bucket.remove(namespace).is_some() {
+                    state.notify_namespace_update(&scope_key, namespace, false);
+                }
             }
             Ok(())
         }
@@ -1163,14 +1358,32 @@ mod tests {
                 .or_default()
                 .push(relay_url.clone());
 
+            let subscription_id = state.next_namespace_subscription_id;
+            state.next_namespace_subscription_id =
+                state.next_namespace_subscription_id.saturating_add(1);
+
             let handle = MockNamespaceSubHandle {
                 state: self.state.clone(),
-                scope_key,
+                scope_key: scope_key.clone(),
                 prefix: prefix.clone(),
                 relay_url,
+                subscription_id,
             };
 
-            Ok(NamespaceSubscription::new(existing, handle))
+            let (subscription, sender) = NamespaceSubscription::bounded(existing, handle, 16);
+            state
+                .namespace_update_subscribers
+                .entry(scope_key)
+                .or_default()
+                .insert(
+                    subscription_id,
+                    MockNamespaceUpdateSubscriber {
+                        prefix: prefix.clone(),
+                        sender,
+                    },
+                );
+
+            Ok(subscription)
         }
 
         async fn unsubscribe_namespace(
@@ -1185,6 +1398,9 @@ mod tests {
                 if let Some(relays) = bucket.get_mut(prefix) {
                     relays.retain(|r| r != &relay_url);
                 }
+            }
+            if let Some(subscribers) = state.namespace_update_subscribers.get_mut(&scope_key) {
+                subscribers.retain(|_, subscriber| subscriber.prefix != *prefix);
             }
             Ok(())
         }
@@ -1681,6 +1897,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_subscription_streams_additions_and_withdrawals() {
+        let coord = MockCoordinator::new("https://relay-1.example.com");
+        let scope = Some("content-provider-123");
+        let namespace = ns("sports/football/match-44");
+        let mut subscription = coord
+            .subscribe_namespace(scope, &ns("sports/football"))
+            .await
+            .unwrap();
+
+        let registration = coord.register_namespace(scope, &namespace).await.unwrap();
+        assert_eq!(
+            subscription.next_update().await.unwrap(),
+            NamespaceUpdate::Added(NamespaceInfo::new(namespace.clone()))
+        );
+
+        drop(registration);
+        assert_eq!(
+            subscription.next_update().await.unwrap(),
+            NamespaceUpdate::Removed(NamespaceInfo::new(namespace))
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_updates_are_scope_and_prefix_isolated() {
+        let coord = MockCoordinator::new("https://relay-1.example.com");
+        let mut subscription = coord
+            .subscribe_namespace(Some("provider-a"), &ns("sports/football"))
+            .await
+            .unwrap();
+
+        let _other_scope = coord
+            .register_namespace(Some("provider-b"), &ns("sports/football/private-match"))
+            .await
+            .unwrap();
+        let _other_prefix = coord
+            .register_namespace(Some("provider-a"), &ns("sports/tennis/open"))
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            subscription.next_update()
+        )
+        .await
+        .is_err());
+
+        let matching = ns("sports/football/public-match");
+        let _matching = coord
+            .register_namespace(Some("provider-a"), &matching)
+            .await
+            .unwrap();
+        assert_eq!(
+            subscription.next_update().await.unwrap(),
+            NamespaceUpdate::Added(NamespaceInfo::new(matching))
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_update_overflow_fails_closed_without_partial_delivery() {
+        let (mut subscription, sender) = NamespaceSubscription::bounded(vec![], (), 1);
+        sender
+            .try_send(NamespaceUpdate::Added(NamespaceInfo::new(ns("one"))))
+            .unwrap();
+        assert_eq!(
+            sender.try_send(NamespaceUpdate::Added(NamespaceInfo::new(ns("two")))),
+            Err(NamespaceUpdateSendError::Full)
+        );
+        assert!(sender.is_overflowed());
+        assert!(matches!(
+            subscription.next_update().await,
+            Err(CoordinatorError::CapacityExhausted {
+                resource: "namespace_update_stream"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn lookup_namespace_subscribers_finds_interested_relays() {
         // An edge relay has subscribers interested in football broadcasts.
         // When a new match starts (namespace registered), the origin relay
@@ -1732,6 +2024,11 @@ mod tests {
             .await
             .unwrap();
         assert!(interested.is_empty());
+        let state = coord.state.lock().unwrap();
+        assert!(state
+            .namespace_update_subscribers
+            .get("content-provider-123")
+            .is_none_or(HashMap::is_empty));
     }
 
     // ========================================================================

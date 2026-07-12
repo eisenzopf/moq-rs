@@ -10,8 +10,8 @@ use moq_transport::{
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Locals, RelayCapacity, RelayCapacityLease, RelayIdentity, RelayResource, RemoteCapacityError,
-    RemoteManager,
+    Locals, NamespaceUpdate, RelayCapacity, RelayCapacityLease, RelayIdentity, RelayResource,
+    RemoteCapacityError, RemoteManager,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -219,7 +219,8 @@ impl Producer {
         }
     }
 
-    /// Serve namespace discovery from the coordinator's scope-bound snapshot.
+    /// Serve namespace discovery from the coordinator's scope-bound snapshot
+    /// and long-lived bounded update stream.
     async fn serve_subscribe_namespace(
         self,
         mut request: SubscribedNamespace,
@@ -228,7 +229,7 @@ impl Producer {
         let prefix = TrackNamespace {
             fields: request.info.prefix.fields.clone(),
         };
-        let subscription = match self
+        let mut subscription = match self
             .remotes
             .subscribe_namespace(self.identity.scope(), &prefix)
             .await
@@ -250,7 +251,39 @@ impl Producer {
         }
 
         let _subscription_guard = GaugeGuard::new("moq_relay_active_namespace_subscriptions");
-        request.closed().await;
+        loop {
+            let update = tokio::select! {
+                _ = request.closed() => break,
+                update = subscription.next_update() => update,
+            };
+
+            let update = match update {
+                Ok(update) => update,
+                Err(error) => {
+                    metrics::counter!(
+                        "moq_relay_namespace_subscription_failures_total",
+                        "kind" => "coordinator_update"
+                    )
+                    .increment(1);
+                    return Err(anyhow::anyhow!(
+                        "namespace coordinator update stream failed: {error}"
+                    ));
+                }
+            };
+
+            match update {
+                NamespaceUpdate::Added(namespace) => {
+                    let suffix =
+                        Self::namespace_suffix(&request.info.prefix, &namespace.namespace)?;
+                    request.namespace(suffix)?;
+                }
+                NamespaceUpdate::Removed(namespace) => {
+                    let suffix =
+                        Self::namespace_suffix(&request.info.prefix, &namespace.namespace)?;
+                    request.namespace_done(suffix)?;
+                }
+            }
+        }
         drop(subscription);
         Ok(())
     }
