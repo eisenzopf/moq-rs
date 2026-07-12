@@ -588,6 +588,56 @@ impl Subscriber {
         Ok((subscribe, fetch))
     }
 
+    /// Subscribe at the live edge and join retained Objects when the peer
+    /// reports an existing Largest Object.
+    ///
+    /// A newly activated upstream can legitimately acknowledge SUBSCRIBE
+    /// before it has observed any Object. In that case there is no valid
+    /// Relative Joining FETCH range. The live barrier is released atomically
+    /// and `None` is returned instead of failing an otherwise healthy
+    /// subscription.
+    pub async fn subscribe_joining_or_live(
+        &mut self,
+        track: serve::TrackWriter,
+    ) -> Result<(Subscribe, Option<Fetch>), ServeError> {
+        let options = SubscribeOptions::default()
+            .with_forward(true)
+            .with_filter(message::SubscriptionFilter::largest_object())
+            .with_group_order(message::GroupOrder::Ascending);
+        let subscribe = self
+            .subscribe_open_with_barrier(track, options, true)
+            .await?;
+        let joining_request_id = subscribe.info.id;
+        let has_joining_location = self
+            .subscribes
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("subscribe registry unavailable"))?
+            .get(&joining_request_id)
+            .ok_or_else(|| {
+                ServeError::internal_ctx(
+                    "Joining FETCH reference is not active in this Subscriber session",
+                )
+            })?
+            .joining_location()
+            .is_some();
+        if has_joining_location {
+            let fetch = self.fetch_joining(&subscribe).await?;
+            return Ok((subscribe, Some(fetch)));
+        }
+
+        self.subscribes
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("subscribe registry unavailable"))?
+            .get_mut(&joining_request_id)
+            .ok_or_else(|| {
+                ServeError::internal_ctx(
+                    "Joining FETCH reference is not active in this Subscriber session",
+                )
+            })?
+            .finish_joining_fetch()?;
+        Ok((subscribe, None))
+    }
+
     /// Start the supported Relative Joining FETCH for an established
     /// subscription in this same session.
     pub async fn fetch_joining(&mut self, joining: &Subscribe) -> Result<Fetch, ServeError> {
