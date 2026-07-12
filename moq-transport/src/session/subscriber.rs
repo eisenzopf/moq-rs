@@ -23,8 +23,9 @@ use crate::watch::Queue;
 
 use super::{
     BidiCommand, BidiResponseMap, PublishReceived, PublishReceivedRecv, PublishedNamespace,
-    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe, SubscribeOptions,
-    SubscribeRecv, Writer,
+    PublishedNamespaceRecv, Reader, RequestClass, RequestDirection, RequestId, RequestLease,
+    Session, SessionError, SessionRequestCapacity, Subscribe, SubscribeOptions, SubscribeRecv,
+    Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -42,6 +43,17 @@ enum AliasBinding {
 struct AliasEntry {
     full_name: serve::FullTrackName,
     bindings: Vec<AliasBinding>,
+}
+
+struct SubscribeResponseGuard {
+    subscriber: Subscriber,
+    request_id: u64,
+}
+
+impl Drop for SubscribeResponseGuard {
+    fn drop(&mut self) {
+        self.subscriber.cleanup_outbound_subscribe(self.request_id);
+    }
 }
 
 // TODO remove Clone.
@@ -92,6 +104,9 @@ pub struct Subscriber {
 
     /// Request-stream command channels, used for cancellation and reverse updates.
     bidi_response_map: BidiResponseMap,
+
+    /// Shared fail-fast ownership for logical inbound and outbound requests.
+    request_capacity: SessionRequestCapacity,
 }
 
 impl Subscriber {
@@ -102,14 +117,16 @@ impl Subscriber {
         request_id: RequestId,
         bidi_task_tx: super::BidiTaskSender,
         bidi_response_map: BidiResponseMap,
+        request_capacity: SessionRequestCapacity,
     ) -> Self {
+        let limits = request_capacity.limits();
         Self {
             published_namespaces: Default::default(),
-            published_namespace_queue: Default::default(),
+            published_namespace_queue: Queue::bounded(limits.session_inbound.publish_namespace),
             subscribes: Default::default(),
             alias_map: Default::default(),
             publishes_received: Default::default(),
-            publish_received_queue: Default::default(),
+            publish_received_queue: Queue::bounded(limits.session_inbound.publish),
             outgoing,
             webtransport,
             request_id,
@@ -117,18 +134,23 @@ impl Subscriber {
             subscribe_alias_notify: Arc::new(Notify::new()),
             bidi_task_tx,
             bidi_response_map,
+            request_capacity,
         }
     }
 
     pub(super) fn cancel_publish_received(&mut self, request_id: u64, code: u32) {
         self.fail_publish_received(request_id, ServeError::Cancel);
+        self.cancel_request_stream(request_id, code);
+    }
+
+    pub(super) fn cancel_request_stream(&mut self, request_id: u64, code: u32) {
         let command = self
             .bidi_response_map
             .lock()
             .ok()
             .and_then(|streams| streams.get(&request_id).cloned());
         if let Some(command) = command {
-            let _ = command.send(BidiCommand::Cancel(code));
+            let _ = command.try_send(BidiCommand::Cancel(code));
         }
     }
 
@@ -157,12 +179,12 @@ impl Subscriber {
             })?;
         let (completion, completed) = tokio::sync::oneshot::channel();
         command
-            .send(BidiCommand::RequestUpdate {
+            .try_send(BidiCommand::RequestUpdate {
                 update,
                 forward,
                 completion,
             })
-            .map_err(|_| SessionError::Internal)?;
+            .map_err(|_| SessionError::TooManyRequestUpdates)?;
         completed.await.map_err(|_| SessionError::Internal)?
     }
 
@@ -264,18 +286,26 @@ impl Subscriber {
         &mut self,
         track_namespace: &TrackNamespace,
         track_name: TrackName,
-    ) -> Result<message::TrackStatus, SessionError> {
-        Ok(message::TrackStatus {
-            id: self.get_next_request_id()?,
-            track_namespace: track_namespace.clone(),
-            track_name,
-            params: Default::default(),
-        })
+    ) -> Result<(message::TrackStatus, Arc<RequestLease>), SessionError> {
+        let request_lease = Arc::new(
+            self.request_capacity
+                .try_acquire(RequestDirection::Outbound, RequestClass::TrackStatus)?,
+        );
+        Ok((
+            message::TrackStatus {
+                id: self.get_next_request_id()?,
+                track_namespace: track_namespace.clone(),
+                track_name,
+                params: Default::default(),
+            },
+            request_lease,
+        ))
     }
 
     async fn run_track_status_request(
         &self,
         request: message::TrackStatus,
+        _request_lease: Arc<RequestLease>,
     ) -> Result<message::RequestOk, SessionError> {
         let request_id = request.id;
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
@@ -326,8 +356,9 @@ impl Subscriber {
         track_namespace: &TrackNamespace,
         track_name: impl Into<TrackName>,
     ) -> Result<message::RequestOk, SessionError> {
-        let request = self.new_track_status_request(track_namespace, track_name.into())?;
-        self.run_track_status_request(request).await
+        let (request, request_lease) =
+            self.new_track_status_request(track_namespace, track_name.into())?;
+        self.run_track_status_request(request, request_lease).await
     }
 
     /// Send a fire-and-forget TRACK_STATUS request for source compatibility.
@@ -339,13 +370,14 @@ impl Subscriber {
         track_namespace: &TrackNamespace,
         track_name: impl Into<TrackName>,
     ) {
-        let request = match self.new_track_status_request(track_namespace, track_name.into()) {
-            Ok(request) => request,
-            Err(error) => {
-                tracing::warn!(%error, "could not allocate TRACK_STATUS request");
-                return;
-            }
-        };
+        let (request, request_lease) =
+            match self.new_track_status_request(track_namespace, track_name.into()) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, "could not allocate TRACK_STATUS request");
+                    return;
+                }
+            };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!("could not send TRACK_STATUS outside a Tokio runtime");
             return;
@@ -354,7 +386,10 @@ impl Subscriber {
         let subscriber = self.clone();
         let request_id = request.id;
         let task = runtime.spawn(async move {
-            if let Err(error) = subscriber.run_track_status_request(request).await {
+            if let Err(error) = subscriber
+                .run_track_status_request(request, request_lease)
+                .await
+            {
                 tracing::warn!(%error, request_id, "TRACK_STATUS request failed");
             }
         });
@@ -388,10 +423,16 @@ impl Subscriber {
         track: serve::TrackWriter,
         options: SubscribeOptions,
     ) -> Result<Subscribe, ServeError> {
+        let request_lease = Arc::new(
+            self.request_capacity
+                .try_acquire(RequestDirection::Outbound, RequestClass::Subscribe)
+                .map_err(|error| ServeError::internal_ctx(error.to_string()))?,
+        );
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
-        let (send, recv) = Subscribe::new_with_options(self.clone(), request_id, track, options)?;
+        let (mut send, recv) =
+            Subscribe::new_with_options(self.clone(), request_id, track, options, request_lease)?;
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if
@@ -415,18 +456,31 @@ impl Subscriber {
             })?
             .insert(request_id, recv);
 
+        let (response_cancel, mut response_cancelled) = tokio::sync::oneshot::channel();
+        send.attach_response_cancel(response_cancel);
+
         // Spawn a reader task for bidi stream responses (draft-19).
         // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
         let mut subscriber_clone = self.clone();
+        let response_guard = SubscribeResponseGuard {
+            subscriber: subscriber_clone.clone(),
+            request_id,
+        };
         let handle = tokio::spawn(async move {
+            let _response_guard = response_guard;
             loop {
-                match Session::decode_bidi_response(
-                    &mut response_reader,
-                    request_id,
-                    super::RequestKind::Subscribe,
-                )
-                .await
-                {
+                let response = tokio::select! {
+                    _ = &mut response_cancelled => {
+                        response_reader.stop(Session::REQUEST_STREAM_CANCELLED);
+                        break;
+                    }
+                    response = Session::decode_bidi_response(
+                        &mut response_reader,
+                        request_id,
+                        super::RequestKind::Subscribe,
+                    ) => response,
+                };
+                match response {
                     Ok(msg) => {
                         if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                             if let Err(e) = subscriber_clone.recv_message(pub_msg) {
@@ -465,8 +519,20 @@ impl Subscriber {
     /// Receive a publisher message from a request stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
-            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,
-            message::Publisher::Publish(msg) => self.recv_publish(msg)?,
+            message::Publisher::PublishNamespace(msg) => {
+                let lease = Arc::new(
+                    self.request_capacity
+                        .try_acquire(RequestDirection::Inbound, RequestClass::PublishNamespace)?,
+                );
+                self.recv_publish_namespace(msg, lease)?;
+            }
+            message::Publisher::Publish(msg) => {
+                let lease = Arc::new(
+                    self.request_capacity
+                        .try_acquire(RequestDirection::Inbound, RequestClass::Publish)?,
+                );
+                self.recv_publish(msg, lease)?;
+            }
             message::Publisher::RequestUpdate(_) => {
                 return Err(SessionError::ProtocolViolation(
                     "REQUEST_UPDATE was not associated with a request stream".to_string(),
@@ -499,6 +565,22 @@ impl Subscriber {
         }
 
         Ok(())
+    }
+
+    /// Dispatch the first message on a peer-opened request stream while
+    /// attaching its already-acquired logical request lease to retained state.
+    pub(super) fn recv_request_message(
+        &mut self,
+        msg: message::Publisher,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
+        match msg {
+            message::Publisher::PublishNamespace(msg) => {
+                self.recv_publish_namespace(&msg, request_lease)
+            }
+            message::Publisher::Publish(msg) => self.recv_publish(&msg, request_lease),
+            other => self.recv_message(other),
+        }
     }
 
     pub(crate) fn recv_request_update(
@@ -542,6 +624,7 @@ impl Subscriber {
     fn recv_publish_namespace(
         &mut self,
         msg: &message::PublishNamespace,
+        request_lease: Arc<RequestLease>,
     ) -> Result<(), SessionError> {
         let mut published_namespaces = self
             .published_namespaces
@@ -554,8 +637,12 @@ impl Subscriber {
             hash_map::Entry::Vacant(entry) => entry,
         };
 
-        let (published_ns, recv) =
-            PublishedNamespace::new(self.clone(), msg.id, msg.track_namespace.clone());
+        let (published_ns, recv) = PublishedNamespace::new(
+            self.clone(),
+            msg.id,
+            msg.track_namespace.clone(),
+            request_lease,
+        );
         if let Err(published_ns) = self.published_namespace_queue.push(published_ns) {
             published_ns.close(ServeError::Cancel)?;
             return Ok(());
@@ -599,6 +686,7 @@ impl Subscriber {
     pub(super) fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
         let subscribe = self.subscribes.lock().ok().and_then(|mut s| s.remove(&id));
         if let Some(ref sub) = subscribe {
+            sub.release_request_lease();
             if let Some(track_alias) = sub.track_alias() {
                 self.unregister_alias_binding(track_alias, AliasBinding::Subscribe(id));
             }
@@ -606,7 +694,17 @@ impl Subscriber {
         subscribe
     }
 
-    fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
+    fn cleanup_outbound_subscribe(&mut self, id: u64) {
+        if let Some(subscribe) = self.remove_subscribe(id) {
+            let _ = subscribe.error(ServeError::Cancel);
+        }
+    }
+
+    fn recv_publish(
+        &mut self,
+        msg: &message::Publish,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
         // The serve model cannot yet retain Track Properties. Rejecting them
         // avoids silently stripping relay-visible metadata.
         if !msg.track_extensions.is_empty() {
@@ -648,6 +746,7 @@ impl Subscriber {
                 largest_location,
                 writer,
                 reader,
+                request_lease,
             );
             self.register_alias(
                 msg.track_alias,
@@ -794,6 +893,24 @@ impl Subscriber {
             }
         }
         None
+    }
+
+    /// Remove every retained representation of a peer-opened
+    /// PUBLISH_NAMESPACE and mark any application handle complete.
+    pub(super) fn cleanup_inbound_publish_namespace(&mut self, id: u64) {
+        if let Some(recv) = self.drop_publish_namespace(id) {
+            let _ = recv.recv_done();
+        }
+        self.published_namespace_queue
+            .remove_where(|namespace| namespace.info.request_id == id);
+    }
+
+    /// Remove every retained representation of a peer-opened PUBLISH and
+    /// notify an already-consumed application handle that its stream ended.
+    pub(super) fn cleanup_inbound_publish(&mut self, id: u64) {
+        self.fail_publish_received(id, ServeError::Cancel);
+        self.publish_received_queue
+            .remove_where(|publish| publish.request_id() == id);
     }
 
     pub(super) fn remove_publish_received(&mut self, id: u64) {

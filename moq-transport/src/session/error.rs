@@ -4,6 +4,8 @@
 
 use crate::{coding, serve};
 
+use super::RequestCapacityError;
+
 /// Draft-19 Session Termination error codes used by transport/application
 /// boundaries that must close before a full [`SessionError`] exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +82,9 @@ pub enum SessionError {
     #[error("too many requests")]
     TooManyRequests,
 
+    #[error("request capacity exhausted: {0}")]
+    RequestCapacity(#[from] RequestCapacityError),
+
     /// Draft-19 TOO_MANY_REQUEST_UPDATES (0x1B): the peer exceeded the
     /// per-request-stream limit advertised in MAX_REQUEST_UPDATES.
     #[error("too many request updates")]
@@ -117,6 +122,7 @@ impl SessionError {
             Self::InvalidRequestId => 0x4,
             // TOO_MANY_REQUESTS (0x7)
             Self::TooManyRequests => 0x7,
+            Self::RequestCapacity(_) => 0x7,
             // TOO_MANY_REQUEST_UPDATES (0x1B)
             Self::TooManyRequestUpdates => 0x1B,
             // PROTOCOL_VIOLATION (0x3)

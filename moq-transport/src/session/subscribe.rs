@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{collections::HashSet, ops};
+use std::{collections::HashSet, ops, sync::Arc};
 
 use bytes::BytesMut;
 
@@ -15,8 +15,8 @@ use crate::{
 
 use crate::watch::State;
 
-use super::SessionError;
 use super::Subscriber;
+use super::{RequestLease, SessionError};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -337,8 +337,10 @@ impl Default for SubscribeState {
 pub struct Subscribe {
     state: State<SubscribeState>,
     subscriber: Subscriber,
+    response_cancel: Option<tokio::sync::oneshot::Sender<()>>,
 
     pub info: SubscribeInfo,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl Subscribe {
@@ -364,9 +366,10 @@ impl Subscribe {
         request_id: u64,
         track: TrackWriter,
         options: SubscribeOptions,
+        request_lease: Arc<RequestLease>,
     ) -> Result<(Subscribe, SubscribeRecv), SubscribeOptionsError> {
         let info = Self::build_info(request_id, &track, &options)?;
-        Ok(Self::from_parts(subscriber, info, track))
+        Ok(Self::from_parts(subscriber, info, track, request_lease))
     }
 
     /// Return the wire message to send on the request stream.
@@ -383,13 +386,16 @@ impl Subscribe {
         subscriber: Subscriber,
         info: SubscribeInfo,
         track: TrackWriter,
+        request_lease: Arc<RequestLease>,
     ) -> (Subscribe, SubscribeRecv) {
         let (send, recv) = State::default().split();
 
         let send = Subscribe {
             state: send,
             subscriber,
+            response_cancel: None,
             info,
+            _request_lease: request_lease.clone(),
         };
 
         let recv = SubscribeRecv {
@@ -398,6 +404,7 @@ impl Subscribe {
             info: send.info.clone(),
             delivery_filter: None,
             seen_objects: HashSet::new(),
+            _request_lease: request_lease,
         };
 
         (send, recv)
@@ -416,6 +423,13 @@ impl Subscribe {
             }
             .await;
         }
+    }
+
+    pub(super) fn attach_response_cancel(
+        &mut self,
+        response_cancel: tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.response_cancel = Some(response_cancel);
     }
 
     pub async fn ok(&self) -> Result<(), ServeError> {
@@ -442,7 +456,11 @@ impl Drop for Subscribe {
     fn drop(&mut self) {
         // Draft-19 removed UNSUBSCRIBE. The owning request stream is the
         // cancellation boundary; dropping the handle releases local state.
+        if let Some(cancel) = self.response_cancel.take() {
+            let _ = cancel.send(());
+        }
         self.subscriber.remove_subscribe(self.info.id);
+        self._request_lease.release();
     }
 }
 
@@ -460,9 +478,14 @@ pub(super) struct SubscribeRecv {
     info: SubscribeInfo,
     delivery_filter: Option<DeliveryFilter>,
     seen_objects: HashSet<(u64, u64)>,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl SubscribeRecv {
+    pub(super) fn release_request_lease(&self) {
+        self._request_lease.release();
+    }
+
     pub fn ok(&mut self, msg: &message::SubscribeOk) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
@@ -825,6 +848,10 @@ mod tests {
             info: subscribe_info_with(KeyValuePairs::default()),
             delivery_filter: None,
             seen_objects: HashSet::new(),
+            _request_lease: crate::session::test_request_lease(
+                crate::session::RequestDirection::Outbound,
+                crate::session::RequestClass::Subscribe,
+            ),
         };
         let header_type = data::StreamHeaderType::subgroup(
             true,

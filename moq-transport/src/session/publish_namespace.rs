@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{collections::VecDeque, ops, time::Duration};
+use std::{collections::VecDeque, ops, sync::Arc, time::Duration};
 
 use crate::coding::TrackNamespace;
 use crate::watch::State;
@@ -11,7 +11,9 @@ use crate::{
     serve::{ServeError, TracksReader},
 };
 
-use super::{Publisher, Session, SessionError, Subscribed, TrackStatusRequested, Writer};
+use super::{
+    Publisher, RequestLease, Session, SessionError, Subscribed, TrackStatusRequested, Writer,
+};
 
 /// Default time allowed for a peer to accept `PUBLISH_NAMESPACE`.
 pub const DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,6 +110,7 @@ impl Drop for PublishNamespaceState {
                 ))
                 .ok();
         }
+        self.track_statuses_requested.clear();
     }
 }
 
@@ -120,6 +123,7 @@ pub struct PublishNamespace {
     state: State<PublishNamespaceState>,
     request_writer: Option<Writer>,
     response_cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    _request_lease: Arc<RequestLease>,
 
     pub info: PublishNamespaceInfo,
 }
@@ -131,12 +135,13 @@ impl PublishNamespace {
         publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,
+        request_lease: Arc<RequestLease>,
     ) -> (PublishNamespace, PublishNamespaceRecv) {
         let info = PublishNamespaceInfo {
             request_id,
             namespace: namespace.clone(),
         };
-        Self::from_parts(publisher, info, request_id)
+        Self::from_parts(publisher, info, request_id, request_lease)
     }
 
     /// Return the wire message to send on the request stream.
@@ -152,6 +157,7 @@ impl PublishNamespace {
         publisher: Publisher,
         info: PublishNamespaceInfo,
         request_id: u64,
+        request_lease: Arc<RequestLease>,
     ) -> (PublishNamespace, PublishNamespaceRecv) {
         let (send, recv) = State::default().split();
 
@@ -161,10 +167,12 @@ impl PublishNamespace {
             state: send,
             request_writer: None,
             response_cancel: None,
+            _request_lease: request_lease.clone(),
         };
         let recv = PublishNamespaceRecv {
             state: recv,
             request_id,
+            _request_lease: request_lease,
         };
 
         (send, recv)
@@ -334,6 +342,7 @@ impl Drop for PublishNamespace {
             writer.reset(Session::REQUEST_STREAM_CANCELLED);
         }
         let _ = self.publisher.drop_publish_namespace(self.info.request_id);
+        self._request_lease.release();
     }
 }
 
@@ -352,9 +361,14 @@ pub(super) struct PublishNamespaceRecv {
     // Namespace lookup alone is insufficient: both request_id and namespace
     // are needed, so Publisher holds a second index by request_id.
     pub request_id: u64,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl PublishNamespaceRecv {
+    pub(super) fn release_request_lease(&self) {
+        self._request_lease.release();
+    }
+
     pub fn recv_ok(&mut self) -> Result<(), ServeError> {
         if let Some(mut state) = self.state.lock_mut() {
             match state.acceptance.clone() {
@@ -406,6 +420,22 @@ impl PublishNamespaceRecv {
             .push_back(track_status_requested);
         Ok(())
     }
+
+    pub fn remove_subscribe(&mut self, request_id: u64) {
+        if let Some(mut state) = self.state.lock_mut() {
+            state
+                .subscribers
+                .retain(|subscriber| subscriber.info.id != request_id);
+        }
+    }
+
+    pub fn remove_track_status(&mut self, request_id: u64) {
+        if let Some(mut state) = self.state.lock_mut() {
+            state
+                .track_statuses_requested
+                .retain(|request| request.request_msg.id != request_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +449,10 @@ mod tests {
             PublishNamespaceRecv {
                 state: recv,
                 request_id: 0,
+                _request_lease: crate::session::test_request_lease(
+                    crate::session::RequestDirection::Outbound,
+                    crate::session::RequestClass::PublishNamespace,
+                ),
             },
         )
     }

@@ -14,7 +14,7 @@ use crate::{
     watch::State,
 };
 
-use super::{Session, SessionError, Subscriber};
+use super::{RequestLease, Session, SessionError, Subscriber};
 
 #[derive(Debug)]
 struct PublishReceivedState {
@@ -49,6 +49,7 @@ pub struct PublishReceived {
     largest_location: Option<Location>,
     accepted: bool,
     rejection: Option<ServeError>,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl PublishReceived {
@@ -63,6 +64,7 @@ impl PublishReceived {
         name: TrackName,
         initial_forward: bool,
         largest_location: Option<Location>,
+        request_lease: Arc<RequestLease>,
     ) -> Self {
         Self {
             subscriber,
@@ -76,6 +78,7 @@ impl PublishReceived {
             largest_location,
             accepted: false,
             rejection: None,
+            _request_lease: request_lease,
         }
     }
 
@@ -198,11 +201,17 @@ impl PublishReceived {
 
 impl Drop for PublishReceived {
     fn drop(&mut self) {
+        self._request_lease.release();
         if self.accepted {
             if self.state.lock().closed.is_ok() {
                 self.subscriber
                     .cancel_publish_received(self.request_id, Session::REQUEST_STREAM_CANCELLED);
             }
+            return;
+        }
+
+        if self.state.lock().closed.is_err() {
+            self.subscriber.remove_publish_received(self.request_id);
             return;
         }
 
@@ -249,6 +258,7 @@ pub(crate) struct PublishReceivedRecv {
     full_name: serve::FullTrackName,
     progress: Arc<Notify>,
     seen_objects: HashSet<(u64, u64)>,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl PublishReceivedRecv {
@@ -263,6 +273,7 @@ impl PublishReceivedRecv {
         largest_location: Option<Location>,
         writer: serve::TrackWriter,
         reader: TrackReader,
+        request_lease: Arc<RequestLease>,
     ) -> (PublishReceived, Self) {
         let full_name = serve::FullTrackName {
             namespace: namespace.clone(),
@@ -283,6 +294,7 @@ impl PublishReceivedRecv {
             name,
             initial_forward,
             largest_location,
+            request_lease.clone(),
         );
         let recv = Self {
             state: transport_state,
@@ -294,6 +306,7 @@ impl PublishReceivedRecv {
             full_name,
             progress: Arc::new(Notify::new()),
             seen_objects: HashSet::new(),
+            _request_lease: request_lease,
         };
         (app, recv)
     }
@@ -470,6 +483,10 @@ mod tests {
                 },
                 progress: Arc::new(Notify::new()),
                 seen_objects: HashSet::new(),
+                _request_lease: crate::session::test_request_lease(
+                    crate::session::RequestDirection::Inbound,
+                    crate::session::RequestClass::Publish,
+                ),
             },
         )
     }

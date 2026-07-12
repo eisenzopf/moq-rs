@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{ops, sync::Arc};
 
 use crate::coding::{ReasonPhrase, TrackNamespace};
 use crate::message::RequestErrorCode;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{PublishNamespaceInfo, Subscriber};
+use super::{PublishNamespaceInfo, RequestLease, Subscriber};
 
 // Tracks whether the publisher has cleanly completed this namespace publish.
 #[derive(Default)]
@@ -24,6 +24,7 @@ struct PublishedNamespaceState {
 pub struct PublishedNamespace {
     session: Subscriber,
     state: State<PublishedNamespaceState>,
+    _request_lease: Arc<RequestLease>,
 
     pub info: PublishNamespaceInfo,
 
@@ -36,6 +37,7 @@ impl PublishedNamespace {
         session: Subscriber,
         request_id: u64,
         namespace: TrackNamespace,
+        request_lease: Arc<RequestLease>,
     ) -> (PublishedNamespace, PublishedNamespaceRecv) {
         let info = PublishNamespaceInfo {
             request_id,
@@ -49,10 +51,12 @@ impl PublishedNamespace {
             ok: false,
             error: None,
             state: send,
+            _request_lease: request_lease.clone(),
         };
         let recv = PublishedNamespaceRecv {
             state: recv,
             request_id,
+            _request_lease: request_lease,
         };
 
         (send, recv)
@@ -108,6 +112,7 @@ impl ops::Deref for PublishedNamespace {
 
 impl Drop for PublishedNamespace {
     fn drop(&mut self) {
+        self._request_lease.release();
         let err = self.error.clone().unwrap_or(ServeError::Done);
 
         if self.state.lock().done {
@@ -115,6 +120,10 @@ impl Drop for PublishedNamespace {
         }
 
         if self.ok {
+            self.session.cancel_request_stream(
+                self.info.request_id,
+                super::Session::REQUEST_STREAM_CANCELLED,
+            );
             if let Some(recv) = self.session.drop_publish_namespace(self.info.request_id) {
                 let _ = recv.recv_done();
             }
@@ -139,6 +148,7 @@ pub(super) struct PublishedNamespaceRecv {
     /// Request ID of the corresponding PUBLISH_NAMESPACE, used for O(1)
     /// request-stream lifecycle lookup.
     pub request_id: u64,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl PublishedNamespaceRecv {
@@ -163,6 +173,10 @@ mod tests {
         let recv = PublishedNamespaceRecv {
             state: recv_state,
             request_id: 0,
+            _request_lease: crate::session::test_request_lease(
+                crate::session::RequestDirection::Inbound,
+                crate::session::RequestClass::PublishNamespace,
+            ),
         };
 
         assert!(!send_state.lock().done);

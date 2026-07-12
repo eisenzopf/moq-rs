@@ -3,7 +3,7 @@
 
 use crate::message::Message;
 
-use super::SessionError;
+use super::{RequestClass, SessionError};
 
 /// The request that owns a bidirectional request stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +18,17 @@ pub(crate) enum RequestKind {
 }
 
 impl RequestKind {
+    pub(super) fn request_class(self) -> Option<RequestClass> {
+        match self {
+            Self::Subscribe => Some(RequestClass::Subscribe),
+            Self::Publish => Some(RequestClass::Publish),
+            Self::Fetch => Some(RequestClass::Fetch),
+            Self::PublishNamespace => Some(RequestClass::PublishNamespace),
+            Self::TrackStatus => Some(RequestClass::TrackStatus),
+            Self::SubscribeNamespace | Self::SubscribeTracks => None,
+        }
+    }
+
     pub(super) fn from_first_message(message: &Message) -> Result<Self, SessionError> {
         match message {
             Message::Subscribe(_) => Ok(Self::Subscribe),
@@ -159,5 +170,31 @@ mod tests {
             credits.receive().unwrap();
         }
         assert_eq!(credits.outstanding(), 1_000);
+    }
+
+    #[test]
+    fn request_classes_cover_retained_families_and_reserve_fetch() {
+        assert_eq!(
+            RequestKind::PublishNamespace.request_class(),
+            Some(RequestClass::PublishNamespace)
+        );
+        assert_eq!(
+            RequestKind::Subscribe.request_class(),
+            Some(RequestClass::Subscribe)
+        );
+        assert_eq!(
+            RequestKind::Publish.request_class(),
+            Some(RequestClass::Publish)
+        );
+        assert_eq!(
+            RequestKind::TrackStatus.request_class(),
+            Some(RequestClass::TrackStatus)
+        );
+        assert_eq!(
+            RequestKind::Fetch.request_class(),
+            Some(RequestClass::Fetch)
+        );
+        assert_eq!(RequestKind::SubscribeNamespace.request_class(), None);
+        assert_eq!(RequestKind::SubscribeTracks.request_class(), None);
     }
 }

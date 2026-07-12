@@ -16,7 +16,7 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
+use super::{DeliveryFilter, Publisher, RequestLease, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -237,6 +237,7 @@ pub struct Subscribed {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    _request_lease: Arc<RequestLease>,
 }
 
 enum SubgroupStreamFactory {
@@ -347,6 +348,7 @@ impl Subscribed {
         publisher: Publisher,
         msg: message::Subscribe,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        request_lease: Arc<RequestLease>,
     ) -> Result<(Self, SubscribedRecv), SessionError> {
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
         let initial = SubscribedState {
@@ -362,12 +364,14 @@ impl Subscribed {
             ok: false,
             initiator: SubscriptionInitiator::Subscriber,
             mlog,
+            _request_lease: request_lease.clone(),
         };
 
         // Prevents updates after being closed
         let recv = SubscribedRecv {
             state: recv,
             info: recv_info,
+            _request_lease: request_lease,
         };
 
         Ok((send, recv))
@@ -378,6 +382,7 @@ impl Subscribed {
         publisher: Publisher,
         msg: &message::Publish,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        request_lease: Arc<RequestLease>,
     ) -> Result<(Self, SubscribedRecv), SessionError> {
         let synthetic = message::Subscribe {
             id: msg.id,
@@ -401,12 +406,14 @@ impl Subscribed {
             ok: false,
             initiator: SubscriptionInitiator::Publisher,
             mlog,
+            _request_lease: request_lease.clone(),
         };
         Ok((
             published,
             SubscribedRecv {
                 state: recv,
                 info: recv_info,
+                _request_lease: request_lease,
             },
         ))
     }
@@ -591,6 +598,7 @@ impl ops::Deref for Subscribed {
 
 impl Drop for Subscribed {
     fn drop(&mut self) {
+        self._request_lease.release();
         let state = self.state.lock();
         let err = state
             .closed
@@ -604,18 +612,16 @@ impl Drop for Subscribed {
             let _ = state.terminate();
         }
 
-        if self.initiator == SubscriptionInitiator::Publisher {
-            if peer_rejected {
+        if peer_rejected {
+            if self.initiator == SubscriptionInitiator::Publisher {
                 self.publisher.drop_published(self.info.id);
-                return;
+            } else {
+                self.publisher.drop_subscribe(self.info.id);
             }
-            self.publisher.send_message(message::PublishDone {
-                id: self.info.id,
-                status_code: Self::publish_done_code(&err),
-                stream_count,
-                reason: ReasonPhrase(err.to_string()),
-            });
-        } else if self.ok {
+            return;
+        }
+
+        if self.initiator == SubscriptionInitiator::Publisher || self.ok {
             self.publisher.send_message(message::PublishDone {
                 id: self.info.id,
                 status_code: Self::publish_done_code(&err),
@@ -1022,9 +1028,14 @@ impl Subscribed {
 pub(super) struct SubscribedRecv {
     state: State<SubscribedState>,
     info: SubscribeInfo,
+    _request_lease: Arc<RequestLease>,
 }
 
 impl SubscribedRecv {
+    pub(super) fn release_request_lease(&self) {
+        self._request_lease.release();
+    }
+
     pub fn recv_publish_ok(&mut self, msg: &message::RequestOk) -> Result<(), ServeError> {
         let forward = msg
             .params
@@ -1133,6 +1144,10 @@ mod tests {
             SubscribedRecv {
                 state: recv,
                 info: subscribe_info(request_id),
+                _request_lease: crate::session::test_request_lease(
+                    crate::session::RequestDirection::Inbound,
+                    crate::session::RequestClass::Subscribe,
+                ),
             },
         )
     }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod capacity;
 mod error;
 mod publish_namespace;
 mod publish_received;
@@ -18,6 +19,7 @@ mod target;
 mod track_status_requested;
 mod writer;
 
+pub use capacity::*;
 pub use error::*;
 pub use publish_namespace::*;
 pub use publish_received::*;
@@ -67,6 +69,59 @@ struct PendingReverseUpdate {
     completion: tokio::sync::oneshot::Sender<Result<(), SessionError>>,
 }
 
+/// Ensures every retained representation of a peer-opened logical request is
+/// removed on normal completion, rejection, reset, decode error, task abort,
+/// or panic unwind.
+struct InboundRequestGuard {
+    kind: RequestKind,
+    id: u64,
+    publisher: Option<Publisher>,
+    subscriber: Option<Subscriber>,
+    responses: BidiResponseMap,
+    response_ids: Arc<Mutex<std::collections::HashSet<u64>>>,
+    request_lease: Arc<RequestLease>,
+}
+
+impl Drop for InboundRequestGuard {
+    fn drop(&mut self) {
+        let response_ids = self
+            .response_ids
+            .lock()
+            .map(|ids| ids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_else(|_| vec![self.id]);
+        if let Ok(mut responses) = self.responses.lock() {
+            for response_id in response_ids {
+                responses.remove(&response_id);
+            }
+        }
+        match self.kind {
+            RequestKind::Subscribe => {
+                if let Some(publisher) = self.publisher.as_mut() {
+                    publisher.cleanup_inbound_subscribe(self.id);
+                }
+            }
+            RequestKind::PublishNamespace => {
+                if let Some(subscriber) = self.subscriber.as_mut() {
+                    subscriber.cleanup_inbound_publish_namespace(self.id);
+                }
+            }
+            RequestKind::Publish => {
+                if let Some(subscriber) = self.subscriber.as_mut() {
+                    subscriber.cleanup_inbound_publish(self.id);
+                }
+            }
+            RequestKind::TrackStatus => {
+                if let Some(publisher) = self.publisher.as_mut() {
+                    publisher.cleanup_inbound_track_status(self.id);
+                }
+            }
+            RequestKind::Fetch | RequestKind::SubscribeNamespace | RequestKind::SubscribeTracks => {
+            }
+        }
+        self.request_lease.release();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutgoingMessageDestination {
     Control,
@@ -77,6 +132,15 @@ enum OutgoingMessageDestination {
 struct RequestUpdateLimits {
     incoming: u64,
     outgoing: u64,
+    outgoing_hard: usize,
+}
+
+#[derive(Clone)]
+struct BidiRequestRuntime {
+    request_id: RequestId,
+    responses: BidiResponseMap,
+    update_limits: RequestUpdateLimits,
+    request_capacity: SessionRequestCapacity,
 }
 
 struct SessionConfig {
@@ -86,7 +150,7 @@ struct SessionConfig {
     peer_max_request_updates: u64,
 }
 
-type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<BidiCommand>>>>;
+type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::Sender<BidiCommand>>>>;
 
 /// Channel for spawned bidi response reader tasks. Publisher/Subscriber send
 /// handles here; `Session::run` collects and polls them.
@@ -95,7 +159,7 @@ type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender
 /// raced against session shutdown is aborted even when the caller ignores the
 /// send error. Dropping a bare `JoinHandle` would detach the task.
 #[derive(Clone)]
-pub(super) struct BidiTaskSender(tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>);
+pub(super) struct BidiTaskSender(tokio::sync::mpsc::Sender<tokio::task::JoinHandle<()>>);
 
 struct BidiTaskSendError(Option<tokio::task::JoinHandle<()>>);
 
@@ -123,18 +187,20 @@ impl BidiTaskSendError {
 }
 
 impl BidiTaskSender {
-    fn channel() -> (
+    fn channel(
+        capacity: usize,
+    ) -> (
         Self,
-        tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+        tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<()>>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (Self(tx), rx)
     }
 
     fn send(&self, task: tokio::task::JoinHandle<()>) -> Result<(), BidiTaskSendError> {
         self.0
-            .send(task)
-            .map_err(|error| BidiTaskSendError(Some(error.0)))
+            .try_send(task)
+            .map_err(|error| BidiTaskSendError(Some(error.into_inner())))
     }
 }
 
@@ -316,7 +382,7 @@ pub struct Session {
 
     /// Receiver for spawned bidi reader task handles.
     /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
-    bidi_task_rx: tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+    bidi_task_rx: tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<()>>,
 
     /// Maps bidi-request IDs to their response stream writers (draft-19).
     bidi_response_map: BidiResponseMap,
@@ -326,7 +392,12 @@ pub struct Session {
 
     /// Maximum concurrent reverse-direction REQUEST_UPDATEs advertised by the peer.
     peer_max_request_updates: u64,
+
+    /// Logical request ownership shared by both transport roles.
+    request_capacity: SessionRequestCapacity,
 }
+
+static GLOBAL_REQUEST_CAPACITY: LazyLock<RequestCapacity> = LazyLock::new(RequestCapacity::default);
 
 impl Session {
     const DEFAULT_MAX_REQUEST_UPDATES: u64 = 16;
@@ -705,12 +776,14 @@ impl Session {
         request_id: RequestId,
         config: SessionConfig,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
-        let outgoing = Queue::default().split();
+        let request_capacity = GLOBAL_REQUEST_CAPACITY.session();
+        let limits = request_capacity.limits();
+        let outgoing = Queue::bounded(limits.max_outbound_messages).split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
 
-        let (bidi_task_tx, bidi_task_rx) = BidiTaskSender::channel();
+        let (bidi_task_tx, bidi_task_rx) = BidiTaskSender::channel(limits.max_outbound_tasks);
         let bidi_response_map = Arc::new(Mutex::new(HashMap::new()));
 
         let publisher = Some(Publisher::new(
@@ -720,6 +793,7 @@ impl Session {
             request_id.clone(),
             bidi_task_tx.clone(),
             bidi_response_map.clone(),
+            request_capacity.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
@@ -728,6 +802,7 @@ impl Session {
             request_id.clone(),
             bidi_task_tx,
             bidi_response_map.clone(),
+            request_capacity.clone(),
         ));
 
         let session = Self {
@@ -746,6 +821,7 @@ impl Session {
             bidi_response_map,
             max_request_updates: Self::DEFAULT_MAX_REQUEST_UPDATES,
             peer_max_request_updates: config.peer_max_request_updates,
+            request_capacity,
         };
 
         (session, publisher, subscriber)
@@ -964,7 +1040,21 @@ impl Session {
         let result = tokio::select! {
             res = Self::run_recv(self.recver, self.mlog.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
-            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.max_request_updates, self.peer_max_request_updates) => res,
+            res = Self::run_bidi_requests(
+                self.webtransport.clone(),
+                self.publisher.clone(),
+                self.subscriber.clone(),
+                BidiRequestRuntime {
+                    request_id: self.request_id.clone(),
+                    responses: self.bidi_response_map.clone(),
+                    update_limits: RequestUpdateLimits {
+                        incoming: self.max_request_updates,
+                        outgoing: self.peer_max_request_updates,
+                        outgoing_hard: self.request_capacity.limits().max_reverse_updates,
+                    },
+                    request_capacity: self.request_capacity.clone(),
+                },
+            ) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
             // Collect bidi reader task handles and poll them to completion.
@@ -996,7 +1086,7 @@ impl Session {
     /// handle accepted by this collector is explicitly awaited after abort so
     /// no request-stream task can outlive `Session::run`.
     async fn shutdown_bidi_tasks(
-        bidi_task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+        bidi_task_rx: &mut tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<()>>,
         reader_tasks: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
     ) {
         bidi_task_rx.close();
@@ -1080,7 +1170,7 @@ impl Session {
                         .get(&target_id)
                         .cloned();
                     if let Some(tx) = tx_opt {
-                        if tx.send(BidiCommand::Send(msg)).is_err() {
+                        if tx.try_send(BidiCommand::Send(msg)).is_err() {
                             tracing::warn!(
                                 target_id,
                                 "bidi response channel closed, dropping message"
@@ -1121,10 +1211,7 @@ impl Session {
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
         subscriber: Option<Subscriber>,
-        request_id: RequestId,
-        bidi_response_map: BidiResponseMap,
-        max_request_updates: u64,
-        peer_max_request_updates: u64,
+        runtime: BidiRequestRuntime,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let limits = BidiRequestTaskLimits::production();
@@ -1141,18 +1228,13 @@ impl Session {
                     };
                     let mut pub_clone = publisher.clone();
                     let mut sub_clone = subscriber.clone();
-                    let rid = request_id.clone();
-                    let map = bidi_response_map.clone();
+                    let runtime = runtime.clone();
 
                     tasks.push(async move {
                         let _permit = permit;
                         Self::handle_bidi_request(
                             send_stream, recv_stream,
-                            &mut pub_clone, &mut sub_clone, &rid, &map,
-                            RequestUpdateLimits {
-                                incoming: max_request_updates,
-                                outgoing: peer_max_request_updates,
-                            },
+                            &mut pub_clone, &mut sub_clone, &runtime,
                         ).await
                     });
                 }
@@ -1174,10 +1256,12 @@ impl Session {
         recv_stream: web_transport::RecvStream,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
-        request_id: &RequestId,
-        bidi_response_map: &BidiResponseMap,
-        update_limits: RequestUpdateLimits,
+        runtime: &BidiRequestRuntime,
     ) -> Result<(), SessionError> {
+        let request_id = &runtime.request_id;
+        let bidi_response_map = &runtime.responses;
+        let update_limits = runtime.update_limits;
+        let request_capacity = &runtime.request_capacity;
         let mut reader = Reader::new(recv_stream);
         let mut writer = Writer::new(send_stream);
 
@@ -1192,11 +1276,61 @@ impl Session {
 
         request_id.validate_incoming(initial_id)?;
 
-        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<BidiCommand>();
+        let Some(request_class) = request_kind.request_class() else {
+            Self::encode_bidi_response(
+                &mut writer,
+                &Message::RequestError(message::RequestError {
+                    id: initial_id,
+                    error_code: message::RequestErrorCode::NotSupported as u64,
+                    retry_interval: 0,
+                    reason: crate::coding::ReasonPhrase("not supported".to_string()),
+                    redirect: None,
+                }),
+            )
+            .await?;
+            writer.finish();
+            reader.stop(Self::REQUEST_STREAM_CANCELLED);
+            tokio::task::yield_now().await;
+            return Ok(());
+        };
+        let request_lease = match request_capacity
+            .try_acquire(RequestDirection::Inbound, request_class)
+        {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                tracing::warn!(
+                    request_id = initial_id,
+                    request_kind = ?request_kind,
+                    %error,
+                    "rejecting request because logical capacity is exhausted"
+                );
+                Self::encode_bidi_response(&mut writer, &Self::excessive_load_response(initial_id))
+                    .await?;
+                writer.finish();
+                reader.stop(Self::DATA_STREAM_EXCESSIVE_LOAD);
+                tokio::task::yield_now().await;
+                return Ok(());
+            }
+        };
+
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<BidiCommand>(
+            request_capacity.limits().max_response_commands,
+        );
         bidi_response_map
             .lock()
             .map_err(|_| SessionError::Internal)?
             .insert(initial_id, response_tx.clone());
+
+        let response_ids = Arc::new(Mutex::new(std::collections::HashSet::from([initial_id])));
+        let _request_guard = InboundRequestGuard {
+            kind: request_kind,
+            id: initial_id,
+            publisher: publisher.clone(),
+            subscriber: subscriber.clone(),
+            responses: bidi_response_map.clone(),
+            response_ids: response_ids.clone(),
+            request_lease: request_lease.clone(),
+        };
 
         // Dispatch to the appropriate role handler (same as run_recv).
         // Capture the result so cleanup runs unconditionally on error.
@@ -1206,7 +1340,7 @@ impl Session {
                     subscriber
                         .as_mut()
                         .ok_or(SessionError::RoleViolation)?
-                        .recv_message(msg)?;
+                        .recv_request_message(msg, request_lease.clone())?;
                     return Ok(());
                 }
                 Err(msg) => msg,
@@ -1216,7 +1350,7 @@ impl Session {
                     publisher
                         .as_mut()
                         .ok_or(SessionError::RoleViolation)?
-                        .recv_message(msg)?;
+                        .recv_request_message(msg, request_lease.clone())?;
                 }
                 Err(msg) => {
                     tracing::warn!(
@@ -1227,12 +1361,7 @@ impl Session {
             }
             Ok(())
         })();
-        if let Err(error) = dispatch_result {
-            if let Ok(mut map) = bidi_response_map.lock() {
-                map.remove(&initial_id);
-            }
-            return Err(error);
-        }
+        dispatch_result?;
 
         let mut requester_open = true;
         let mut update_ids = std::collections::HashSet::new();
@@ -1266,6 +1395,10 @@ impl Session {
                                 .lock()
                                 .map_err(|_| SessionError::Internal)?
                                 .insert(update_id, response_tx.clone());
+                            response_ids
+                                .lock()
+                                .map_err(|_| SessionError::Internal)?
+                                .insert(update_id);
                             if previous.is_some() || !update_ids.insert(update_id) {
                                 break Err(SessionError::InvalidRequestId);
                             }
@@ -1356,9 +1489,9 @@ impl Session {
                                 )));
                                 continue;
                             }
-                            if update_limits.outgoing != 0
-                                && reverse_updates.len() as u64 >= update_limits.outgoing
-                            {
+                            let reverse_limit =
+                                Self::effective_reverse_update_limit(update_limits);
+                            if reverse_updates.len() >= reverse_limit {
                                 let _ = completion.send(Err(SessionError::TooManyRequestUpdates));
                                 continue;
                             }
@@ -1390,6 +1523,9 @@ impl Session {
                     if is_update_response {
                         if let Ok(mut map) = bidi_response_map.lock() {
                             map.remove(&response_id);
+                        }
+                        if let Ok(mut ids) = response_ids.lock() {
+                            ids.remove(&response_id);
                         }
                         update_credits.respond();
                     }
@@ -1440,6 +1576,25 @@ impl Session {
         tokio::task::yield_now().await;
 
         result
+    }
+
+    fn excessive_load_response(request_id: u64) -> Message {
+        Message::RequestError(message::RequestError {
+            id: request_id,
+            error_code: message::RequestErrorCode::ExcessiveLoad as u64,
+            retry_interval: 1001,
+            reason: crate::coding::ReasonPhrase("request capacity exhausted".to_string()),
+            redirect: None,
+        })
+    }
+
+    fn effective_reverse_update_limit(limits: RequestUpdateLimits) -> usize {
+        if limits.outgoing == 0 {
+            return limits.outgoing_hard;
+        }
+        usize::try_from(limits.outgoing)
+            .unwrap_or(usize::MAX)
+            .min(limits.outgoing_hard)
     }
 
     /// Decode a message sent after the first request-stream message.
@@ -1965,6 +2120,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn excessive_load_is_a_retryable_request_response_not_session_failure() {
+        let Message::RequestError(error) = Session::excessive_load_response(42) else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 42);
+        assert_eq!(
+            error.error_code,
+            message::RequestErrorCode::ExcessiveLoad as u64
+        );
+        assert_eq!(error.retry_interval, 1001);
+        assert!(error.redirect.is_none());
+        assert!(!error.reason.0.is_empty());
+    }
+
+    #[test]
+    fn reverse_updates_are_bounded_even_when_peer_advertises_unlimited() {
+        assert_eq!(
+            Session::effective_reverse_update_limit(RequestUpdateLimits {
+                incoming: 16,
+                outgoing: 0,
+                outgoing_hard: 64,
+            }),
+            64
+        );
+        assert_eq!(
+            Session::effective_reverse_update_limit(RequestUpdateLimits {
+                incoming: 16,
+                outgoing: 8,
+                outgoing_hard: 64,
+            }),
+            8
+        );
+        assert_eq!(
+            Session::effective_reverse_update_limit(RequestUpdateLimits {
+                incoming: 16,
+                outgoing: 4_096,
+                outgoing_hard: 64,
+            }),
+            64
+        );
+    }
+
+    #[test]
+    fn inbound_guard_cleans_response_registry_and_capacity_during_unwind() {
+        let mut limits = RequestLimits::default();
+        limits.session_inbound.total = 1;
+        limits.session_inbound.fetch = 1;
+        limits.process_inbound.total = 1;
+        limits.process_inbound.fetch = 1;
+        let capacity = RequestCapacity::new(limits).unwrap();
+        let session = capacity.session();
+        let lease = Arc::new(
+            session
+                .try_acquire(RequestDirection::Inbound, RequestClass::Fetch)
+                .unwrap(),
+        );
+        let responses: BidiResponseMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (update_tx, _update_rx) = tokio::sync::mpsc::channel(1);
+        responses
+            .lock()
+            .unwrap()
+            .extend([(77, tx), (79, update_tx)]);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let responses = responses.clone();
+            move || {
+                let _guard = InboundRequestGuard {
+                    kind: RequestKind::Fetch,
+                    id: 77,
+                    publisher: None,
+                    subscriber: None,
+                    responses,
+                    response_ids: Arc::new(Mutex::new(std::collections::HashSet::from([77, 79]))),
+                    request_lease: lease,
+                };
+                panic!("exercise lifecycle guard");
+            }
+        }));
+        assert!(unwind.is_err());
+        assert!(responses.lock().unwrap().is_empty());
+        assert!(session
+            .try_acquire(RequestDirection::Inbound, RequestClass::Fetch)
+            .is_ok());
+    }
+
     // ========================================================================
     // normalize_connection_path
     // ========================================================================
@@ -2242,7 +2484,7 @@ mod tests {
     #[tokio::test]
     async fn bidi_task_shutdown_drains_aborts_and_awaits_all_accepted_handles() {
         let dropped = Arc::new(AtomicUsize::new(0));
-        let (sender, mut receiver) = BidiTaskSender::channel();
+        let (sender, mut receiver) = BidiTaskSender::channel(2);
         let mut collected = FuturesUnordered::new();
 
         collected.push(pending_task(dropped.clone()));
@@ -2257,9 +2499,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bidi_task_queue_rejects_n_plus_one_and_aborts_rejected_task() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (sender, mut receiver) = BidiTaskSender::channel(1);
+        let mut collected = FuturesUnordered::new();
+
+        assert!(sender.send(pending_task(dropped.clone())).is_ok());
+        let rejected = sender.send(pending_task(dropped.clone()));
+        assert!(rejected.is_err());
+        drop(rejected);
+
+        Session::shutdown_bidi_tasks(&mut receiver, &mut collected).await;
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn bidi_task_sender_aborts_handle_raced_after_collector_close() {
         let dropped = Arc::new(AtomicUsize::new(0));
-        let (sender, mut receiver) = BidiTaskSender::channel();
+        let (sender, mut receiver) = BidiTaskSender::channel(1);
         receiver.close();
 
         let result = sender.send(pending_task(dropped.clone()));
@@ -2278,7 +2541,7 @@ mod tests {
     #[tokio::test]
     async fn bidi_task_send_error_can_abort_and_join_raced_handle() {
         let dropped = Arc::new(AtomicUsize::new(0));
-        let (sender, mut receiver) = BidiTaskSender::channel();
+        let (sender, mut receiver) = BidiTaskSender::channel(1);
         receiver.close();
 
         let Err(error) = sender.send(pending_task(dropped.clone())) else {

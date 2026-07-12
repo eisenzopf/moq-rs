@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{Publisher, SessionError};
+use std::sync::Arc;
+
+use super::{Publisher, RequestLease, SessionError};
 use crate::coding::{KeyValuePairs, ReasonPhrase};
 use crate::message;
 use crate::message::RequestOk;
@@ -10,13 +12,21 @@ use crate::serve;
 pub struct TrackStatusRequested {
     publisher: Publisher,
     pub request_msg: message::TrackStatus,
+    _request_lease: Arc<RequestLease>,
+    responded: bool,
 }
 
 impl TrackStatusRequested {
-    pub fn new(publisher: Publisher, request_msg: message::TrackStatus) -> Self {
+    pub(super) fn new(
+        publisher: Publisher,
+        request_msg: message::TrackStatus,
+        request_lease: Arc<RequestLease>,
+    ) -> Self {
         Self {
             publisher,
             request_msg,
+            _request_lease: request_lease,
+            responded: false,
         }
     }
 
@@ -36,6 +46,8 @@ impl TrackStatusRequested {
                 redirect: None,
             },
         );
+        self.responded = true;
+        self._request_lease.release();
         Ok(())
     }
 
@@ -61,7 +73,29 @@ impl TrackStatusRequested {
                 track_properties: Default::default(),
             },
         );
+        self.responded = true;
+        self._request_lease.release();
 
         Ok(())
+    }
+}
+
+impl Drop for TrackStatusRequested {
+    fn drop(&mut self) {
+        self._request_lease.release();
+        if self.responded {
+            return;
+        }
+        self.publisher.send_request_error(
+            "track_status",
+            message::RequestError {
+                id: self.request_msg.id,
+                error_code: message::RequestErrorCode::Uninterested as u64,
+                retry_interval: 0,
+                reason: ReasonPhrase("track status request dropped".to_string()),
+                redirect: None,
+            },
+        );
+        self.responded = true;
     }
 }

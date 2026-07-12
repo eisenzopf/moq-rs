@@ -24,9 +24,9 @@ use super::subscribed::{
 };
 use super::{
     BidiCommand, BidiResponseMap, PublishNamespace, PublishNamespaceRecv,
-    PublishNamespaceRejection, Published, PublishedInfo, RequestId, RequestUpdateCredits, Session,
-    SessionError, Subscribed, SubscribedRecv, TrackStatusRequested,
-    DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
+    PublishNamespaceRejection, Published, PublishedInfo, RequestClass, RequestDirection, RequestId,
+    RequestLease, RequestUpdateCredits, Session, SessionError, SessionRequestCapacity, Subscribed,
+    SubscribedRecv, TrackStatusRequested, DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
 };
 use crate::message::RequestErrorCode;
 
@@ -39,6 +39,22 @@ enum PublishRequestStreamEvent {
 struct PublishNamespaceResponseGuard {
     publisher: Publisher,
     request_id: u64,
+}
+
+struct PublishResponseGuard {
+    publisher: Publisher,
+    request_id: u64,
+    responses: BidiResponseMap,
+}
+
+impl Drop for PublishResponseGuard {
+    fn drop(&mut self) {
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.remove(&self.request_id);
+        }
+        self.publisher
+            .reject_published_locally(self.request_id, ServeError::Cancel);
+    }
 }
 
 impl Drop for PublishNamespaceResponseGuard {
@@ -89,6 +105,9 @@ pub struct Publisher {
     /// Request-stream writers used to deliver PUBLISH_DONE on the same bidi
     /// stream as the original outbound PUBLISH.
     bidi_response_map: BidiResponseMap,
+
+    /// Shared fail-fast ownership for logical inbound and outbound requests.
+    request_capacity: SessionRequestCapacity,
 }
 
 impl Publisher {
@@ -99,19 +118,22 @@ impl Publisher {
         request_id: RequestId,
         bidi_task_tx: super::BidiTaskSender,
         bidi_response_map: BidiResponseMap,
+        request_capacity: SessionRequestCapacity,
     ) -> Self {
+        let limits = request_capacity.limits();
         Self {
             webtransport,
             publish_namespaces: Default::default(),
             subscribeds: Default::default(),
             published: Default::default(),
-            unknown_subscribed: Default::default(),
-            unknown_track_status_requested: Default::default(),
+            unknown_subscribed: Queue::bounded(limits.session_inbound.subscribe),
+            unknown_track_status_requested: Queue::bounded(limits.session_inbound.track_status),
             outgoing,
             request_id,
             mlog,
             bidi_task_tx,
             bidi_response_map,
+            request_capacity,
         }
     }
 
@@ -173,6 +195,10 @@ impl Publisher {
         &mut self,
         namespace: TrackNamespace,
     ) -> Result<PublishNamespace, SessionError> {
+        let request_lease = Arc::new(
+            self.request_capacity
+                .try_acquire(RequestDirection::Outbound, RequestClass::PublishNamespace)?,
+        );
         // Phase 1: allocate under lock, release before any await.
         let (mut publish_ns, wire_msg, request_id) = {
             let mut namespaces = self
@@ -185,7 +211,8 @@ impl Publisher {
             }
 
             let request_id = self.request_id.allocate()?;
-            let (send, recv) = PublishNamespace::new(self.clone(), request_id, namespace.clone());
+            let (send, recv) =
+                PublishNamespace::new(self.clone(), request_id, namespace.clone(), request_lease);
             namespaces.insert(namespace.clone(), recv);
             let wire_msg: Message = send.wire_message().into();
             (send, wire_msg, request_id)
@@ -218,11 +245,12 @@ impl Publisher {
         // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
         let mut this = self.clone();
         let bidi_request_id = request_id;
+        let response_guard = PublishNamespaceResponseGuard {
+            publisher: this.clone(),
+            request_id: bidi_request_id,
+        };
         let handle = tokio::spawn(async move {
-            let _response_guard = PublishNamespaceResponseGuard {
-                publisher: this.clone(),
-                request_id: bidi_request_id,
-            };
+            let _response_guard = response_guard;
             let mut reader = super::Reader::new(recv_stream);
             loop {
                 let response = tokio::select! {
@@ -337,6 +365,10 @@ impl Publisher {
     /// direction until it writes `PUBLISH_DONE` and FIN, as required by
     /// draft-19.
     pub async fn publish_open(&mut self, track: TrackReader) -> Result<Published, SessionError> {
+        let request_lease = Arc::new(
+            self.request_capacity
+                .try_acquire(RequestDirection::Outbound, RequestClass::Publish)?,
+        );
         let request_id = self.request_id.allocate()?;
         // Request IDs are unique across both roles in a session; using the ID
         // as the alias therefore cannot collide with aliases assigned to
@@ -357,7 +389,7 @@ impl Publisher {
             track_extensions: Default::default(),
         };
         let (subscription, recv) =
-            Subscribed::new_published(self.clone(), &publish, self.mlog.clone())?;
+            Subscribed::new_published(self.clone(), &publish, self.mlog.clone(), request_lease)?;
         self.published
             .lock()
             .map_err(|_| SessionError::Internal)?
@@ -382,7 +414,8 @@ impl Publisher {
             return Err(err);
         }
 
-        let (terminal_tx, terminal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (terminal_tx, terminal_rx) =
+            tokio::sync::mpsc::channel(self.request_capacity.limits().max_response_commands);
         let previous = self
             .bidi_response_map
             .lock()
@@ -395,7 +428,13 @@ impl Publisher {
 
         let mut this = self.clone();
         let map = self.bidi_response_map.clone();
+        let response_guard = PublishResponseGuard {
+            publisher: this.clone(),
+            request_id,
+            responses: map.clone(),
+        };
         let handle = tokio::spawn(async move {
+            let _response_guard = response_guard;
             let result = Self::run_publish_request_stream(
                 request_id,
                 writer,
@@ -444,7 +483,7 @@ impl Publisher {
         request_id: u64,
         mut writer: super::Writer,
         mut reader: super::Reader,
-        mut terminal_rx: tokio::sync::mpsc::UnboundedReceiver<BidiCommand>,
+        mut terminal_rx: tokio::sync::mpsc::Receiver<BidiCommand>,
         publisher: &mut Publisher,
     ) -> Result<(), SessionError> {
         let mut response_open = true;
@@ -586,7 +625,7 @@ impl Publisher {
             .ok()
             .and_then(|streams| streams.get(&id).cloned());
         if let Some(command) = command {
-            let _ = command.send(BidiCommand::Cancel(code));
+            let _ = command.try_send(BidiCommand::Cancel(code));
         }
         if let Some(mut published) = self.drop_published(id) {
             let _ = published.recv_error(ServeError::Cancel);
@@ -713,7 +752,13 @@ impl Publisher {
 
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         match msg {
-            message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg)?,
+            message::Subscriber::Subscribe(msg) => {
+                let lease = Arc::new(
+                    self.request_capacity
+                        .try_acquire(RequestDirection::Inbound, RequestClass::Subscribe)?,
+                );
+                self.recv_subscribe(msg, lease)?;
+            }
             message::Subscriber::RequestUpdate(_) => {
                 return Err(SessionError::ProtocolViolation(
                     "REQUEST_UPDATE was not associated with a request stream".to_string(),
@@ -735,7 +780,13 @@ impl Publisher {
             message::Subscriber::Fetch(msg) => {
                 self.send_not_supported(msg.id, "fetch");
             }
-            message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
+            message::Subscriber::TrackStatus(msg) => {
+                let lease = Arc::new(
+                    self.request_capacity
+                        .try_acquire(RequestDirection::Inbound, RequestClass::TrackStatus)?,
+                );
+                self.recv_track_status(msg, lease)?;
+            }
             // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::SubscribeNamespace(msg) => {
                 self.send_not_supported(msg.id, "subscribe_namespace");
@@ -748,6 +799,20 @@ impl Publisher {
         }
 
         Ok(())
+    }
+
+    /// Dispatch the first message on a peer-opened request stream while
+    /// attaching its already-acquired logical request lease to retained state.
+    pub(super) fn recv_request_message(
+        &mut self,
+        msg: message::Subscriber,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
+        match msg {
+            message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg, request_lease),
+            message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg, request_lease),
+            other => self.recv_message(other),
+        }
     }
 
     pub(crate) fn recv_request_update(
@@ -843,20 +908,24 @@ impl Publisher {
     ) -> Result<(), SessionError> {
         self.log_request_error_parsed("publish_namespace", &msg);
         if let Some(recv) = self.drop_publish_namespace(msg.id) {
+            recv.release_request_lease();
             recv.recv_rejected(PublishNamespaceRejection::from(msg))?;
         }
         Ok(())
     }
 
     fn recv_publish_namespace_response_stream_closed(&mut self, id: u64) {
-        if let Ok(mut namespaces) = self.publish_namespaces.lock() {
-            if let Some(recv) = namespaces.values_mut().find(|recv| recv.request_id == id) {
-                recv.recv_response_stream_closed();
-            }
+        if let Some(mut recv) = self.drop_publish_namespace(id) {
+            recv.recv_response_stream_closed();
+            recv.release_request_lease();
         }
     }
 
-    fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
+    fn recv_subscribe(
+        &mut self,
+        msg: message::Subscribe,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
 
         let subscribed = {
@@ -869,7 +938,8 @@ impl Publisher {
                 return Err(SessionError::InvalidRequestId);
             }
 
-            let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
+            let (send, recv) =
+                Subscribed::new(self.clone(), msg, self.mlog.clone(), request_lease)?;
             subscribeds.insert(send.info.id, recv);
 
             send
@@ -896,10 +966,14 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_track_status(&mut self, msg: message::TrackStatus) -> Result<(), SessionError> {
+    fn recv_track_status(
+        &mut self,
+        msg: message::TrackStatus,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
 
-        let track_status_requested = TrackStatusRequested::new(self.clone(), msg);
+        let track_status_requested = TrackStatusRequested::new(self.clone(), msg, request_lease);
 
         if let Some(ns) = self
             .publish_namespaces
@@ -965,6 +1039,36 @@ impl Publisher {
         Ok(())
     }
 
+    /// Remove every retained representation of a peer-opened SUBSCRIBE.
+    pub(super) fn cleanup_inbound_subscribe(&mut self, id: u64) {
+        let recv = self
+            .subscribeds
+            .lock()
+            .ok()
+            .and_then(|mut subscribes| subscribes.remove(&id));
+        if let Some(mut recv) = recv {
+            let _ = recv.recv_error(ServeError::Cancel);
+        }
+        self.unknown_subscribed
+            .remove_where(|subscribe| subscribe.info.id == id);
+        if let Ok(mut namespaces) = self.publish_namespaces.lock() {
+            for namespace in namespaces.values_mut() {
+                namespace.remove_subscribe(id);
+            }
+        }
+    }
+
+    /// Remove every queued representation of a peer-opened TRACK_STATUS.
+    pub(super) fn cleanup_inbound_track_status(&mut self, id: u64) {
+        self.unknown_track_status_requested
+            .remove_where(|request| request.request_msg.id == id);
+        if let Ok(mut namespaces) = self.publish_namespaces.lock() {
+            for namespace in namespaces.values_mut() {
+                namespace.remove_track_status(id);
+            }
+        }
+    }
+
     pub(super) fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
         if let Ok(mut ns) = self.publish_namespaces.lock() {
             let key = ns
@@ -979,7 +1083,11 @@ impl Publisher {
     }
 
     pub(super) fn drop_published(&mut self, id: u64) -> Option<SubscribedRecv> {
-        self.published.lock().ok()?.remove(&id)
+        let recv = self.published.lock().ok()?.remove(&id);
+        if let Some(recv) = &recv {
+            recv.release_request_lease();
+        }
+        recv
     }
 
     pub(super) async fn open_uni(&mut self) -> Result<web_transport::SendStream, SessionError> {
