@@ -311,20 +311,7 @@ impl PublishReceivedRecv {
                 return Err(ServeError::Mode);
             }
         };
-        let subgroup_id = header
-            .resolved_subgroup_id()
-            .map_err(|err| ServeError::internal_ctx(format!("invalid subgroup id: {err}")))?
-            .ok_or_else(|| {
-                ServeError::internal_ctx(
-                    "FIRST_OBJECT subgroup id was not resolved before creating the subgroup",
-                )
-            })?;
-        let subgroup = subgroups.create(serve::Subgroup {
-            group_id: header.group_id,
-            subgroup_id,
-            priority: header.publisher_priority,
-            first_object: header.header_type.is_first_object(),
-        })?;
+        let subgroup = subgroups.create(serve::Subgroup::from_header(&header)?)?;
         self.writer = Some(subgroups.into());
         Ok(subgroup)
     }
@@ -568,5 +555,33 @@ mod tests {
         assert!(!recv.claim_object(8, 0));
         recv.set_forward(true);
         assert!(recv.claim_object(8, 0));
+    }
+
+    #[test]
+    fn reverse_publish_receive_path_preserves_first_object_and_end_of_group() {
+        let (_app, mut recv) = recv();
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "audio").produce();
+        recv.writer = Some(writer.into());
+        let header_type = data::StreamHeaderType::subgroup(
+            true,
+            data::SubgroupIdMode::Explicit,
+            true,
+            false,
+            true,
+        );
+
+        let subgroup = recv
+            .subgroup(data::SubgroupHeader {
+                header_type,
+                track_alias: 1,
+                group_id: 2,
+                subgroup_id: Some(3),
+                publisher_priority: 4,
+            })
+            .unwrap();
+
+        assert!(subgroup.first_object);
+        assert!(subgroup.end_of_group);
     }
 }

@@ -478,6 +478,7 @@ mod tests {
                 subgroup_id: 0,
                 priority: 0,
                 first_object: true,
+                end_of_group: false,
             })
             .expect("create subgroup should succeed");
 

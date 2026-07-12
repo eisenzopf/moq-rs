@@ -14,7 +14,7 @@ use std::{cmp, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
 
-use crate::data::ObjectStatus;
+use crate::data::{self, ObjectStatus};
 use crate::watch::State;
 
 use super::{ServeError, Track};
@@ -80,6 +80,19 @@ impl SubgroupsWriter {
 
     // Helper to increment the group by one.
     pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
+        self.append_with_end_of_group(priority, false)
+    }
+
+    /// Append a subgroup for an original publisher and explicitly state
+    /// whether it completes the Group.
+    ///
+    /// [`Self::append`] remains conservative for legacy callers and defaults
+    /// this assertion to false.
+    pub fn append_with_end_of_group(
+        &mut self,
+        priority: u8,
+        end_of_group: bool,
+    ) -> Result<SubgroupWriter, ServeError> {
         let group_id;
         let subgroup_id;
 
@@ -94,12 +107,7 @@ impl SubgroupsWriter {
             subgroup_id = self.next_subgroup_id;
         }
 
-        self.create(Subgroup {
-            group_id,
-            subgroup_id,
-            priority,
-            first_object: true,
-        })
+        self.create(Subgroup::new(group_id, subgroup_id, priority).with_end_of_group(end_of_group))
     }
 
     /// Create a new subgroup with the given parameters, inserting it into the track.
@@ -110,6 +118,7 @@ impl SubgroupsWriter {
             subgroup_id: subgroup.subgroup_id,
             priority: subgroup.priority,
             first_object: subgroup.first_object,
+            end_of_group: subgroup.end_of_group,
         };
         let (writer, reader) = subgroup.produce();
 
@@ -238,6 +247,70 @@ pub struct Subgroup {
     /// Subgroup. Draft-19 requires original publishers, and relays that retain
     /// that first Object, to preserve this signal.
     pub first_object: bool,
+
+    /// Whether this stream contains the largest Object in its Group. A clean
+    /// stream FIN then communicates that larger Object IDs do not exist.
+    pub end_of_group: bool,
+}
+
+impl Subgroup {
+    /// Construct a subgroup for an original publisher.
+    ///
+    /// The legacy/default behavior begins with the original first Object but
+    /// makes no claim that the subgroup completes its Group. Publishers must
+    /// opt in to [`Self::with_end_of_group`] only when that fact is known.
+    pub const fn new(group_id: u64, subgroup_id: u64, priority: u8) -> Self {
+        Self {
+            group_id,
+            subgroup_id,
+            priority,
+            first_object: true,
+            end_of_group: false,
+        }
+    }
+
+    /// Override whether this stream begins with the originally published
+    /// first Object. Relays use this when their cache starts later.
+    pub const fn with_first_object(mut self, first_object: bool) -> Self {
+        self.first_object = first_object;
+        self
+    }
+
+    /// Mark whether this subgroup contains the largest Object in its Group.
+    pub const fn with_end_of_group(mut self, end_of_group: bool) -> Self {
+        self.end_of_group = end_of_group;
+        self
+    }
+
+    /// Convert a validated draft-19 wire header into serve metadata.
+    ///
+    /// This is the common relay boundary: it rejects non-subgroup and
+    /// unresolved subgroup-ID combinations while preserving both independent
+    /// FIRST_OBJECT and END_OF_GROUP assertions.
+    pub fn from_header(header: &data::SubgroupHeader) -> Result<Self, ServeError> {
+        if !header.header_type.is_subgroup() {
+            return Err(ServeError::internal_ctx(
+                "cannot create serve subgroup from a non-subgroup header",
+            ));
+        }
+
+        let subgroup_id = header
+            .resolved_subgroup_id()
+            .map_err(|err| ServeError::internal_ctx(format!("invalid subgroup id: {err}")))?
+            .ok_or_else(|| {
+                ServeError::internal_ctx(
+                    "FIRST_OBJECT subgroup id was not resolved before creating the subgroup",
+                )
+            })?;
+
+        Ok(Self {
+            group_id: header.group_id,
+            subgroup_id,
+            priority: header.publisher_priority,
+            first_object: header.header_type.is_first_object(),
+            end_of_group: header.header_type.contains_end_of_group(),
+        })
+    }
 }
 
 /// Static information about the group
@@ -258,6 +331,9 @@ pub struct SubgroupInfo {
 
     /// Whether this stream begins with the original first Object.
     pub first_object: bool,
+
+    /// Whether this stream contains the largest Object in its Group.
+    pub end_of_group: bool,
 }
 
 impl SubgroupInfo {
@@ -647,23 +723,95 @@ impl Deref for SubgroupObjectReader {
 mod tests {
     use super::*;
     use crate::coding::TrackNamespace;
+    use crate::data::{StreamHeaderType, SubgroupHeader, SubgroupIdMode};
 
     #[test]
-    fn first_object_semantics_survive_the_serve_model() {
+    fn legacy_construction_uses_safe_draft19_defaults() {
         let (track, _reader) =
             Track::new(TrackNamespace::from_utf8_path("live"), "audio").produce();
         let mut groups = track.subgroups().unwrap();
         let relayed = groups
-            .create(Subgroup {
-                group_id: 1,
-                subgroup_id: 2,
-                priority: 3,
-                first_object: false,
-            })
+            .create(Subgroup::new(1, 2, 3).with_first_object(false))
             .unwrap();
         assert!(!relayed.first_object);
+        assert!(!relayed.end_of_group);
 
         let original = groups.append(3).unwrap();
         assert!(original.first_object);
+        assert!(!original.end_of_group);
+
+        let complete = groups.append_with_end_of_group(3, true).unwrap();
+        assert!(complete.first_object);
+        assert!(complete.end_of_group);
+    }
+
+    #[test]
+    fn all_legal_first_and_end_flag_combinations_survive_the_model() {
+        for first_object in [false, true] {
+            for end_of_group in [false, true] {
+                let header_type = StreamHeaderType::subgroup(
+                    true,
+                    SubgroupIdMode::Explicit,
+                    end_of_group,
+                    false,
+                    first_object,
+                );
+                let subgroup = Subgroup::from_header(&SubgroupHeader {
+                    header_type,
+                    track_alias: 1,
+                    group_id: 2,
+                    subgroup_id: Some(3),
+                    publisher_priority: 4,
+                })
+                .unwrap();
+
+                assert_eq!(subgroup.first_object, first_object);
+                assert_eq!(subgroup.end_of_group, end_of_group);
+            }
+        }
+    }
+
+    #[test]
+    fn relay_preserves_first_object_and_end_of_group_metadata() {
+        let header_type =
+            StreamHeaderType::subgroup(true, SubgroupIdMode::Explicit, true, false, true);
+        let subgroup = Subgroup::from_header(&SubgroupHeader {
+            header_type,
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: Some(3),
+            publisher_priority: 4,
+        })
+        .unwrap();
+
+        let (track, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("relay"), "audio").produce();
+        let mut groups = track.subgroups().unwrap();
+        let relayed = groups.create(subgroup).unwrap();
+        assert!(relayed.first_object);
+        assert!(relayed.end_of_group);
+    }
+
+    #[test]
+    fn wire_conversion_rejects_non_subgroup_and_unresolved_id_headers() {
+        let non_subgroup = SubgroupHeader {
+            header_type: StreamHeaderType::Fetch,
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: None,
+            publisher_priority: 3,
+        };
+        assert!(Subgroup::from_header(&non_subgroup).is_err());
+
+        let unresolved_type =
+            StreamHeaderType::subgroup(true, SubgroupIdMode::FirstObject, false, false, true);
+        let unresolved = SubgroupHeader {
+            header_type: unresolved_type,
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: None,
+            publisher_priority: 3,
+        };
+        assert!(Subgroup::from_header(&unresolved).is_err());
     }
 }

@@ -239,12 +239,105 @@ pub struct Subscribed {
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
+enum SubgroupStreamFactory {
+    Network(Box<Publisher>),
+    #[cfg(test)]
+    Recording(RecordingSubgroupStream),
+}
+
+impl SubgroupStreamFactory {
+    async fn open(&mut self, priority: u8) -> Result<SubgroupStreamOutput, SessionError> {
+        match self {
+            Self::Network(publisher) => {
+                let mut send_stream = publisher.open_uni().await?;
+                send_stream.set_priority(priority as i32);
+
+                let mut writer = Writer::new(send_stream);
+                writer.reset_on_drop(super::Session::REQUEST_STREAM_CANCELLED);
+                Ok(SubgroupStreamOutput::Network(writer))
+            }
+            #[cfg(test)]
+            Self::Recording(stream) => {
+                {
+                    let mut state = stream.0.lock().map_err(|_| SessionError::Internal)?;
+                    state.open_count += 1;
+                    state.priority = Some(priority);
+                }
+                Ok(SubgroupStreamOutput::Recording(stream.clone()))
+            }
+        }
+    }
+}
+
+enum SubgroupStreamOutput {
+    Network(Writer),
+    #[cfg(test)]
+    Recording(RecordingSubgroupStream),
+}
+
+impl SubgroupStreamOutput {
+    async fn encode<T: Encode>(&mut self, message: &T) -> Result<(), SessionError> {
+        match self {
+            Self::Network(writer) => writer.encode(message).await,
+            #[cfg(test)]
+            Self::Recording(stream) => {
+                let mut state = stream.0.lock().map_err(|_| SessionError::Internal)?;
+                message.encode(&mut state.bytes)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn write(&mut self, payload: &[u8]) -> Result<(), SessionError> {
+        match self {
+            Self::Network(writer) => writer.write(payload).await,
+            #[cfg(test)]
+            Self::Recording(stream) => {
+                let mut state = stream.0.lock().map_err(|_| SessionError::Internal)?;
+                state.bytes.extend_from_slice(payload);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), SessionError> {
+        match self {
+            Self::Network(writer) => {
+                writer.finish();
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Recording(stream) => {
+                stream
+                    .0
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?
+                    .finished = true;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct RecordingSubgroupStream(Arc<Mutex<RecordingSubgroupStreamState>>);
+
+#[cfg(test)]
+#[derive(Default)]
+struct RecordingSubgroupStreamState {
+    bytes: bytes::BytesMut,
+    open_count: usize,
+    priority: Option<u8>,
+    finished: bool,
+}
+
 impl Subscribed {
-    fn subgroup_header_type(first_object: bool) -> data::StreamHeaderType {
+    fn subgroup_header_type(first_object: bool, end_of_group: bool) -> data::StreamHeaderType {
         data::StreamHeaderType::subgroup(
             true,
             data::SubgroupIdMode::Explicit,
-            false,
+            end_of_group,
             false,
             first_object,
         )
@@ -596,7 +689,10 @@ impl Subscribed {
                 res = subgroups.next(), if done.is_none() => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
-                            header_type: Self::subgroup_header_type(subgroup.first_object),
+                            header_type: Self::subgroup_header_type(
+                                subgroup.first_object,
+                                subgroup.end_of_group,
+                            ),
                             track_alias: self.info.id, // use subscription id as track_alias
                             group_id: subgroup.group_id,
                             subgroup_id: Some(subgroup.subgroup_id),
@@ -644,8 +740,27 @@ impl Subscribed {
 
     async fn serve_subgroup(
         header: data::SubgroupHeader,
+        subgroup_reader: serve::SubgroupReader,
+        publisher: Publisher,
+        state: State<SubscribedState>,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        delivery_filter: DeliveryFilter,
+    ) -> Result<(), SessionError> {
+        Self::serve_subgroup_with_factory(
+            header,
+            subgroup_reader,
+            SubgroupStreamFactory::Network(Box::new(publisher)),
+            state,
+            mlog,
+            delivery_filter,
+        )
+        .await
+    }
+
+    async fn serve_subgroup_with_factory(
+        header: data::SubgroupHeader,
         mut subgroup_reader: serve::SubgroupReader,
-        mut publisher: Publisher,
+        mut stream_factory: SubgroupStreamFactory,
         state: State<SubscribedState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
@@ -657,7 +772,7 @@ impl Subscribed {
             subgroup_reader.priority
         );
 
-        let mut writer: Option<Writer> = None;
+        let mut writer: Option<SubgroupStreamOutput> = None;
         let mut object_count = 0;
         loop {
             Self::wait_until_forward(&state).await?;
@@ -676,19 +791,13 @@ impl Subscribed {
             }
 
             if writer.is_none() {
-                let mut send_stream = publisher.open_uni().await?;
+                let mut new_writer = stream_factory.open(subgroup_reader.priority).await?;
                 tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
                 state
                     .lock_mut()
                     .ok_or(ServeError::Done)?
                     .record_stream_opened();
-
-                // TODO figure out u32 vs u64 priority
-                send_stream.set_priority(subgroup_reader.priority as i32);
-
-                let mut new_writer = Writer::new(send_stream);
-                new_writer.reset_on_drop(super::Session::REQUEST_STREAM_CANCELLED);
 
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
@@ -798,7 +907,7 @@ impl Subscribed {
         );
 
         if let Some(mut writer) = writer {
-            writer.finish();
+            writer.finish()?;
         }
 
         Ok(())
@@ -1002,6 +1111,7 @@ pub(super) fn lookup_joining_subscription(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::Decode;
 
     fn subscribe_info(request_id: u64) -> SubscribeInfo {
         SubscribeInfo::new_from_subscribe(&message::Subscribe {
@@ -1085,9 +1195,103 @@ mod tests {
     }
 
     #[test]
-    fn subgroup_header_preserves_first_object_semantics() {
-        assert!(Subscribed::subgroup_header_type(true).is_first_object());
-        assert!(!Subscribed::subgroup_header_type(false).is_first_object());
+    fn subgroup_header_preserves_draft19_first_and_end_semantics() {
+        for first_object in [false, true] {
+            for end_of_group in [false, true] {
+                let header_type = Subscribed::subgroup_header_type(first_object, end_of_group);
+                assert_eq!(header_type.is_first_object(), first_object);
+                assert_eq!(header_type.contains_end_of_group(), end_of_group);
+            }
+        }
+
+        let header_type = Subscribed::subgroup_header_type(true, true);
+        assert_eq!(header_type.value(), 0x5d);
+        let header = data::SubgroupHeader {
+            header_type,
+            track_alias: 2,
+            group_id: 3,
+            subgroup_id: Some(4),
+            publisher_priority: 5,
+        };
+        let mut wire = bytes::BytesMut::new();
+        header.encode(&mut wire).unwrap();
+        assert_eq!(wire.as_ref(), &[0x5d, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[tokio::test]
+    async fn one_object_complete_group_sets_both_bits_and_finishes_stream() {
+        let subgroup = serve::SubgroupInfo {
+            track: Arc::new(serve::Track::new(
+                TrackNamespace::from_utf8_path("test/session"),
+                "audio",
+            )),
+            group_id: 3,
+            subgroup_id: 4,
+            priority: 5,
+            first_object: true,
+            end_of_group: true,
+        };
+        let (mut subgroup_writer, subgroup_reader) = subgroup.produce();
+        subgroup_writer
+            .write(bytes::Bytes::from_static(b"opus"))
+            .unwrap();
+        drop(subgroup_writer);
+
+        let header_type = Subscribed::subgroup_header_type(
+            subgroup_reader.first_object,
+            subgroup_reader.end_of_group,
+        );
+        let header = data::SubgroupHeader {
+            header_type,
+            track_alias: 2,
+            group_id: subgroup_reader.group_id,
+            subgroup_id: Some(subgroup_reader.subgroup_id),
+            publisher_priority: subgroup_reader.priority,
+        };
+        let recording = RecordingSubgroupStream::default();
+        let subscribed_state = State::default();
+
+        Subscribed::serve_subgroup_with_factory(
+            header,
+            subgroup_reader,
+            SubgroupStreamFactory::Recording(recording.clone()),
+            subscribed_state.clone(),
+            None,
+            DeliveryFilter {
+                forward: true,
+                start_location: None,
+                end_group_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let state = recording.0.lock().unwrap();
+        assert_eq!(state.open_count, 1);
+        assert_eq!(state.priority, Some(5));
+        assert!(state.finished, "a complete subgroup must send stream FIN");
+
+        let mut wire = state.bytes.clone();
+        drop(state);
+        let decoded_type = data::StreamHeaderType::decode(&mut wire).unwrap();
+        assert_eq!(decoded_type.value(), 0x5d);
+        assert!(decoded_type.is_first_object());
+        assert!(decoded_type.contains_end_of_group());
+
+        let decoded_header = data::SubgroupHeader::decode(decoded_type, &mut wire).unwrap();
+        assert_eq!(decoded_header.track_alias, 2);
+        assert_eq!(decoded_header.group_id, 3);
+        assert_eq!(decoded_header.subgroup_id, Some(4));
+        assert_eq!(decoded_header.publisher_priority, 5);
+
+        let object = data::SubgroupObjectExt::decode(&mut wire).unwrap();
+        assert_eq!(object.object_id_delta, 0);
+        assert_eq!(object.payload_length, 4);
+        assert_eq!(wire.as_ref(), b"opus");
+
+        let state = subscribed_state.lock();
+        assert_eq!(state.stream_count, 1);
+        assert_eq!(state.largest_location, Some(Location::new(3, 0)));
     }
 
     #[test]
