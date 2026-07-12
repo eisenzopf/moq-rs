@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Control messages sent over the bidirectional control stream.
+//! Messages sent over MOQT control and request streams.
 //!
-//! Wire format per draft-ietf-moq-transport-19 §9:
+//! Draft-19 uses a pair of unidirectional control streams. After `SETUP`,
+//! `GOAWAY` is the only message in this module that may be sent on a control
+//! stream; every other message is confined to a bidirectional request stream.
+//!
+//! Wire format per draft-ietf-moq-transport-19 §10:
 //!
 //! ```text
 //! MOQT Control Message {
@@ -72,10 +76,35 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use bytes::Buf as _;
 use std::fmt;
 
+/// Streams on which a draft-19 message is permitted.
+///
+/// `SETUP` is represented by [`crate::setup::Setup`] rather than [`Message`],
+/// so there is no control-only variant in this enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessagePlacement {
+    /// The message is valid only on a bidirectional request stream.
+    RequestOnly,
+    /// The message is valid on either the session control stream or an
+    /// established request stream.
+    ControlOrRequest,
+}
+
+impl MessagePlacement {
+    /// Whether the message may be encoded on the session control stream.
+    pub const fn allows_control(self) -> bool {
+        matches!(self, Self::ControlOrRequest)
+    }
+
+    /// Whether the message may be encoded on a bidirectional request stream.
+    pub const fn allows_request(self) -> bool {
+        true
+    }
+}
+
 // Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
     {$($name:ident = $val:expr,)*} => {
-        /// Wire type IDs for control messages (draft-19 Table 5).
+        /// Wire type IDs for control and request messages (draft-19 Table 5).
         ///
         /// These are the `u64` values used in the `Message Type` field on
         /// the wire. Use these constants instead of hardcoded hex literals
@@ -85,7 +114,7 @@ macro_rules! message_types {
             $(pub const $name: u64 = $val;)*
         }
 
-        /// All supported control message types.
+        /// All supported framed message types after `SETUP`.
         #[derive(Clone)]
         pub enum Message {
             $($name($name)),*
@@ -151,6 +180,33 @@ macro_rules! message_types {
             pub fn name(&self) -> &'static str {
                 match self {
                     $(Self::$name(_) => stringify!($name),)*
+                }
+            }
+
+            /// Return the stream placement required by draft-19 Table 5.
+            ///
+            /// This deliberately uses an exhaustive match rather than a
+            /// default so adding a new message requires an explicit protocol
+            /// placement decision.
+            pub const fn placement(&self) -> MessagePlacement {
+                match self {
+                    Self::GoAway(_) => MessagePlacement::ControlOrRequest,
+                    Self::RequestUpdate(_)
+                    | Self::RequestError(_)
+                    | Self::RequestOk(_)
+                    | Self::Subscribe(_)
+                    | Self::SubscribeOk(_)
+                    | Self::PublishNamespace(_)
+                    | Self::Namespace(_)
+                    | Self::NamespaceDone(_)
+                    | Self::TrackStatus(_)
+                    | Self::Publish(_)
+                    | Self::PublishDone(_)
+                    | Self::Fetch(_)
+                    | Self::FetchOk(_)
+                    | Self::PublishSkipped(_)
+                    | Self::SubscribeNamespace(_)
+                    | Self::SubscribeTracks(_) => MessagePlacement::RequestOnly,
                 }
             }
 
@@ -244,7 +300,7 @@ message_types! {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::coding::{
         KeyValuePairs, Location, ReasonPhrase, TrackNamespace, TrackNamespacePrefix,
@@ -252,6 +308,124 @@ mod tests {
 
     fn namespace() -> TrackNamespace {
         TrackNamespace::from_utf8_path("test/ns")
+    }
+
+    pub(crate) fn request_only_messages() -> Vec<Message> {
+        let namespace = namespace();
+        let prefix = TrackNamespacePrefix::from_utf8_path("test/ns");
+        vec![
+            Message::RequestUpdate(RequestUpdate {
+                id: 0,
+                params: KeyValuePairs::default(),
+            }),
+            Message::RequestError(RequestError {
+                id: 0,
+                error_code: 0,
+                retry_interval: 0,
+                reason: ReasonPhrase(String::new()),
+                redirect: None,
+            }),
+            Message::RequestOk(RequestOk {
+                id: 0,
+                params: KeyValuePairs::default(),
+                track_properties: TrackProperties::default(),
+            }),
+            Message::Subscribe(Subscribe {
+                id: 0,
+                track_namespace: namespace.clone(),
+                track_name: "track".into(),
+                params: KeyValuePairs::default(),
+            }),
+            Message::SubscribeOk(SubscribeOk {
+                id: 0,
+                track_alias: 0,
+                params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
+            }),
+            Message::PublishNamespace(PublishNamespace {
+                id: 0,
+                track_namespace: namespace.clone(),
+                params: KeyValuePairs::default(),
+            }),
+            Message::Namespace(Namespace {
+                track_namespace_suffix: prefix.clone(),
+            }),
+            Message::NamespaceDone(NamespaceDone {
+                track_namespace_suffix: prefix.clone(),
+            }),
+            Message::TrackStatus(TrackStatus {
+                id: 0,
+                track_namespace: namespace.clone(),
+                track_name: "track".into(),
+                params: KeyValuePairs::default(),
+            }),
+            Message::Publish(Publish {
+                id: 0,
+                track_namespace: namespace.clone(),
+                track_name: "track".into(),
+                track_alias: 0,
+                params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
+            }),
+            Message::PublishDone(PublishDone {
+                id: 0,
+                status_code: 0,
+                stream_count: 0,
+                reason: ReasonPhrase(String::new()),
+            }),
+            Message::Fetch(Fetch {
+                id: 0,
+                fetch_type: FetchType::Standalone,
+                standalone_fetch: Some(StandaloneFetch {
+                    track_namespace: namespace,
+                    track_name: "track".into(),
+                    start_location: Location::new(0, 0),
+                    end_location: Location::new(0, 1),
+                }),
+                joining_fetch: None,
+                params: KeyValuePairs::default(),
+            }),
+            Message::FetchOk(FetchOk {
+                id: 0,
+                end_of_track: false,
+                end_location: Location::new(0, 0),
+                params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
+            }),
+            Message::PublishSkipped(PublishSkipped {
+                track_namespace_suffix: prefix.clone(),
+                track_name: "track".into(),
+            }),
+            Message::SubscribeNamespace(SubscribeNamespace {
+                id: 0,
+                track_namespace_prefix: prefix.clone(),
+                params: KeyValuePairs::default(),
+            }),
+            Message::SubscribeTracks(SubscribeTracks {
+                id: 0,
+                track_namespace_prefix: prefix,
+                params: KeyValuePairs::default(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn draft19_stream_placement_is_exhaustive() {
+        let request_only = request_only_messages();
+        assert_eq!(request_only.len(), 16);
+        for message in request_only {
+            assert_eq!(message.placement(), MessagePlacement::RequestOnly);
+            assert!(!message.placement().allows_control());
+            assert!(message.placement().allows_request());
+        }
+
+        let goaway = Message::GoAway(GoAway {
+            uri: crate::coding::SessionUri(String::new()),
+            timeout: 0,
+        });
+        assert_eq!(goaway.placement(), MessagePlacement::ControlOrRequest);
+        assert!(goaway.placement().allows_control());
+        assert!(goaway.placement().allows_request());
     }
 
     fn assert_sequenced(msg: Message, id: u64) {

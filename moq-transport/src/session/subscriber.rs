@@ -69,8 +69,8 @@ pub struct Subscriber {
     /// Inbound publications waiting for application policy and registration.
     publish_received_queue: Queue<PublishReceived>,
 
-    /// The queue we will write any outbound control messages we want to send, the session run_send task
-    /// will process the queue and send the message on the control stream.
+    /// Shared queue for request-stream responses and session-level messages.
+    /// The session send task enforces the draft-19 stream placement.
     outgoing: Queue<Message>,
 
     /// WebTransport session, used to open bidi streams for requests (draft-19).
@@ -260,26 +260,107 @@ impl Subscriber {
         Ok(Reader::new(recv_stream))
     }
 
-    /// Send a TRACK_STATUS request for a track.
+    fn new_track_status_request(
+        &mut self,
+        track_namespace: &TrackNamespace,
+        track_name: TrackName,
+    ) -> Result<message::TrackStatus, SessionError> {
+        Ok(message::TrackStatus {
+            id: self.get_next_request_id()?,
+            track_namespace: track_namespace.clone(),
+            track_name,
+            params: Default::default(),
+        })
+    }
+
+    async fn run_track_status_request(
+        &self,
+        request: message::TrackStatus,
+    ) -> Result<message::RequestOk, SessionError> {
+        let request_id = request.id;
+        let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
+        let mut writer = Writer::new(send_stream);
+        writer.encode(&Message::TrackStatus(request)).await?;
+
+        // TRACK_STATUS cannot be updated, so the requester has no further
+        // messages to send and can close its direction immediately.
+        writer.finish();
+
+        let mut reader = Reader::new(recv_stream);
+        let response =
+            Session::decode_bidi_response(&mut reader, request_id, super::RequestKind::TrackStatus)
+                .await?;
+
+        let result = match response {
+            Message::RequestOk(ok) => {
+                self.log_request_ok_parsed("track_status", &ok);
+                Ok(ok)
+            }
+            Message::RequestError(error) => {
+                self.log_request_error_parsed("track_status", &error);
+                Err(SessionError::Serve(Self::request_error_to_serve_error(
+                    &error,
+                )))
+            }
+            other => Err(SessionError::ProtocolViolation(format!(
+                "unexpected {} on TRACK_STATUS response stream",
+                other.name()
+            ))),
+        };
+
+        // A TRACK_STATUS responder has no subsequent messages. Require the
+        // response direction to close so a successful query cannot leave an
+        // orphaned request stream behind.
+        if !reader.done().await? {
+            return Err(SessionError::ProtocolViolation(
+                "TRACK_STATUS response stream contained additional messages".to_string(),
+            ));
+        }
+
+        result
+    }
+
+    /// Query the status of a track on a dedicated bidirectional request stream.
+    pub async fn track_status_query(
+        &mut self,
+        track_namespace: &TrackNamespace,
+        track_name: impl Into<TrackName>,
+    ) -> Result<message::RequestOk, SessionError> {
+        let request = self.new_track_status_request(track_namespace, track_name.into())?;
+        self.run_track_status_request(request).await
+    }
+
+    /// Send a fire-and-forget TRACK_STATUS request for source compatibility.
+    ///
+    /// New callers should use [`Self::track_status_query`] so transport and
+    /// request errors are observable.
     pub fn track_status(
         &mut self,
         track_namespace: &TrackNamespace,
         track_name: impl Into<TrackName>,
     ) {
-        let id = match self.get_next_request_id() {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not send TRACK_STATUS: request ID limit reached");
+        let request = match self.new_track_status_request(track_namespace, track_name.into()) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "could not allocate TRACK_STATUS request");
                 return;
             }
         };
-        self.send_message(message::TrackStatus {
-            id,
-            track_namespace: track_namespace.clone(),
-            track_name: track_name.into(),
-            params: Default::default(),
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("could not send TRACK_STATUS outside a Tokio runtime");
+            return;
+        };
+
+        let subscriber = self.clone();
+        let request_id = request.id;
+        let task = runtime.spawn(async move {
+            if let Err(error) = subscriber.run_track_status_request(request).await {
+                tracing::warn!(%error, request_id, "TRACK_STATUS request failed");
+            }
         });
-        // TODO(itzmanish): make async and wait for response?
+        if self.bidi_task_tx.send(task).is_err() {
+            tracing::warn!(request_id, "TRACK_STATUS task collector is closed");
+        }
     }
 
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
@@ -290,7 +371,7 @@ impl Subscriber {
 
     /// Subscribe to a track and wait until the publisher acknowledges it.
     ///
-    /// Draft-18: sends SUBSCRIBE on a new bidi request stream and reads
+    /// Draft-19: sends SUBSCRIBE on a new bidi request stream and reads
     /// the response (REQUEST_OK / REQUEST_ERROR) from the same stream.
     pub async fn subscribe_open(
         &mut self,
@@ -362,7 +443,7 @@ impl Subscriber {
         Ok(send)
     }
 
-    /// Send a message to the publisher via the control stream.
+    /// Enqueue a response for routing to its owning request stream.
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 
@@ -370,7 +451,7 @@ impl Subscriber {
         let _ = self.outgoing.push(msg.into());
     }
 
-    /// Receive a message from the publisher via the control stream.
+    /// Receive a publisher message from a request stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
             message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,

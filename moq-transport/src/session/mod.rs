@@ -64,6 +64,12 @@ struct PendingReverseUpdate {
     completion: tokio::sync::oneshot::Sender<Result<(), SessionError>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutgoingMessageDestination {
+    Control,
+    Request(u64),
+}
+
 #[derive(Clone, Copy)]
 struct RequestUpdateLimits {
     incoming: u64,
@@ -337,9 +343,9 @@ impl Session {
         self.connection_path.as_deref()
     }
 
-    /// Log a control message with structured fields for observability.
+    /// Log a control- or request-stream message with structured fields.
     /// Uses target "moq_transport::control" so it can be filtered independently.
-    fn log_control_message(msg: &Message, direction: &str) {
+    fn log_message(msg: &Message, direction: &str) {
         match msg {
             Message::Subscribe(m) => {
                 tracing::debug!(
@@ -349,7 +355,7 @@ impl Session {
                     subscribe_id = m.id,
                     namespace = %m.track_namespace,
                     track_name = %m.track_name,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::SubscribeOk(m) => {
@@ -359,7 +365,7 @@ impl Session {
                     msg_type = "SUBSCRIBE_OK",
                     subscribe_id = m.id,
                     track_alias = m.track_alias,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::PublishNamespace(m) => {
@@ -369,7 +375,7 @@ impl Session {
                     msg_type = "PUBLISH_NAMESPACE",
                     request_id = m.id,
                     namespace = %m.track_namespace,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::Namespace(m) => {
@@ -378,7 +384,7 @@ impl Session {
                     direction,
                     msg_type = "NAMESPACE",
                     namespace_suffix = %m.track_namespace_suffix,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::NamespaceDone(m) => {
@@ -387,7 +393,7 @@ impl Session {
                     direction,
                     msg_type = "NAMESPACE_DONE",
                     namespace_suffix = %m.track_namespace_suffix,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::TrackStatus(m) => {
@@ -398,7 +404,7 @@ impl Session {
                     request_id = m.id,
                     namespace = %m.track_namespace,
                     track_name = %m.track_name,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::SubscribeNamespace(m) => {
@@ -408,7 +414,7 @@ impl Session {
                     msg_type = "SUBSCRIBE_NAMESPACE",
                     request_id = m.id,
                     namespace_prefix = %m.track_namespace_prefix,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::SubscribeTracks(m) => {
@@ -418,7 +424,7 @@ impl Session {
                     msg_type = "SUBSCRIBE_TRACKS",
                     request_id = m.id,
                     namespace_prefix = %m.track_namespace_prefix,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::Fetch(m) => {
@@ -428,7 +434,7 @@ impl Session {
                     msg_type = "FETCH",
                     request_id = m.id,
                     fetch_type = ?m.fetch_type,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::FetchOk(m) => {
@@ -438,7 +444,7 @@ impl Session {
                     msg_type = "FETCH_OK",
                     request_id = m.id,
                     end_of_track = m.end_of_track,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::Publish(m) => {
@@ -450,7 +456,7 @@ impl Session {
                     namespace = %m.track_namespace,
                     track_name = %m.track_name,
                     track_alias = m.track_alias,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::PublishSkipped(m) => {
@@ -460,7 +466,7 @@ impl Session {
                     msg_type = "PUBLISH_SKIPPED",
                     namespace_suffix = %m.track_namespace_suffix,
                     track_name = %m.track_name,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::PublishDone(m) => {
@@ -471,7 +477,7 @@ impl Session {
                     request_id = m.id,
                     status_code = m.status_code,
                     stream_count = m.stream_count,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::GoAway(m) => {
@@ -481,7 +487,7 @@ impl Session {
                     msg_type = "GOAWAY",
                     uri = %m.uri.0,
                     timeout_ms = m.timeout,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::RequestOk(m) => {
@@ -490,7 +496,7 @@ impl Session {
                     direction,
                     msg_type = "REQUEST_OK",
                     request_id = m.id,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::RequestError(m) => {
@@ -501,7 +507,7 @@ impl Session {
                     request_id = m.id,
                     error_code = m.error_code,
                     retry_interval = m.retry_interval,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
             Message::RequestUpdate(m) => {
@@ -510,7 +516,7 @@ impl Session {
                     direction,
                     msg_type = "REQUEST_UPDATE",
                     request_id = m.id,
-                    "MoQT control message"
+                    "MoQT framed message"
                 );
             }
         }
@@ -637,7 +643,7 @@ impl Session {
             msg_type = "SETUP",
             ?transport,
             path = path.as_deref(),
-            "MoQT control message"
+            "MoQT framed message"
         );
         sender.encode(&client).await?;
 
@@ -650,7 +656,7 @@ impl Session {
             target: "moq_transport::control",
             direction = "recv",
             msg_type = "SETUP (recv)",
-            "MoQT control message"
+            "MoQT framed message"
         );
 
         // Client sends even IDs (0); peer server sends odd IDs (1).
@@ -700,7 +706,7 @@ impl Session {
             target: "moq_transport::control",
             direction = "recv",
             msg_type = "SETUP",
-            "MoQT control message"
+            "MoQT framed message"
         );
 
         // For WebTransport the path arrives in the HTTP/3 CONNECT :path.
@@ -740,7 +746,7 @@ impl Session {
             target: "moq_transport::control",
             direction = "sent",
             msg_type = "SETUP (recv)",
-            "MoQT control message"
+            "MoQT framed message"
         );
 
         if let Some(ref mut mlog) = mlog {
@@ -774,7 +780,7 @@ impl Session {
         let mut reader_tasks = FuturesUnordered::new();
 
         let result = tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
+            res = Self::run_recv(self.recver, self.mlog.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
             res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.max_request_updates, self.peer_max_request_updates) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
@@ -829,9 +835,38 @@ impl Session {
         }
     }
 
-    /// Processes the outgoing control message queue. Response messages targeting
-    /// a bidi request stream are redirected there (draft-19); everything else
-    /// goes to the control stream.
+    fn outgoing_message_destination(
+        msg: &Message,
+    ) -> Result<OutgoingMessageDestination, SessionError> {
+        if let Some(request_id) = msg.response_target_id() {
+            return Ok(OutgoingMessageDestination::Request(request_id));
+        }
+
+        if msg.placement().allows_control() {
+            return Ok(OutgoingMessageDestination::Control);
+        }
+
+        tracing::error!(
+            msg_type = msg.name(),
+            "request-only message was enqueued without request-stream context"
+        );
+        Err(SessionError::Internal)
+    }
+
+    fn validate_control_message(msg: &Message) -> Result<(), SessionError> {
+        if msg.placement().allows_control() {
+            return Ok(());
+        }
+
+        Err(SessionError::ProtocolViolation(format!(
+            "{} is not permitted on the control stream",
+            msg.name()
+        )))
+    }
+
+    /// Processes the shared outgoing queue. ID-bearing responses are routed to
+    /// their owning bidirectional request stream. `GOAWAY` is the only message
+    /// that may reach the post-SETUP control stream in draft-19.
     async fn run_send(
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
@@ -839,57 +874,54 @@ impl Session {
         bidi_response_map: BidiResponseMap,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
-            Self::log_control_message(&msg, "sent");
+            match Self::outgoing_message_destination(&msg)? {
+                OutgoingMessageDestination::Request(target_id) => {
+                    Self::log_message(&msg, "sent on request stream");
+                    if let Some(ref mlog) = mlog {
+                        if let Ok(mut mlog_guard) = mlog.lock() {
+                            let time = mlog_guard.elapsed_ms();
+                            let event = match &msg {
+                                Message::SubscribeOk(m) => {
+                                    Some(mlog::events::subscribe_ok_created(time, m.id, m))
+                                }
+                                _ => None,
+                            };
+                            if let Some(event) = event {
+                                let _ = mlog_guard.add_event(event);
+                            }
+                        }
+                    }
 
-            if let Some(ref mlog) = mlog {
-                if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
-                    // Draft-18: Subscribe and PublishNamespace travel on bidi
-                    // request streams, not the control stream. Use the request
-                    // ID as the stream identifier for mlog; only GoAway still
-                    // uses stream 0 (control).
-                    let event = match &msg {
-                        Message::Subscribe(m) => {
-                            Some(mlog::events::subscribe_created(time, m.id, m))
+                    let tx_opt = bidi_response_map
+                        .lock()
+                        .map_err(|_| SessionError::Internal)?
+                        .get(&target_id)
+                        .cloned();
+                    if let Some(tx) = tx_opt {
+                        if tx.send(BidiCommand::Send(msg)).is_err() {
+                            tracing::warn!(
+                                target_id,
+                                "bidi response channel closed, dropping message"
+                            );
                         }
-                        Message::SubscribeOk(m) => {
-                            Some(mlog::events::subscribe_ok_created(time, m.id, m))
-                        }
-                        Message::PublishNamespace(m) => {
-                            Some(mlog::events::publish_namespace_created(time, m.id, m))
-                        }
-                        Message::GoAway(m) => Some(mlog::events::go_away_created(time, 0, m)),
-                        _ => None,
-                    };
-                    if let Some(event) = event {
-                        let _ = mlog_guard.add_event(event);
+                    } else {
+                        tracing::warn!(
+                            target_id,
+                            "bidi response map entry gone, dropping late response"
+                        );
                     }
                 }
-            }
-
-            // Draft-18: response messages with a target request ID belong on
-            // the bidi stream, never the control stream.
-            if let Some(target_id) = msg.response_target_id() {
-                let tx_opt = bidi_response_map
-                    .lock()
-                    .map_err(|_| SessionError::Internal)?
-                    .get(&target_id)
-                    .cloned();
-                if let Some(tx) = tx_opt {
-                    if tx.send(BidiCommand::Send(msg)).is_err() {
-                        tracing::warn!(target_id, "bidi response channel closed, dropping message");
+                OutgoingMessageDestination::Control => {
+                    Self::log_message(&msg, "sent on control stream");
+                    if let (Some(mlog), Message::GoAway(goaway)) = (&mlog, &msg) {
+                        if let Ok(mut mlog) = mlog.lock() {
+                            let event = mlog::events::go_away_created(mlog.elapsed_ms(), 0, goaway);
+                            let _ = mlog.add_event(event);
+                        }
                     }
-                } else {
-                    tracing::warn!(
-                        target_id,
-                        "bidi response map entry gone, dropping late response"
-                    );
+                    sender.encode(&msg).await?;
                 }
-                continue; // never fall through to control stream for bidi-only messages
             }
-
-            // Only control-stream messages (no response_target_id) reach here.
-            sender.encode(&msg).await?;
         }
 
         Ok(())
@@ -1537,24 +1569,21 @@ impl Session {
         Ok(Message::RequestUpdate(update))
     }
 
-    /// Receives inbound messages from the control stream reader/receiver.
-    /// Handles session-level messages (GOAWAY) directly and routes
-    /// role-specific messages to Publisher or Subscriber.
+    /// Receives post-SETUP messages from the peer's control stream.
+    /// Draft-19 permits only `GOAWAY` here; request messages and responses are
+    /// rejected before request IDs or application state can be touched.
     async fn run_recv(
         mut recver: Reader,
-        mut publisher: Option<Publisher>,
-        mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
-        request_id: RequestId,
-        _outgoing: Queue<Message>,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
         loop {
             let msg: message::Message = recver.decode().await?;
+            Self::validate_control_message(&msg)?;
 
             // Emit structured tracing log for received control messages
-            Self::log_control_message(&msg, "recv");
+            Self::log_message(&msg, "received on control stream");
 
             // Emit mlog event for received control messages
             if let Some(ref mlog) = mlog {
@@ -1562,21 +1591,11 @@ impl Session {
                     let time = mlog_guard.elapsed_ms();
                     let stream_id = 0; // Control stream is always stream 0
 
-                    // Emit events based on message type
                     let event = match &msg {
-                        Message::Subscribe(m) => {
-                            Some(mlog::events::subscribe_parsed(time, stream_id, m))
-                        }
-                        Message::SubscribeOk(m) => {
-                            Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
-                        }
-                        Message::PublishNamespace(m) => {
-                            Some(mlog::events::publish_namespace_parsed(time, stream_id, m))
-                        }
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }
-                        _ => None, // TODO: Add other message types
+                        _ => None,
                     };
 
                     if let Some(event) = event {
@@ -1585,36 +1604,9 @@ impl Session {
                 }
             }
 
-            if let Some(id) = msg.sequenced_request_id() {
-                request_id.validate_incoming(id)?;
-            }
-
-            let msg = match TryInto::<message::Publisher>::try_into(msg) {
-                Ok(msg) => {
-                    subscriber
-                        .as_mut()
-                        .ok_or(SessionError::RoleViolation)?
-                        .recv_message(msg)?;
-                    continue;
-                }
-                Err(msg) => msg,
-            };
-
-            let msg = match TryInto::<message::Subscriber>::try_into(msg) {
-                Ok(msg) => {
-                    publisher
-                        .as_mut()
-                        .ok_or(SessionError::RoleViolation)?
-                        .recv_message(msg)?;
-                    continue;
-                }
-                Err(msg) => msg,
-            };
-
-            // Session-level messages handled here (not role-specific).
             match msg {
                 Message::GoAway(ref m) => {
-                    // Draft-16 §9.4: receiving a second GOAWAY is PROTOCOL_VIOLATION.
+                    // Draft-19 §10.4: receiving a second GOAWAY is PROTOCOL_VIOLATION.
                     if goaway_received {
                         return Err(SessionError::ProtocolViolation(
                             "received multiple GOAWAY messages".to_string(),
@@ -1629,9 +1621,8 @@ impl Session {
                     // TODO(itzmanish): trigger session migration.
                 }
                 other => {
-                    tracing::warn!(msg_type = other.name(), "received unhandled message type");
-                    return Err(SessionError::unimplemented(&format!(
-                        "message type {}",
+                    return Err(SessionError::ProtocolViolation(format!(
+                        "{} is not permitted on the control stream",
                         other.name()
                     )));
                 }
@@ -1717,6 +1708,70 @@ mod tests {
             let _drop_counter = drop_counter;
             futures::future::pending::<()>().await;
         })
+    }
+
+    fn goaway() -> Message {
+        Message::GoAway(message::GoAway {
+            uri: crate::coding::SessionUri(String::new()),
+            timeout: 0,
+        })
+    }
+
+    #[test]
+    fn control_ingress_accepts_only_goaway() {
+        for message in crate::message::tests::request_only_messages() {
+            let error = Session::validate_control_message(&message).unwrap_err();
+            assert!(matches!(&error, SessionError::ProtocolViolation(_)));
+            assert_eq!(
+                error.code(),
+                0x3,
+                "{} used the wrong close code",
+                message.name()
+            );
+        }
+
+        assert!(Session::validate_control_message(&goaway()).is_ok());
+    }
+
+    #[test]
+    fn rejected_control_request_does_not_consume_its_request_id() {
+        let request_ids = RequestId::new(1, 0);
+        let request = Message::TrackStatus(message::TrackStatus {
+            id: 0,
+            track_namespace: crate::coding::TrackNamespace::from_utf8_path("live"),
+            track_name: "audio".into(),
+            params: Default::default(),
+        });
+
+        assert!(Session::validate_control_message(&request).is_err());
+        request_ids.validate_incoming(0).unwrap();
+    }
+
+    #[test]
+    fn outbound_queue_never_falls_through_to_control_for_request_messages() {
+        for message in crate::message::tests::request_only_messages() {
+            match message.response_target_id() {
+                Some(request_id) => assert_eq!(
+                    Session::outgoing_message_destination(&message).unwrap(),
+                    OutgoingMessageDestination::Request(request_id),
+                    "{} was not routed to its request stream",
+                    message.name()
+                ),
+                None => assert!(
+                    matches!(
+                        Session::outgoing_message_destination(&message),
+                        Err(SessionError::Internal)
+                    ),
+                    "{} was allowed to fall through to control",
+                    message.name()
+                ),
+            }
+        }
+
+        assert_eq!(
+            Session::outgoing_message_destination(&goaway()).unwrap(),
+            OutgoingMessageDestination::Control
+        );
     }
 
     // ========================================================================

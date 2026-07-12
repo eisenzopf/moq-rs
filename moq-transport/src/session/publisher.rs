@@ -52,7 +52,7 @@ pub struct Publisher {
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
 
-    /// Queue for outbound control messages; processed by the session run_send task.
+    /// Shared queue for request-stream responses and session-level messages.
     outgoing: Queue<Message>,
 
     /// Shared with Subscriber so all requests within a session use unique IDs.
@@ -117,7 +117,7 @@ impl Publisher {
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
     /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
     ///
-    /// Draft-18: sends PUBLISH_NAMESPACE on a new bidi request stream and reads
+    /// Draft-19: sends PUBLISH_NAMESPACE on a new bidi request stream and reads
     /// responses from the same stream.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
         // Phase 1: allocate under lock, release before any await.
@@ -160,7 +160,7 @@ impl Publisher {
         }
 
         // Spawn a reader task for responses on this bidi stream.
-        // Draft-18: responses omit Request ID (the stream identity provides it).
+        // Draft-19: responses omit Request ID (the stream identity provides it).
         // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
         let mut this = self.clone();
         let bidi_request_id = request_id;
