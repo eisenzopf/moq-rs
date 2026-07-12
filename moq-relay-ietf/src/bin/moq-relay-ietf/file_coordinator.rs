@@ -738,7 +738,8 @@ impl Coordinator for FileCoordinator {
             existing,
             NamespaceSubscriptionHandle { cancel },
             update_capacity,
-        );
+        )
+        .map_err(|error| CoordinatorError::Other(error.into()))?;
         tokio::spawn(supervise_namespace_updates(
             NamespaceWatcherConfig {
                 file_path,

@@ -266,16 +266,16 @@ impl NamespaceSubscription {
         existing: Vec<NamespaceInfo>,
         inner: T,
         capacity: usize,
-    ) -> (Self, NamespaceUpdateSender) {
-        let (updates, sender) = NamespaceUpdateReceiver::bounded(capacity);
-        (
+    ) -> Result<(Self, NamespaceUpdateSender), NamespaceUpdateCapacityError> {
+        let (updates, sender) = NamespaceUpdateReceiver::bounded(capacity)?;
+        Ok((
             Self {
                 existing_namespaces: existing,
                 updates,
                 _registration: Box::new(inner),
             },
             sender,
-        )
+        ))
     }
 
     /// Wait for the next namespace addition or withdrawal.
@@ -307,6 +307,14 @@ pub enum NamespaceUpdateSendError {
     /// The subscription no longer exists.
     #[error("namespace update subscription is closed")]
     Closed,
+}
+
+/// Error returned when constructing a bounded namespace update stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NamespaceUpdateCapacityError {
+    /// A bounded queue must be able to retain at least one update.
+    #[error("namespace update capacity must be positive")]
+    Zero,
 }
 
 /// Non-blocking sender for a bounded namespace update stream.
@@ -348,9 +356,25 @@ struct NamespaceUpdateReceiver {
 }
 
 impl NamespaceUpdateReceiver {
-    fn bounded(capacity: usize) -> (Self, NamespaceUpdateSender) {
-        assert!(capacity > 0, "namespace update capacity must be positive");
+    fn bounded(
+        capacity: usize,
+    ) -> Result<(Self, NamespaceUpdateSender), NamespaceUpdateCapacityError> {
+        if capacity == 0 {
+            return Err(NamespaceUpdateCapacityError::Zero);
+        }
         let (sender, receiver) = mpsc::channel(capacity);
+        let (overflow, overflow_receiver) = watch::channel(false);
+        Ok((
+            Self {
+                receiver,
+                overflow: overflow_receiver,
+            },
+            NamespaceUpdateSender { sender, overflow },
+        ))
+    }
+
+    fn pending() -> (Self, NamespaceUpdateSender) {
+        let (sender, receiver) = mpsc::channel(1);
         let (overflow, overflow_receiver) = watch::channel(false);
         (
             Self {
@@ -359,10 +383,6 @@ impl NamespaceUpdateReceiver {
             },
             NamespaceUpdateSender { sender, overflow },
         )
-    }
-
-    fn pending() -> (Self, NamespaceUpdateSender) {
-        Self::bounded(1)
     }
 
     async fn recv(&mut self) -> CoordinatorResult<NamespaceUpdate> {
@@ -1370,7 +1390,8 @@ mod tests {
                 subscription_id,
             };
 
-            let (subscription, sender) = NamespaceSubscription::bounded(existing, handle, 16);
+            let (subscription, sender) = NamespaceSubscription::bounded(existing, handle, 16)
+                .map_err(|error| CoordinatorError::Other(error.into()))?;
             state
                 .namespace_update_subscribers
                 .entry(scope_key)
@@ -1955,7 +1976,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_update_overflow_fails_closed_without_partial_delivery() {
-        let (mut subscription, sender) = NamespaceSubscription::bounded(vec![], (), 1);
+        let (mut subscription, sender) = NamespaceSubscription::bounded(vec![], (), 1).unwrap();
         sender
             .try_send(NamespaceUpdate::Added(NamespaceInfo::new(ns("one"))))
             .unwrap();
@@ -1969,6 +1990,14 @@ mod tests {
             Err(CoordinatorError::CapacityExhausted {
                 resource: "namespace_update_stream"
             })
+        ));
+    }
+
+    #[test]
+    fn namespace_update_capacity_zero_is_an_error_not_a_panic() {
+        assert!(matches!(
+            NamespaceSubscription::bounded(vec![], (), 0),
+            Err(NamespaceUpdateCapacityError::Zero)
         ));
     }
 

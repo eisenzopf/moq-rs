@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashSet;
+
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
@@ -245,8 +247,10 @@ impl Producer {
         };
 
         request.ok()?;
+        let mut active_namespaces = HashSet::with_capacity(subscription.existing_namespaces.len());
         for namespace in &subscription.existing_namespaces {
             let suffix = Self::namespace_suffix(&request.info.prefix, &namespace.namespace)?;
+            Self::record_namespace_added(&mut active_namespaces, &namespace.namespace)?;
             request.namespace(suffix)?;
         }
 
@@ -275,11 +279,13 @@ impl Producer {
                 NamespaceUpdate::Added(namespace) => {
                     let suffix =
                         Self::namespace_suffix(&request.info.prefix, &namespace.namespace)?;
+                    Self::record_namespace_added(&mut active_namespaces, &namespace.namespace)?;
                     request.namespace(suffix)?;
                 }
                 NamespaceUpdate::Removed(namespace) => {
                     let suffix =
                         Self::namespace_suffix(&request.info.prefix, &namespace.namespace)?;
+                    Self::record_namespace_removed(&mut active_namespaces, &namespace.namespace)?;
                     request.namespace_done(suffix)?;
                 }
             }
@@ -306,6 +312,32 @@ impl Producer {
         Ok(TrackNamespacePrefix {
             fields: namespace.fields[prefix.fields.len()..].to_vec(),
         })
+    }
+
+    fn record_namespace_added(
+        active: &mut HashSet<TrackNamespace>,
+        namespace: &TrackNamespace,
+    ) -> Result<(), ServeError> {
+        if active.insert(namespace.clone()) {
+            Ok(())
+        } else {
+            Err(ServeError::internal_ctx(
+                "coordinator announced an already-active namespace",
+            ))
+        }
+    }
+
+    fn record_namespace_removed(
+        active: &mut HashSet<TrackNamespace>,
+        namespace: &TrackNamespace,
+    ) -> Result<(), ServeError> {
+        if active.remove(namespace) {
+            Ok(())
+        } else {
+            Err(ServeError::internal_ctx(
+                "coordinator withdrew a namespace before announcing it",
+            ))
+        }
     }
 
     /// Serve a subscribe request.
@@ -501,6 +533,8 @@ impl Producer {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use moq_transport::{
         coding::{TrackNamespace, TrackNamespacePrefix},
         message::RequestErrorCode,
@@ -565,5 +599,30 @@ mod tests {
         let prefix = TrackNamespacePrefix::from_utf8_path("tenant/live");
         let namespace = TrackNamespace::from_utf8_path("other/live/clock");
         assert!(Producer::namespace_suffix(&prefix, &namespace).is_err());
+    }
+
+    #[test]
+    fn namespace_update_state_rejects_done_before_namespace() {
+        let mut active = HashSet::new();
+        let namespace = TrackNamespace::from_utf8_path("tenant/live/clock");
+        assert!(Producer::record_namespace_removed(&mut active, &namespace).is_err());
+    }
+
+    #[test]
+    fn namespace_update_state_rejects_duplicate_namespace() {
+        let mut active = HashSet::new();
+        let namespace = TrackNamespace::from_utf8_path("tenant/live/clock");
+        Producer::record_namespace_added(&mut active, &namespace).unwrap();
+        assert!(Producer::record_namespace_added(&mut active, &namespace).is_err());
+    }
+
+    #[test]
+    fn namespace_update_state_allows_withdrawal_and_reannouncement() {
+        let mut active = HashSet::new();
+        let namespace = TrackNamespace::from_utf8_path("tenant/live/clock");
+        Producer::record_namespace_added(&mut active, &namespace).unwrap();
+        Producer::record_namespace_removed(&mut active, &namespace).unwrap();
+        Producer::record_namespace_added(&mut active, &namespace).unwrap();
+        assert!(active.contains(&namespace));
     }
 }
