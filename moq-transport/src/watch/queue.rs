@@ -42,9 +42,11 @@ impl<T> Queue<T> {
             {
                 let queue = self.state.lock();
                 if !queue.is_empty() {
-                    // Take mutable access only in a block
+                    // Accepted items remain readable after the producer side
+                    // closes. Once the queue is drained, `modified()` below
+                    // observes closure and returns `None`.
                     if let Some((item, notifier)) = {
-                        let mut state_mut = queue.into_mut()?;
+                        let mut state_mut = queue.into_mut_after_close();
                         state_mut.pop_front()
                     } {
                         if let Some(tx) = notifier {
@@ -183,6 +185,18 @@ mod tests {
         assert_eq!(consumer.pop().await, Some(2));
         assert_eq!(consumer.pop().await, Some(3));
         assert!(consumer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumer_drains_accepted_items_before_observing_producer_close() {
+        let (mut producer, mut consumer) = Queue::bounded(2).split();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        drop(producer);
+
+        assert_eq!(consumer.pop().await, Some(1));
+        assert_eq!(consumer.pop().await, Some(2));
+        assert_eq!(consumer.pop().await, None);
     }
 
     #[test]

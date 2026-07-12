@@ -158,6 +158,16 @@ impl<'a, T> StateRef<'a, T> {
             _drop: self.drop,
         })
     }
+
+    /// Upgrade while retaining access to values queued before the opposite
+    /// side closed. Queue consumers use this to drain already-accepted items
+    /// before observing end-of-stream.
+    pub(super) fn into_mut_after_close(self) -> StateMut<'a, T> {
+        StateMut {
+            lock: self.lock,
+            _drop: self.drop,
+        }
+    }
 }
 
 impl<T> Deref for StateRef<'_, T> {
