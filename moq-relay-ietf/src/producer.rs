@@ -3,8 +3,9 @@
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    coding::{TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, TrackReader, TrackRequestError, TracksReader},
-    session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
+    session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
 };
 
 use crate::{
@@ -83,6 +84,7 @@ impl Producer {
 
         loop {
             let mut publisher_subscribed = self.publisher.clone();
+            let mut publisher_subscribed_namespace = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
             let mut publisher_fetch = self.publisher.clone();
 
@@ -122,6 +124,32 @@ impl Producer {
                             } else {
                                 tracing::warn!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "failed serving subscribe");
                             }
+                        }
+                    }.boxed())
+                },
+                Some(subscribed_namespace) = publisher_subscribed_namespace.subscribed_namespace() => {
+                    let capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::Subscribe,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "subscribe_namespace").increment(1);
+                            tracing::warn!(%error, "rejecting SUBSCRIBE_NAMESPACE at relay capacity");
+                            subscribed_namespace.close(ServeError::Closed(
+                                moq_transport::message::RequestErrorCode::ExcessiveLoad as u64,
+                            ));
+                            continue;
+                        }
+                    };
+                    let this = self.clone();
+                    tasks.push(async move {
+                        let prefix = subscribed_namespace.info.prefix.to_utf8_path();
+                        if let Err(error) = this
+                            .serve_subscribe_namespace(subscribed_namespace, capacity_lease)
+                            .await
+                        {
+                            tracing::warn!(%prefix, %error, "failed serving SUBSCRIBE_NAMESPACE");
                         }
                     }.boxed())
                 },
@@ -189,6 +217,62 @@ impl Producer {
                 else => return Ok(()),
             };
         }
+    }
+
+    /// Serve namespace discovery from the coordinator's scope-bound snapshot.
+    async fn serve_subscribe_namespace(
+        self,
+        mut request: SubscribedNamespace,
+        _capacity_lease: RelayCapacityLease,
+    ) -> Result<(), anyhow::Error> {
+        let prefix = TrackNamespace {
+            fields: request.info.prefix.fields.clone(),
+        };
+        let subscription = match self
+            .remotes
+            .subscribe_namespace(self.identity.scope(), &prefix)
+            .await
+        {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                let serve_error = ServeError::internal_ctx(format!(
+                    "namespace coordinator subscription failed: {error}"
+                ));
+                request.close(serve_error);
+                return Err(error.into());
+            }
+        };
+
+        request.ok()?;
+        for namespace in &subscription.existing_namespaces {
+            let suffix = Self::namespace_suffix(&request.info.prefix, &namespace.namespace)?;
+            request.namespace(suffix)?;
+        }
+
+        let _subscription_guard = GaugeGuard::new("moq_relay_active_namespace_subscriptions");
+        request.closed().await;
+        drop(subscription);
+        Ok(())
+    }
+
+    fn namespace_suffix(
+        prefix: &TrackNamespacePrefix,
+        namespace: &TrackNamespace,
+    ) -> Result<TrackNamespacePrefix, ServeError> {
+        let matches = prefix.fields.len() <= namespace.fields.len()
+            && prefix
+                .fields
+                .iter()
+                .zip(&namespace.fields)
+                .all(|(expected, actual)| expected == actual);
+        if !matches {
+            return Err(ServeError::internal_ctx(
+                "coordinator returned a namespace outside the subscribed prefix",
+            ));
+        }
+        Ok(TrackNamespacePrefix {
+            fields: namespace.fields[prefix.fields.len()..].to_vec(),
+        })
     }
 
     /// Serve a subscribe request.
@@ -385,7 +469,10 @@ impl Producer {
 #[cfg(test)]
 mod tests {
     use moq_transport::{
-        coding::TrackNamespace, message::RequestErrorCode, serve::ServeError, session::SessionError,
+        coding::{TrackNamespace, TrackNamespacePrefix},
+        message::RequestErrorCode,
+        serve::ServeError,
+        session::SessionError,
     };
 
     use super::Producer;
@@ -430,5 +517,20 @@ mod tests {
             ),
             ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
         );
+    }
+
+    #[test]
+    fn namespace_suffix_preserves_tuple_boundaries() {
+        let prefix = TrackNamespacePrefix::from_utf8_path("tenant/live");
+        let namespace = TrackNamespace::from_utf8_path("tenant/live/clock");
+        let suffix = Producer::namespace_suffix(&prefix, &namespace).unwrap();
+        assert_eq!(suffix.to_utf8_path(), "/clock");
+    }
+
+    #[test]
+    fn namespace_suffix_rejects_out_of_prefix_results() {
+        let prefix = TrackNamespacePrefix::from_utf8_path("tenant/live");
+        let namespace = TrackNamespace::from_utf8_path("other/live/clock");
+        assert!(Producer::namespace_suffix(&prefix, &namespace).is_err());
     }
 }

@@ -15,6 +15,7 @@ mod request_id;
 mod request_updates;
 mod subscribe;
 mod subscribed;
+mod subscribed_namespace;
 mod subscriber;
 mod target;
 mod track_status_requested;
@@ -31,6 +32,7 @@ pub use publisher::*;
 pub use request_id::RequestId;
 pub use subscribe::*;
 pub use subscribed::*;
+pub use subscribed_namespace::*;
 pub use subscriber::*;
 pub use target::*;
 pub use track_status_requested::*;
@@ -122,7 +124,12 @@ impl Drop for InboundRequestGuard {
                     publisher.cleanup_inbound_fetch(self.id);
                 }
             }
-            RequestKind::SubscribeNamespace | RequestKind::SubscribeTracks => {}
+            RequestKind::SubscribeNamespace => {
+                if let Some(publisher) = self.publisher.as_mut() {
+                    publisher.cleanup_inbound_subscribe_namespace(self.id);
+                }
+            }
+            RequestKind::SubscribeTracks => {}
         }
         self.request_lease.release();
     }
@@ -1655,12 +1662,24 @@ impl Session {
                         }
                         BidiCommand::Send(response) => response,
                     };
-                    let response_id = response.response_target_id().ok_or_else(|| {
-                        SessionError::ProtocolViolation(format!(
-                            "{} is not valid on a request response stream",
-                            response.name()
-                        ))
-                    })?;
+                    let response_id = match response.response_target_id() {
+                        Some(id) => id,
+                        None
+                            if request_kind == RequestKind::SubscribeNamespace
+                                && matches!(
+                                    response,
+                                    Message::Namespace(_) | Message::NamespaceDone(_)
+                                ) =>
+                        {
+                            initial_id
+                        }
+                        None => {
+                            break Err(SessionError::ProtocolViolation(format!(
+                                "{} is not valid on a {:?} response stream",
+                                response.name(), request_kind
+                            )));
+                        }
+                    };
                     let is_update_response = update_ids.remove(&response_id);
 
                     Self::validate_response_for_request(
@@ -1830,6 +1849,14 @@ impl Session {
                     }
                 }
             }
+            Message::Namespace(_) | Message::NamespaceDone(_)
+                if request_kind != RequestKind::SubscribeNamespace =>
+            {
+                return Err(SessionError::ProtocolViolation(format!(
+                    "{} is only valid on a SUBSCRIBE_NAMESPACE response stream",
+                    response.name()
+                )));
+            }
             _ => {}
         }
         Ok(())
@@ -1888,6 +1915,12 @@ impl Session {
                 m.end_location.encode(&mut payload)?;
                 m.params.encode(&mut payload)?;
                 m.track_extensions.encode(&mut payload)?;
+            }
+            Message::Namespace(m) => {
+                m.track_namespace_suffix.encode(&mut payload)?;
+            }
+            Message::NamespaceDone(m) => {
+                m.track_namespace_suffix.encode(&mut payload)?;
             }
             other => {
                 tracing::warn!(
@@ -2869,6 +2902,28 @@ mod tests {
             !bytes.contains(&99),
             "Request ID must not appear in bidi encoding"
         );
+    }
+
+    #[test]
+    fn encode_namespace_response_uses_stream_association() {
+        use message::wire_id;
+        let msg = Message::Namespace(message::Namespace {
+            track_namespace_suffix: crate::coding::TrackNamespacePrefix::from_utf8_path(
+                "live/clock",
+            ),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::Namespace as u8);
+        assert!(Session::validate_response_for_request(
+            RequestKind::SubscribeNamespace,
+            false,
+            &msg,
+        )
+        .is_ok());
+        assert!(matches!(
+            Session::validate_response_for_request(RequestKind::Subscribe, false, &msg),
+            Err(SessionError::ProtocolViolation(_))
+        ));
     }
 
     #[test]

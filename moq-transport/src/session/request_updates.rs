@@ -25,7 +25,11 @@ impl RequestKind {
             Self::Fetch => Some(RequestClass::Fetch),
             Self::PublishNamespace => Some(RequestClass::PublishNamespace),
             Self::TrackStatus => Some(RequestClass::TrackStatus),
-            Self::SubscribeNamespace | Self::SubscribeTracks => None,
+            // Namespace discovery shares the inbound subscription budget. A
+            // separate class can be introduced if operators need independent
+            // limits, but it must never bypass logical request admission.
+            Self::SubscribeNamespace => Some(RequestClass::Subscribe),
+            Self::SubscribeTracks => None,
         }
     }
 
@@ -194,7 +198,10 @@ mod tests {
             RequestKind::Fetch.request_class(),
             Some(RequestClass::Fetch)
         );
-        assert_eq!(RequestKind::SubscribeNamespace.request_class(), None);
+        assert_eq!(
+            RequestKind::SubscribeNamespace.request_class(),
+            Some(RequestClass::Subscribe)
+        );
         assert_eq!(RequestKind::SubscribeTracks.request_class(), None);
     }
 }

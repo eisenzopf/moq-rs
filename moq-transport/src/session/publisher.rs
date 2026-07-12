@@ -26,8 +26,8 @@ use super::{
     BidiCommand, BidiResponseMap, FetchRequested, FetchRequestedRecv, PublishNamespace,
     PublishNamespaceRecv, PublishNamespaceRejection, Published, PublishedInfo, RequestClass,
     RequestDirection, RequestId, RequestLease, RequestUpdateCredits, Session, SessionError,
-    SessionRequestCapacity, Subscribed, SubscribedRecv, TrackStatusRequested,
-    DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
+    SessionRequestCapacity, Subscribed, SubscribedNamespace, SubscribedNamespaceRecv,
+    SubscribedRecv, TrackStatusRequested, DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
 };
 use crate::message::RequestErrorCode;
 
@@ -82,6 +82,12 @@ pub struct Publisher {
 
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
+
+    /// Active inbound SUBSCRIBE_NAMESPACE requests, keyed by request ID.
+    subscribed_namespaces: Arc<Mutex<HashMap<u64, SubscribedNamespaceRecv>>>,
+
+    /// Inbound SUBSCRIBE_NAMESPACE requests surfaced to the application.
+    unknown_subscribed_namespace: Queue<SubscribedNamespace>,
 
     /// Active inbound FETCH requests, keyed by request ID.
     fetches: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
@@ -142,6 +148,8 @@ impl Publisher {
             subscribeds: Default::default(),
             published: Default::default(),
             unknown_subscribed: Queue::bounded(limits.session_inbound.subscribe),
+            subscribed_namespaces: Default::default(),
+            unknown_subscribed_namespace: Queue::bounded(limits.session_inbound.subscribe),
             fetches: Default::default(),
             unknown_fetch_requested: Queue::bounded(limits.session_inbound.fetch),
             unknown_track_status_requested: Queue::bounded(limits.session_inbound.track_status),
@@ -794,6 +802,11 @@ impl Publisher {
         self.unknown_subscribed.pop().await
     }
 
+    /// Return the next inbound namespace-discovery request.
+    pub async fn subscribed_namespace(&mut self) -> Option<SubscribedNamespace> {
+        self.unknown_subscribed_namespace.pop().await
+    }
+
     /// Return the next supported inbound Relative Joining FETCH.
     pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
         self.unknown_fetch_requested.pop().await
@@ -878,9 +891,12 @@ impl Publisher {
                 );
                 self.recv_track_status(msg, lease)?;
             }
-            // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::SubscribeNamespace(msg) => {
-                self.send_not_supported(msg.id, "subscribe_namespace");
+                let lease = Arc::new(
+                    self.request_capacity
+                        .try_acquire(RequestDirection::Inbound, RequestClass::Subscribe)?,
+                );
+                self.recv_subscribe_namespace(msg, lease)?;
             }
             // SUBSCRIBE_TRACKS is wire-supported in draft-19, but automatic
             // PUBLISH fanout is a later session-layer tranche.
@@ -903,6 +919,9 @@ impl Publisher {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg, request_lease),
             message::Subscriber::Fetch(msg) => self.recv_fetch(msg, request_lease),
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg, request_lease),
+            message::Subscriber::SubscribeNamespace(msg) => {
+                self.recv_subscribe_namespace(msg, request_lease)
+            }
             other => self.recv_message(other),
         }
     }
@@ -1068,6 +1087,31 @@ impl Publisher {
         Ok(())
     }
 
+    fn recv_subscribe_namespace(
+        &mut self,
+        msg: message::SubscribeNamespace,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
+        let id = msg.id;
+        let (request, recv) = SubscribedNamespace::new(self.clone(), msg, request_lease);
+        {
+            let mut requests = self
+                .subscribed_namespaces
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if requests.contains_key(&id) {
+                return Err(SessionError::InvalidRequestId);
+            }
+            requests.insert(id, recv);
+        }
+
+        if let Err(request) = self.unknown_subscribed_namespace.push(request) {
+            request.close(ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64));
+            self.cleanup_inbound_subscribe_namespace(id);
+        }
+        Ok(())
+    }
+
     fn recv_track_status(
         &mut self,
         msg: message::TrackStatus,
@@ -1159,6 +1203,27 @@ impl Publisher {
         self.outgoing.push(msg.into()).ok();
     }
 
+    /// Send a stream-associated response that has no embedded request ID.
+    ///
+    /// NAMESPACE and NAMESPACE_DONE are associated by the request stream, so
+    /// they bypass the shared outgoing queue's ID-based response routing.
+    pub(super) fn send_associated_message(
+        &mut self,
+        request_id: u64,
+        msg: Message,
+    ) -> Result<(), SessionError> {
+        let command = self
+            .bidi_response_map
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| SessionError::Serve(ServeError::Cancel))?;
+        command
+            .try_send(BidiCommand::Send(msg))
+            .map_err(|_| SessionError::Serve(ServeError::Cancel))
+    }
+
     /// Enqueue a control message and wait until it has been dequeued for sending.
     pub(super) async fn send_message_and_wait<T: Into<message::Publisher> + Into<Message>>(
         &mut self,
@@ -1199,6 +1264,21 @@ impl Publisher {
             for namespace in namespaces.values_mut() {
                 namespace.remove_subscribe(id);
             }
+        }
+    }
+
+    /// Remove every retained representation of a peer-opened
+    /// SUBSCRIBE_NAMESPACE and wake the application-facing handle.
+    pub(super) fn cleanup_inbound_subscribe_namespace(&mut self, id: u64) {
+        self.unknown_subscribed_namespace
+            .remove_where(|request| request.info.request_id == id);
+        if let Some(mut recv) = self
+            .subscribed_namespaces
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&id))
+        {
+            recv.recv_closed();
         }
     }
 

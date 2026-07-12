@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
+use crate::{
+    metrics::GaugeGuard, Coordinator, CoordinatorError, CoordinatorResult, NamespaceSubscription,
+};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_MAX_TRACKS: usize = 4_096;
@@ -289,6 +291,16 @@ impl RemoteManager {
             supervised_tasks: self.tasks.len(),
             limits: self.limits,
         }
+    }
+
+    /// Register namespace-prefix discovery with the shared coordinator and
+    /// return the current matching namespace snapshot plus its RAII lease.
+    pub async fn subscribe_namespace(
+        &self,
+        scope: Option<&str>,
+        prefix: &TrackNamespace,
+    ) -> CoordinatorResult<NamespaceSubscription> {
+        self.coordinator.subscribe_namespace(scope, prefix).await
     }
 
     /// Subscribe to a track from a remote relay.

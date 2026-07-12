@@ -26,7 +26,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use moq_relay_ietf::{
-    Coordinator, CoordinatorError, CoordinatorResult, NamespaceOrigin, NamespaceRegistration,
+    Coordinator, CoordinatorError, CoordinatorResult, NamespaceInfo, NamespaceOrigin,
+    NamespaceRegistration, NamespaceSubscription,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -577,6 +578,56 @@ impl Coordinator for FileCoordinator {
         result.ok_or(CoordinatorError::NamespaceNotFound)
     }
 
+    async fn subscribe_namespace(
+        &self,
+        scope: Option<&str>,
+        prefix: &TrackNamespace,
+    ) -> CoordinatorResult<NamespaceSubscription> {
+        let prefix = prefix.clone();
+        let scope_key = CoordinatorData::scope_key(scope);
+        let file_path = self.file_path.clone();
+        let limits = self.limits;
+
+        let existing = tokio::task::spawn_blocking(move || -> Result<Vec<NamespaceInfo>> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&file_path)?;
+            file.lock_shared()?;
+            let data = read_data(&file, limits)?;
+            let mut matches = Vec::new();
+            if let Some(bucket) = data.namespaces.get(&scope_key) {
+                for key in bucket.keys() {
+                    let namespace = CoordinatorData::namespace_from_key(key)?;
+                    let is_match = prefix.fields.len() <= namespace.fields.len()
+                        && prefix
+                            .fields
+                            .iter()
+                            .zip(&namespace.fields)
+                            .all(|(expected, actual)| expected == actual);
+                    if is_match {
+                        matches.push(NamespaceInfo::new(namespace));
+                    }
+                }
+            }
+            file.unlock()?;
+            matches.sort_by(|left, right| {
+                left.namespace
+                    .to_utf8_path()
+                    .cmp(&right.namespace.to_utf8_path())
+            });
+            Ok(matches)
+        })
+        .await??;
+
+        // The file coordinator currently provides a consistent current
+        // snapshot. The returned lease keeps the API ready for a persistent
+        // cross-relay interest registration without changing callers.
+        Ok(NamespaceSubscription::new(existing, ()))
+    }
+
     async fn shutdown(&self) -> CoordinatorResult<()> {
         let wait = async {
             while self.cleanup_capacity.available_permits() < self.limits.max_entries {
@@ -663,6 +714,40 @@ mod tests {
             .register_namespace(Some("tenant-b"), &second_namespace)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn namespace_subscription_snapshot_is_scope_and_prefix_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = FileCoordinator::with_limits(
+            directory.path().join("coordinator.json"),
+            relay_url(),
+            FileCoordinatorLimits::default(),
+        )
+        .unwrap();
+        let matching = TrackNamespace::from_utf8_path("shows/live/clock");
+        let sibling = TrackNamespace::from_utf8_path("shows/vod/archive");
+        let other_tenant = TrackNamespace::from_utf8_path("shows/live/private");
+        let _matching = coordinator
+            .register_namespace(Some("tenant-a"), &matching)
+            .await
+            .unwrap();
+        let _sibling = coordinator
+            .register_namespace(Some("tenant-a"), &sibling)
+            .await
+            .unwrap();
+        let _other = coordinator
+            .register_namespace(Some("tenant-b"), &other_tenant)
+            .await
+            .unwrap();
+
+        let prefix = TrackNamespace::from_utf8_path("shows/live");
+        let snapshot = coordinator
+            .subscribe_namespace(Some("tenant-a"), &prefix)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.existing_namespaces.len(), 1);
+        assert_eq!(snapshot.existing_namespaces[0].namespace, matching);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
