@@ -22,7 +22,7 @@ pub struct Config {
 	#[arg(long, default_value = "1500000")]
 	pub bitrate: u32,
 
-	/// Connect to the given URL starting with https://
+	/// Canonical moqt:// target (https:// is a deprecated WebTransport alias).
 	#[arg(value_parser = moq_url)]
 	pub url: Url,
 

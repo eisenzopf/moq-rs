@@ -37,8 +37,24 @@ pub enum SessionError {
     #[error("wrong size")]
     WrongSize,
 
+    /// Draft-19 INVALID_PATH (0x8): PATH was used on the wrong substrate or
+    /// identifies an unsupported resource.
     #[error("invalid connection path: {0}")]
     InvalidPath(String),
+
+    /// Draft-19 MALFORMED_PATH (0x9): PATH is not a valid path-abempty and
+    /// optional query component.
+    #[error("malformed connection path: {0}")]
+    MalformedPath(String),
+
+    /// Draft-19 INVALID_AUTHORITY (0x19): AUTHORITY was used on the wrong
+    /// substrate or does not identify the accepting server.
+    #[error("invalid connection authority: {0}")]
+    InvalidAuthority(String),
+
+    /// Draft-19 MALFORMED_AUTHORITY (0x1A): AUTHORITY is syntactically invalid.
+    #[error("malformed connection authority: {0}")]
+    MalformedAuthority(String),
 
     /// Draft-16 §3.4 INVALID_REQUEST_ID (0x4): peer used an invalid request ID.
     #[error("invalid request ID")]
@@ -58,7 +74,7 @@ pub enum SessionError {
     ProtocolViolation(String),
 }
 
-// Session Termination Error Codes from draft-ietf-moq-transport-14 Section 13.1.1
+// Session Termination Error Codes from draft-ietf-moq-transport-19.
 impl SessionError {
     /// An integer code that is sent over the wire.
     /// Returns Session Termination Error Codes per draft-14.
@@ -74,7 +90,11 @@ impl SessionError {
             // PROTOCOL_VIOLATION (0x3) - Malformed messages
             Self::Decode(_) => 0x3,
             Self::WrongSize => 0x3,
-            Self::InvalidPath(_) => 0x3,
+            // Draft-19 setup-option failures.
+            Self::InvalidPath(_) => 0x8,
+            Self::MalformedPath(_) => 0x9,
+            Self::InvalidAuthority(_) => 0x19,
+            Self::MalformedAuthority(_) => 0x1A,
             // DUPLICATE_TRACK_ALIAS (0x5)
             Self::Duplicate => 0x5,
             // INVALID_REQUEST_ID (0x4)
@@ -231,6 +251,14 @@ mod tests {
     #[test]
     fn too_many_request_updates_uses_draft_19_code() {
         assert_eq!(SessionError::TooManyRequestUpdates.code(), 0x1B);
+    }
+
+    #[test]
+    fn path_and_authority_errors_use_draft_19_codes() {
+        assert_eq!(SessionError::InvalidPath(String::new()).code(), 0x8);
+        assert_eq!(SessionError::MalformedPath(String::new()).code(), 0x9);
+        assert_eq!(SessionError::InvalidAuthority(String::new()).code(), 0x19);
+        assert_eq!(SessionError::MalformedAuthority(String::new()).code(), 0x1A);
     }
 
     #[test]

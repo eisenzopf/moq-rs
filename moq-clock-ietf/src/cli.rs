@@ -11,7 +11,7 @@ pub struct Cli {
     #[arg(long, default_value = "[::]:0")]
     pub bind: net::SocketAddr,
 
-    /// Connect to the given URL starting with https://
+    /// Canonical moqt:// target (https:// is a deprecated WebTransport alias).
     #[arg()]
     pub url: Url,
 

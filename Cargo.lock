@@ -1401,6 +1401,7 @@ dependencies = [
  "thiserror 1.0.61",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "web-transport",
 ]

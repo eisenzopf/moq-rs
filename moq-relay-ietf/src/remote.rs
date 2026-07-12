@@ -255,9 +255,9 @@ impl Remote {
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
     ) -> anyhow::Result<Self> {
-        let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
-        {
-            Ok(session) => session,
+        let (target, policy) = quic::compatibility_target(&url)?;
+        let connection = match client.connect_target(&target, policy, addr).await {
+            Ok(connection) => connection,
             Err(err) => {
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
                     .increment(1);
@@ -265,15 +265,19 @@ impl Remote {
             }
         };
 
-        let (session, subscriber) =
-            match moq_transport::session::Subscriber::connect(session, transport).await {
-                Ok(session) => session,
-                Err(err) => {
-                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
-                        .increment(1);
-                    return Err(err.into());
-                }
-            };
+        let (session, subscriber) = match moq_transport::session::Subscriber::connect(
+            connection.session,
+            connection.negotiated,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                    .increment(1);
+                return Err(err.into());
+            }
+        };
 
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();

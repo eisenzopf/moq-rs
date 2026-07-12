@@ -11,10 +11,10 @@
 //!
 //! ```bash
 //! # Run all tests against a relay
-//! moq-test-client --relay https://localhost:4443
+//! moq-test-client --relay moqt://localhost:4443
 //!
 //! # Run a specific test
-//! moq-test-client --relay https://localhost:4443 --test setup-only
+//! moq-test-client --relay moqt://localhost:4443 --test setup-only
 //!
 //! # List available tests
 //! moq-test-client --list
@@ -34,7 +34,7 @@ mod scenarios;
 #[command(name = "moq-test-client")]
 #[command(about = "MoQT Interoperability Test Client", long_about = None)]
 pub struct Args {
-    /// Relay URL to test against (e.g., https://localhost:4443)
+    /// Canonical moqt:// relay target (https:// is a deprecated WebTransport alias).
     #[arg(
         short,
         long,

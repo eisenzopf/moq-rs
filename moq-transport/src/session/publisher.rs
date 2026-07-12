@@ -19,9 +19,10 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    BidiCommand, BidiResponseMap, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
-    RequestId, RequestUpdateCredits, Session, SessionError, Subscribed, SubscribedRecv,
-    TrackStatusRequested,
+    BidiCommand, BidiResponseMap, PublishNamespace, PublishNamespaceRecv,
+    PublishNamespaceRejection, Published, PublishedInfo, RequestId, RequestUpdateCredits, Session,
+    SessionError, Subscribed, SubscribedRecv, TrackStatusRequested,
+    DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
 };
 use crate::message::RequestErrorCode;
 
@@ -29,6 +30,18 @@ enum PublishRequestStreamEvent {
     Response(Result<Option<Message>, SessionError>),
     Command(Option<BidiCommand>),
     SendStopped(Result<Option<u8>, SessionError>),
+}
+
+struct PublishNamespaceResponseGuard {
+    publisher: Publisher,
+    request_id: u64,
+}
+
+impl Drop for PublishNamespaceResponseGuard {
+    fn drop(&mut self) {
+        self.publisher
+            .recv_publish_namespace_response_stream_closed(self.request_id);
+    }
 }
 
 // TODO remove Clone.
@@ -100,41 +113,59 @@ impl Publisher {
 
     pub async fn accept(
         session: web_transport::Session,
-        transport: super::Transport,
+        negotiated: super::NegotiatedTransport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::accept(session, None, transport).await?;
+        let (session, publisher, _) = Session::accept(session, None, negotiated).await?;
         Ok((session, publisher.unwrap()))
     }
 
     pub async fn connect(
         session: web_transport::Session,
-        transport: super::Transport,
+        negotiated: super::NegotiatedTransport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None, transport).await?;
+        let (session, publisher, _) = Session::connect(session, None, negotiated).await?;
         Ok((session, publisher))
     }
 
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
-    /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
+    /// [`TracksReader`]. Blocks until the namespace is unannounced or an error occurs.
     ///
     /// Draft-19: sends PUBLISH_NAMESPACE on a new bidi request stream and reads
     /// responses from the same stream.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        let publish = self
+            .publish_namespace_open(tracks.namespace.clone())
+            .await?;
+        publish
+            .accepted_with_timeout(DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT)
+            .await
+            .map_err(ServeError::from)?;
+        publish.serve(tracks).await
+    }
+
+    /// Open a long-lived PUBLISH_NAMESPACE request without assuming acceptance.
+    ///
+    /// The returned handle owns the request-stream send direction. Call
+    /// [`PublishNamespace::accepted`] or
+    /// [`PublishNamespace::accepted_with_timeout`] before serving tracks.
+    pub async fn publish_namespace_open(
+        &mut self,
+        namespace: TrackNamespace,
+    ) -> Result<PublishNamespace, SessionError> {
         // Phase 1: allocate under lock, release before any await.
-        let (publish_ns, wire_msg, request_id) = {
+        let (mut publish_ns, wire_msg, request_id) = {
             let mut namespaces = self
                 .publish_namespaces
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
 
-            if namespaces.contains_key(&tracks.namespace) {
+            if namespaces.contains_key(&namespace) {
                 return Err(ServeError::Duplicate.into());
             }
 
             let request_id = self.request_id.allocate()?;
-            let (send, recv) =
-                PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
-            namespaces.insert(tracks.namespace.clone(), recv);
+            let (send, recv) = PublishNamespace::new(self.clone(), request_id, namespace.clone());
+            namespaces.insert(namespace.clone(), recv);
             let wire_msg: Message = send.wire_message().into();
             (send, wire_msg, request_id)
         };
@@ -146,7 +177,7 @@ impl Publisher {
             Ok(streams) => streams,
             Err(e) => {
                 if let Ok(mut ns) = self.publish_namespaces.lock() {
-                    ns.remove(&tracks.namespace);
+                    ns.remove(&namespace);
                 }
                 return Err(e.into());
             }
@@ -154,10 +185,12 @@ impl Publisher {
         let mut writer = super::Writer::new(send_stream);
         if let Err(e) = writer.encode(&wire_msg).await {
             if let Ok(mut ns) = self.publish_namespaces.lock() {
-                ns.remove(&tracks.namespace);
+                ns.remove(&namespace);
             }
             return Err(e);
         }
+        let (response_cancel, mut response_cancelled) = tokio::sync::oneshot::channel();
+        publish_ns.attach_request_stream(writer, response_cancel);
 
         // Spawn a reader task for responses on this bidi stream.
         // Draft-19: responses omit Request ID (the stream identity provides it).
@@ -165,25 +198,43 @@ impl Publisher {
         let mut this = self.clone();
         let bidi_request_id = request_id;
         let handle = tokio::spawn(async move {
+            let _response_guard = PublishNamespaceResponseGuard {
+                publisher: this.clone(),
+                request_id: bidi_request_id,
+            };
             let mut reader = super::Reader::new(recv_stream);
             loop {
-                match Session::decode_bidi_response(
-                    &mut reader,
-                    bidi_request_id,
-                    super::RequestKind::PublishNamespace,
-                )
-                .await
-                {
+                let response = tokio::select! {
+                    _ = &mut response_cancelled => {
+                        reader.stop(Session::REQUEST_STREAM_CANCELLED);
+                        break;
+                    }
+                    response = Session::decode_bidi_response(
+                        &mut reader,
+                        bidi_request_id,
+                        super::RequestKind::PublishNamespace,
+                    ) => response,
+                };
+                match response {
                     Ok(msg) => {
-                        if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
-                            if let Err(e) = this.recv_message(sub_msg) {
-                                tracing::warn!(error = %e, "error handling bidi response");
-                                break;
-                            }
+                        let terminal = matches!(&msg, Message::RequestError(_));
+                        let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) else {
+                            tracing::warn!(
+                                bidi_request_id,
+                                "unexpected response on PUBLISH_NAMESPACE request stream"
+                            );
+                            break;
+                        };
+                        if let Err(error) = this.recv_message(sub_msg) {
+                            tracing::warn!(%error, "error handling bidi response");
+                            break;
+                        }
+                        if terminal {
+                            break;
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, bidi_request_id, "bidi response reader ended");
+                    Err(error) => {
+                        tracing::debug!(%error, bidi_request_id, "bidi response reader ended");
                         break;
                     }
                 }
@@ -192,11 +243,18 @@ impl Publisher {
         if let Err(error) = self.bidi_task_tx.send(handle) {
             error.abort_and_wait().await;
             if let Ok(mut namespaces) = self.publish_namespaces.lock() {
-                namespaces.remove(&tracks.namespace);
+                namespaces.remove(&namespace);
             }
             return Err(SessionError::Internal);
         }
 
+        Ok(publish_ns)
+    }
+
+    pub(super) async fn serve_publish_namespace(
+        publish_ns: PublishNamespace,
+        tracks: TracksReader,
+    ) -> Result<(), SessionError> {
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
         let mut subscribe_done = false;
@@ -722,7 +780,7 @@ impl Publisher {
         );
     }
 
-    /// Handle REQUEST_OK from subscriber — acceptance of our PUBLISH_NAMESPACE (draft-16 §9.7).
+    /// Handle REQUEST_OK from subscriber — acceptance of our PUBLISH_NAMESPACE.
     fn recv_publish_namespace_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
         self.log_request_ok_parsed("publish_namespace", &msg);
         // The publish_namespaces map is keyed by namespace; we must search by request_id.
@@ -757,16 +815,24 @@ impl Publisher {
         Ok(true)
     }
 
-    /// Handle REQUEST_ERROR from subscriber — rejection of our PUBLISH_NAMESPACE (draft-16 §9.8).
+    /// Handle REQUEST_ERROR from subscriber — rejection of our PUBLISH_NAMESPACE.
     fn recv_publish_namespace_error(
         &mut self,
         msg: message::RequestError,
     ) -> Result<(), SessionError> {
         self.log_request_error_parsed("publish_namespace", &msg);
         if let Some(recv) = self.drop_publish_namespace(msg.id) {
-            recv.recv_error(ServeError::Closed(msg.error_code))?;
+            recv.recv_rejected(PublishNamespaceRejection::from(msg))?;
         }
         Ok(())
+    }
+
+    fn recv_publish_namespace_response_stream_closed(&mut self, id: u64) {
+        if let Ok(mut namespaces) = self.publish_namespaces.lock() {
+            if let Some(recv) = namespaces.values_mut().find(|recv| recv.request_id == id) {
+                recv.recv_response_stream_closed();
+            }
+        }
     }
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {

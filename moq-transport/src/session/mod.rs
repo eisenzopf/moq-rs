@@ -14,6 +14,7 @@ mod request_updates;
 mod subscribe;
 mod subscribed;
 mod subscriber;
+mod target;
 mod track_status_requested;
 mod writer;
 
@@ -27,6 +28,7 @@ pub use request_id::RequestId;
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
+pub use target::*;
 pub use track_status_requested::*;
 
 use reader::*;
@@ -77,8 +79,8 @@ struct RequestUpdateLimits {
 }
 
 struct SessionConfig {
-    transport: Transport,
-    connection_path: Option<String>,
+    negotiated: NegotiatedTransport,
+    target: SessionTarget,
     peer_max_request_updates: u64,
 }
 
@@ -182,8 +184,26 @@ pub enum Transport {
     /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
     WebTransport,
     /// Raw QUIC with MoQT framing directly on QUIC streams.
-    /// ALPN: "moqt-16". Path carried in SETUP PATH parameter.
+    /// ALPN: the negotiated MOQT draft identifier. Path and authority are
+    /// carried in SETUP options.
     RawQuic,
+}
+
+/// Transport substrate plus the protocol identifier actually negotiated by
+/// TLS ALPN or WebTransport's WT-Protocol response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiatedTransport {
+    pub substrate: Transport,
+    pub protocol: &'static str,
+}
+
+impl NegotiatedTransport {
+    pub const fn new(substrate: Transport, protocol: &'static str) -> Self {
+        Self {
+            substrate,
+            protocol,
+        }
+    }
 }
 
 /// Session object for managing all communications in a single QUIC connection.
@@ -209,14 +229,11 @@ pub struct Session {
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 
-    /// The transport protocol negotiated for this connection.
-    transport: Transport,
+    /// Transport substrate and actual protocol selected for this connection.
+    negotiated: NegotiatedTransport,
 
-    /// The connection path, derived from the WebTransport URL path or SETUP PATH parameter.
-    /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
-    /// (takes precedence) or the SETUP PATH parameter (key 0x1).
-    /// For outgoing connections: auto-extracted from the session URL in connect().
-    connection_path: Option<String>,
+    /// Canonical `moqt://` target reconstructed identically on both substrates.
+    target: SessionTarget,
 
     /// Receiver for spawned bidi reader task handles.
     /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
@@ -233,7 +250,6 @@ pub struct Session {
 }
 
 impl Session {
-    const MAX_CONNECTION_PATH_LEN: usize = 1024;
     const DEFAULT_MAX_REQUEST_UPDATES: u64 = 16;
     pub(super) const REQUEST_STREAM_CANCELLED: u32 = 0x1;
 
@@ -246,101 +262,151 @@ impl Session {
     /// Draft-19 stream reset code used when data-stream admission is exhausted.
     const DATA_STREAM_EXCESSIVE_LOAD: u32 = 0x9;
 
-    /// Normalize and validate a connection path.
-    ///
-    /// Returns `Ok(None)` for empty or root-only paths. Returns `Err` for
-    /// paths that are too long, don't start with `/`, contain empty,
-    /// dot, or percent-encoded segments, or are otherwise malformed.
-    ///
-    /// Percent-encoded characters are rejected rather than decoded because
-    /// scope identity must be unambiguous: `/foo%2Fbar` and `/foo/bar`
-    /// must not silently map to different scopes, and `%2E%2E` must not
-    /// bypass the dot-segment check.
-    ///
-    /// This is used internally by `accept()` and `connect()`, but is also
-    /// available for callers that need to validate paths from other sources
-    /// (e.g., announce URLs used for forward connections).
+    /// Validate a draft-19 path-abempty plus optional query while retaining
+    /// its exact encoded identity. This compatibility helper now follows RFC
+    /// 3986 and therefore does not reject or decode percent-encoded octets.
     pub fn normalize_connection_path(raw: &str) -> Result<Option<String>, SessionError> {
-        if raw.is_empty() || raw == "/" {
-            return Ok(None);
-        }
-
-        if raw.len() > Self::MAX_CONNECTION_PATH_LEN {
-            return Err(SessionError::InvalidPath("path too long".to_string()));
-        }
-
-        if !raw.starts_with('/') {
-            return Err(SessionError::InvalidPath(
-                "path must start with '/'".to_string(),
-            ));
-        }
-
-        let trimmed = raw.trim_end_matches('/');
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-
-        let mut segments = trimmed.split('/');
-        let _ = segments.next();
-        for segment in segments {
-            if segment.is_empty() {
-                return Err(SessionError::InvalidPath(
-                    "path contains empty segment".to_string(),
-                ));
-            }
-            if segment.contains('%') {
-                return Err(SessionError::InvalidPath(
-                    "path must not contain percent-encoded characters".to_string(),
-                ));
-            }
-            if segment == "." || segment == ".." {
-                return Err(SessionError::InvalidPath(
-                    "path contains invalid segment".to_string(),
-                ));
-            }
-        }
-
-        Ok(Some(trimmed.to_string()))
+        SessionTarget::from_setup_parts("path-validation.invalid", raw)
+            .map(|target| target.routing_path().map(str::to_string))
+            .map_err(Self::map_target_error)
     }
 
-    fn decode_client_setup_path(params: &KeyValuePairs) -> Result<Option<String>, SessionError> {
-        let Some(kvp) = params.get(setup::ParameterType::Path.into()) else {
-            return Ok(None);
-        };
-
-        let bytes = match &kvp.value {
-            Value::BytesValue(bytes) => bytes,
-            _ => {
-                return Err(SessionError::InvalidPath(
-                    "PATH parameter must be bytes-encoded".to_string(),
-                ))
+    fn map_target_error(error: SessionTargetError) -> SessionError {
+        match error {
+            SessionTargetError::MissingAuthority | SessionTargetError::MalformedAuthority => {
+                SessionError::MalformedAuthority(error.to_string())
             }
-        };
-
-        if bytes.len() > Self::MAX_CONNECTION_PATH_LEN {
-            return Err(SessionError::InvalidPath("path too long".to_string()));
+            SessionTargetError::MalformedPath(_) | SessionTargetError::TooLong => {
+                SessionError::MalformedPath(error.to_string())
+            }
+            SessionTargetError::UnsupportedScheme(_) | SessionTargetError::Malformed(_) => {
+                SessionError::ProtocolViolation(error.to_string())
+            }
         }
+    }
 
-        let path = std::str::from_utf8(bytes)
-            .map_err(|_| SessionError::InvalidPath("path must be UTF-8".to_string()))?;
+    fn setup_bytes(
+        params: &KeyValuePairs,
+        option: setup::ParameterType,
+    ) -> Result<Option<&[u8]>, bool> {
+        params
+            .get(option.into())
+            .map(|pair| match &pair.value {
+                Value::BytesValue(bytes) => Ok(bytes.as_slice()),
+                Value::IntValue(_) => Err(false),
+            })
+            .transpose()
+    }
 
-        Self::normalize_connection_path(path)
+    fn target_from_client_setup(
+        session_url: &url::Url,
+        negotiated: NegotiatedTransport,
+        params: &KeyValuePairs,
+    ) -> Result<SessionTarget, SessionError> {
+        let path = Self::setup_bytes(params, setup::ParameterType::Path)
+            .map_err(|_| SessionError::MalformedPath("PATH option must be bytes-encoded".into()))?;
+        let authority =
+            Self::setup_bytes(params, setup::ParameterType::Authority).map_err(|_| {
+                SessionError::MalformedAuthority("AUTHORITY option must be bytes-encoded".into())
+            })?;
+
+        match negotiated.substrate {
+            Transport::WebTransport => {
+                if path.is_some() {
+                    return Err(SessionError::InvalidPath(
+                        "PATH is prohibited on WebTransport".into(),
+                    ));
+                }
+                if authority.is_some() {
+                    return Err(SessionError::InvalidAuthority(
+                        "AUTHORITY is prohibited on WebTransport".into(),
+                    ));
+                }
+                SessionTarget::from_webtransport_url(session_url).map_err(Self::map_target_error)
+            }
+            Transport::RawQuic => {
+                let authority = authority.ok_or_else(|| {
+                    SessionError::MalformedAuthority(
+                        "native QUIC clients must send AUTHORITY".into(),
+                    )
+                })?;
+                let authority = std::str::from_utf8(authority).map_err(|_| {
+                    SessionError::MalformedAuthority("AUTHORITY must be UTF-8".into())
+                })?;
+                let path = path.ok_or_else(|| {
+                    SessionError::MalformedPath("native QUIC clients must send PATH".into())
+                })?;
+                let path = std::str::from_utf8(path)
+                    .map_err(|_| SessionError::MalformedPath("PATH must be UTF-8".into()))?;
+                let target = SessionTarget::from_setup_parts(authority, path)
+                    .map_err(Self::map_target_error)?;
+                if !target.has_same_host(session_url) {
+                    return Err(SessionError::InvalidAuthority(
+                        "AUTHORITY host does not match the accepted TLS server name".into(),
+                    ));
+                }
+                Ok(target)
+            }
+        }
+    }
+
+    fn validate_server_setup_options(params: &KeyValuePairs) -> Result<(), SessionError> {
+        if params.get(setup::ParameterType::Path.into()).is_some() {
+            return Err(SessionError::InvalidPath(
+                "servers must not send PATH".into(),
+            ));
+        }
+        if params.get(setup::ParameterType::Authority.into()).is_some() {
+            return Err(SessionError::InvalidAuthority(
+                "servers must not send AUTHORITY".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_negotiated_transport(
+        session: &web_transport::Session,
+        negotiated: NegotiatedTransport,
+    ) -> Result<(), SessionError> {
+        if !setup::SUPPORTED_ALPNS.contains(&negotiated.protocol) {
+            return Err(SessionError::ProtocolViolation(format!(
+                "unsupported negotiated MOQT protocol {}",
+                negotiated.protocol
+            )));
+        }
+        if negotiated.substrate == Transport::WebTransport
+            && session.protocol() != Some(negotiated.protocol)
+        {
+            return Err(SessionError::ProtocolViolation(format!(
+                "WebTransport selected protocol {:?}, expected {}",
+                session.protocol(),
+                negotiated.protocol
+            )));
+        }
+        Ok(())
     }
 
     /// Returns the negotiated transport protocol for this connection.
     pub fn transport(&self) -> Transport {
-        self.transport
+        self.negotiated.substrate
     }
 
-    /// Returns the connection path, if one was present on the incoming connection.
-    ///
-    /// For server-side sessions (created via `accept()`), this is derived from:
-    /// 1. The WebTransport CONNECT URL path (takes precedence), or
-    /// 2. The SETUP PATH parameter (key 0x1), used for raw QUIC connections.
-    ///
-    /// Returns `None` if no path was present or if the path was just "/".
+    /// Returns the actual substrate and MOQT protocol selected by the peer.
+    pub fn negotiated_transport(&self) -> NegotiatedTransport {
+        self.negotiated
+    }
+
+    /// Returns the canonical `moqt://` session target.
+    pub fn target(&self) -> &SessionTarget {
+        &self.target
+    }
+
+    /// Returns the canonical path and query used for routing this session.
+    /// WebTransport derives it from the CONNECT URL; raw QUIC reconstructs the
+    /// same value from the required PATH option. Root-only targets return
+    /// `None` for compatibility with existing scope routing.
     pub fn connection_path(&self) -> Option<&str> {
-        self.connection_path.as_deref()
+        self.target.routing_path()
     }
 
     /// Log a control- or request-stream message with structured fields.
@@ -564,8 +630,8 @@ impl Session {
             outgoing: outgoing.1,
             request_id,
             mlog: mlog_shared,
-            transport: config.transport,
-            connection_path: config.connection_path,
+            negotiated: config.negotiated,
+            target: config.target,
             bidi_task_rx,
             bidi_response_map,
             max_request_updates: Self::DEFAULT_MAX_REQUEST_UPDATES,
@@ -586,11 +652,18 @@ impl Session {
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
-        transport: Transport,
+        negotiated: NegotiatedTransport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::validate_negotiated_transport(&session, negotiated)?;
         let url = session.url().clone();
-        let url_path = url.path();
-        let path = Self::normalize_connection_path(url_path)?;
+        let target = match negotiated.substrate {
+            Transport::RawQuic => {
+                SessionTarget::try_from_url(url).map_err(Self::map_target_error)?
+            }
+            Transport::WebTransport => {
+                SessionTarget::from_webtransport_url(&url).map_err(Self::map_target_error)?
+            }
+        };
 
         let mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
@@ -608,31 +681,17 @@ impl Session {
             Self::DEFAULT_MAX_REQUEST_UPDATES,
         );
 
-        if transport == Transport::RawQuic {
-            // Draft-16 §9.3.1.1: send AUTHORITY for native QUIC.
-            if let Some(host) = url.host_str() {
-                let authority = if let Some(port) = url.port() {
-                    format!("{}:{}", host, port)
-                } else {
-                    host.to_string()
-                };
-                params.set_bytesvalue(
-                    setup::ParameterType::Authority.into(),
-                    authority.into_bytes(),
-                );
-            }
-
-            // Draft-16 §9.3.1.2: send PATH (path + optional query) for native QUIC.
-            let path_and_query = match url.query() {
-                Some(q) => format!("{}?{}", url_path, q),
-                None => url_path.to_string(),
-            };
-            if !path_and_query.is_empty() && path_and_query != "/" {
-                params.set_bytesvalue(
-                    setup::ParameterType::Path.into(),
-                    path_and_query.into_bytes(),
-                );
-            }
+        if negotiated.substrate == Transport::RawQuic {
+            // Draft-19 requires both options on every native QUIC session,
+            // including an empty PATH value for a URI with path-abempty="".
+            params.set_bytesvalue(
+                setup::ParameterType::Authority.into(),
+                target.authority().as_bytes().to_vec(),
+            );
+            params.set_bytesvalue(
+                setup::ParameterType::Path.into(),
+                target.path_and_query().as_bytes().to_vec(),
+            );
         }
 
         let client = setup::Setup { params };
@@ -641,8 +700,9 @@ impl Session {
             target: "moq_transport::control",
             direction = "sent",
             msg_type = "SETUP",
-            ?transport,
-            path = path.as_deref(),
+            transport = ?negotiated.substrate,
+            protocol = negotiated.protocol,
+            target = %target,
             "MoQT framed message"
         );
         sender.encode(&client).await?;
@@ -651,6 +711,7 @@ impl Session {
         let recv_stream = session.accept_uni().await?;
         let mut recver = Reader::new(recv_stream);
         let server: setup::Setup = recver.decode().await?;
+        Self::validate_server_setup_options(&server.params)?;
         let peer_max_request_updates = server.max_request_updates()?;
         tracing::debug!(
             target: "moq_transport::control",
@@ -668,8 +729,8 @@ impl Session {
             mlog,
             request_id,
             SessionConfig {
-                transport,
-                connection_path: path,
+                negotiated,
+                target,
                 peer_max_request_updates,
             },
         );
@@ -684,8 +745,9 @@ impl Session {
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
-        transport: Transport,
+        negotiated: NegotiatedTransport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        Self::validate_negotiated_transport(&session, negotiated)?;
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
@@ -709,24 +771,10 @@ impl Session {
             "MoQT framed message"
         );
 
-        // For WebTransport the path arrives in the HTTP/3 CONNECT :path.
-        // For raw QUIC the PATH setup parameter carries it instead.
-        let wt_url_path = session.url().path();
-        let wt_path = Self::normalize_connection_path(wt_url_path)?;
+        let target = Self::target_from_client_setup(session.url(), negotiated, &client.params)?;
 
-        let client_setup_path = if wt_path.is_none() {
-            Self::decode_client_setup_path(&client.params)?
-        } else {
-            None
-        };
-
-        let connection_path = wt_path.or(client_setup_path);
-
-        if connection_path.is_some() {
-            tracing::debug!(
-                connection_path = connection_path.as_deref(),
-                "Connection path resolved"
-            );
+        if let Some(connection_path) = target.routing_path() {
+            tracing::debug!(connection_path, "Connection path resolved");
         }
 
         if let Some(ref mut mlog) = mlog {
@@ -765,8 +813,8 @@ impl Session {
             mlog,
             request_id,
             SessionConfig {
-                transport,
-                connection_path,
+                negotiated,
+                target,
                 peer_max_request_updates,
             },
         ))
@@ -1782,7 +1830,10 @@ mod tests {
     fn normalize_empty_and_root() {
         assert_eq!(Session::normalize_connection_path("").unwrap(), None);
         assert_eq!(Session::normalize_connection_path("/").unwrap(), None);
-        assert_eq!(Session::normalize_connection_path("///").unwrap(), None);
+        assert_eq!(
+            Session::normalize_connection_path("///").unwrap(),
+            Some("///".to_string())
+        );
     }
 
     #[test]
@@ -1795,10 +1846,10 @@ mod tests {
             Session::normalize_connection_path("/tenant/stream-1").unwrap(),
             Some("/tenant/stream-1".to_string())
         );
-        // Trailing slash is trimmed
+        // RFC 3986 path identity is retained exactly.
         assert_eq!(
             Session::normalize_connection_path("/app/").unwrap(),
-            Some("/app".to_string())
+            Some("/app/".to_string())
         );
     }
 
@@ -1808,40 +1859,141 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_empty_segments() {
-        assert!(Session::normalize_connection_path("/app//stream").is_err());
+    fn normalize_accepts_rfc3986_empty_segments() {
+        assert_eq!(
+            Session::normalize_connection_path("/app//stream").unwrap(),
+            Some("/app//stream".to_string())
+        );
     }
 
     #[test]
-    fn normalize_rejects_dot_segments() {
-        assert!(Session::normalize_connection_path("/app/./stream").is_err());
-        assert!(Session::normalize_connection_path("/app/../secret").is_err());
-        assert!(Session::normalize_connection_path("/..").is_err());
+    fn normalize_retains_rfc3986_path_identity() {
+        assert!(Session::normalize_connection_path("/app/./stream").is_ok());
+        assert!(Session::normalize_connection_path("/app/../secret").is_ok());
+        assert!(Session::normalize_connection_path("/..").is_ok());
     }
 
     #[test]
-    fn normalize_rejects_percent_encoded_characters() {
-        // %2F = '/' — would create scope ambiguity
-        assert!(Session::normalize_connection_path("/foo%2Fbar").is_err());
-        // %2E%2E = '..' — would bypass dot-segment check
-        assert!(Session::normalize_connection_path("/%2E%2E/secret").is_err());
-        // %00 = null — general injection risk
-        assert!(Session::normalize_connection_path("/app/%00").is_err());
-        // Uppercase hex digits
-        assert!(Session::normalize_connection_path("/app/%2e%2e").is_err());
+    fn normalize_preserves_percent_encoded_characters() {
+        assert_eq!(
+            Session::normalize_connection_path("/foo%2Fbar?x=%2F").unwrap(),
+            Some("/foo%2Fbar?x=%2F".to_string())
+        );
+        assert!(Session::normalize_connection_path("/%2E%2E/secret").is_ok());
+        assert!(Session::normalize_connection_path("/app/%00").is_ok());
     }
 
     #[test]
     fn normalize_rejects_too_long_path() {
-        let long_path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN));
+        let long_path = format!("/{}", "a".repeat(SessionTarget::MAX_URI_BYTES));
         assert!(Session::normalize_connection_path(&long_path).is_err());
     }
 
     #[test]
     fn normalize_accepts_max_length_path() {
-        // Exactly at the limit (1024 total including leading slash)
-        let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
+        let path = format!("/{}", "a".repeat(8_000));
         assert!(Session::normalize_connection_path(&path).is_ok());
+    }
+
+    #[test]
+    fn webtransport_rejects_path_and_authority_setup_options() {
+        let url = url::Url::parse("https://relay.example/live?q=1").unwrap();
+        let negotiated =
+            NegotiatedTransport::new(Transport::WebTransport, setup::SUPPORTED_ALPNS[0]);
+
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(setup::ParameterType::Path.into(), b"/other".to_vec());
+        let error = Session::target_from_client_setup(&url, negotiated, &params).unwrap_err();
+        assert!(matches!(error, SessionError::InvalidPath(_)));
+        assert_eq!(error.code(), 0x8);
+
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"relay.example".to_vec(),
+        );
+        let error = Session::target_from_client_setup(&url, negotiated, &params).unwrap_err();
+        assert!(matches!(error, SessionError::InvalidAuthority(_)));
+        assert_eq!(error.code(), 0x19);
+    }
+
+    #[test]
+    fn raw_quic_requires_well_formed_path_and_authority_setup_options() {
+        let url = url::Url::parse("moqt://relay.example").unwrap();
+        let negotiated = NegotiatedTransport::new(Transport::RawQuic, setup::SUPPORTED_ALPNS[0]);
+
+        let missing =
+            Session::target_from_client_setup(&url, negotiated, &KeyValuePairs::default())
+                .unwrap_err();
+        assert!(matches!(missing, SessionError::MalformedAuthority(_)));
+
+        let mut malformed_path = KeyValuePairs::default();
+        malformed_path.set_intvalue(setup::ParameterType::Path.into(), 1);
+        malformed_path.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"relay.example".to_vec(),
+        );
+        assert!(matches!(
+            Session::target_from_client_setup(&url, negotiated, &malformed_path),
+            Err(SessionError::MalformedPath(_))
+        ));
+
+        let mut malformed_authority = KeyValuePairs::default();
+        malformed_authority.set_bytesvalue(setup::ParameterType::Path.into(), b"/live".to_vec());
+        malformed_authority.set_intvalue(setup::ParameterType::Authority.into(), 1);
+        assert!(matches!(
+            Session::target_from_client_setup(&url, negotiated, &malformed_authority),
+            Err(SessionError::MalformedAuthority(_))
+        ));
+    }
+
+    #[test]
+    fn raw_quic_reconstructs_exact_target_and_rejects_wrong_host() {
+        let url = url::Url::parse("moqt://relay.example").unwrap();
+        let negotiated = NegotiatedTransport::new(Transport::RawQuic, setup::SUPPORTED_ALPNS[0]);
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"relay.example:4443".to_vec(),
+        );
+        params.set_bytesvalue(
+            setup::ParameterType::Path.into(),
+            b"/a%2Fb?token=x%2Fy".to_vec(),
+        );
+
+        let target = Session::target_from_client_setup(&url, negotiated, &params).unwrap();
+        assert_eq!(
+            target.to_string(),
+            "moqt://relay.example:4443/a%2Fb?token=x%2Fy"
+        );
+
+        params.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"other.example".to_vec(),
+        );
+        let error = Session::target_from_client_setup(&url, negotiated, &params).unwrap_err();
+        assert!(matches!(error, SessionError::InvalidAuthority(_)));
+        assert_eq!(error.code(), 0x19);
+    }
+
+    #[test]
+    fn server_setup_must_not_contain_path_or_authority() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(setup::ParameterType::Path.into(), b"/live".to_vec());
+        assert!(matches!(
+            Session::validate_server_setup_options(&params),
+            Err(SessionError::InvalidPath(_))
+        ));
+
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"relay.example".to_vec(),
+        );
+        assert!(matches!(
+            Session::validate_server_setup_options(&params),
+            Err(SessionError::InvalidAuthority(_))
+        ));
     }
 
     // ========================================================================

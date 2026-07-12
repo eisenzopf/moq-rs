@@ -33,13 +33,18 @@ async fn connect(
 ) -> Result<(
     web_transport::Session,
     String,
-    moq_transport::session::Transport,
+    moq_transport::session::NegotiatedTransport,
 )> {
     let tls = args.tls.load()?;
     let quic = quic::Endpoint::new(quic::Config::new(args.bind, None, tls)?)?;
 
-    let (session, connection_id, transport) = quic.client.connect(&args.relay, None).await?;
-    Ok((session, connection_id, transport))
+    let (target, policy) = quic::compatibility_target(&args.relay)?;
+    let connection = quic.client.connect_target(&target, policy, None).await?;
+    Ok((
+        connection.session,
+        connection.connection_id,
+        connection.negotiated,
+    ))
 }
 
 /// Collected connection IDs from a test run
@@ -91,29 +96,25 @@ pub async fn test_publish_namespace_only(args: &Args) -> Result<TestConnectionId
             .context("SETUP exchange failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
-        let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
         tracing::info!("Sending PUBLISH_NAMESPACE for: {}", TEST_NAMESPACE);
 
-        // publish_namespace() blocks waiting for subscriptions after receiving REQUEST_OK.
-        // If we receive REQUEST_ERROR instead, it returns Err immediately.
-        // Timing out here means we received REQUEST_OK and are now waiting for subscribers,
-        // which is the expected success case.
-        let result = tokio::select! {
-            res = publisher.publish_namespace(reader) => res,
+        let publish = publisher
+            .publish_namespace_open(namespace)
+            .await
+            .context("failed to open PUBLISH_NAMESPACE request stream")?;
+        tokio::select! {
+            accepted = publish.accepted_with_timeout(Duration::from_secs(2)) => {
+                accepted.context("PUBLISH_NAMESPACE was not explicitly accepted")?;
+            }
             res = session.run() => {
                 res.context("session error")?;
-                anyhow::bail!("session ended before PUBLISH_NAMESPACE completed");
+                anyhow::bail!("session ended before PUBLISH_NAMESPACE acceptance");
             }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                tracing::info!(
-                    "PUBLISH_NAMESPACE succeeded (REQUEST_OK received, waiting for subscribers)"
-                );
-                return Ok(cids);
-            }
-        };
+        }
 
-        result.context("PUBLISH_NAMESPACE failed")?;
+        tracing::info!("PUBLISH_NAMESPACE received explicit REQUEST_OK");
+        drop(publish);
         Ok(cids)
     })
     .await

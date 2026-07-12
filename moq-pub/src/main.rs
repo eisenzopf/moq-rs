@@ -30,7 +30,7 @@ pub struct Cli {
     #[arg(long, default_value = "1500000")]
     pub bitrate: u32,
 
-    /// Connect to the given URL starting with https://
+    /// Canonical moqt:// target (https:// is a deprecated WebTransport alias).
     #[arg()]
     pub url: Url,
 
@@ -69,14 +69,15 @@ async fn main() -> anyhow::Result<()> {
     )?)?;
 
     tracing::info!("connecting to relay: url={}", cli.url);
-    let (session, connection_id, transport) = quic.client.connect(&cli.url, None).await?;
+    let (target, policy) = quic::compatibility_target(&cli.url)?;
+    let connection = quic.client.connect_target(&target, policy, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
-        connection_id
+        connection.connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session, transport)
+    let (session, mut publisher) = Publisher::connect(connection.session, connection.negotiated)
         .await
         .context("failed to create MoQ Transport publisher")?;
 

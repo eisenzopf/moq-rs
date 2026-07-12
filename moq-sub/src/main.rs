@@ -29,16 +29,18 @@ async fn main() -> anyhow::Result<()> {
     let tls = config.tls.load()?;
     let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls)?)?;
 
-    let (session, connection_id, transport) = quic.client.connect(&config.url, None).await?;
+    let (target, policy) = quic::compatibility_target(&config.url)?;
+    let connection = quic.client.connect_target(&target, policy, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
-        connection_id
+        connection.connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport session")?;
+    let (session, subscriber) =
+        moq_transport::session::Subscriber::connect(connection.session, connection.negotiated)
+            .await
+            .context("failed to create MoQ Transport session")?;
 
     // Associate empty set of Tracks with provided namespace
     let tracks = Tracks::new(TrackNamespace::from_utf8_path(&config.name));
@@ -59,7 +61,7 @@ pub struct Config {
     #[arg(long, default_value = "[::]:0")]
     pub bind: net::SocketAddr,
 
-    /// Connect to the given URL starting with https://
+    /// Canonical moqt:// target (https:// is a deprecated WebTransport alias).
     #[arg(value_parser = moq_url)]
     pub url: Url,
 
@@ -86,7 +88,10 @@ fn moq_url(s: &str) -> Result<Url, String> {
 
     // Make sure the scheme is moq
     if url.scheme() != "https" && url.scheme() != "moqt" {
-        return Err("url scheme must be https:// for WebTransport & moqt:// for QUIC".to_string());
+        return Err(
+            "URL scheme must be moqt:// (https:// remains a deprecated WebTransport alias)"
+                .to_string(),
+        );
     }
 
     Ok(url)

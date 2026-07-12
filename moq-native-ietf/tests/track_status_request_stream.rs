@@ -5,13 +5,13 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::Context as _;
 use moq_native_ietf::{quic, tls};
+use moq_transport::session::SessionTarget;
 use moq_transport::{
     coding::TrackNamespace,
     serve,
     session::{Publisher, Subscriber},
 };
 use tokio::time::timeout;
-use url::Url;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -35,19 +35,22 @@ async fn track_status_round_trips_on_independent_request_streams() -> anyhow::Re
     let quic::Endpoint { client, server, .. } = endpoint;
     let mut server = server.context("test endpoint did not expose a server")?;
     let server_addr = server.local_addr()?;
-    let url = Url::parse(&format!("moqt://localhost:{}", server_addr.port()))?;
+    let target: SessionTarget = format!("moqt://localhost:{}", server_addr.port()).parse()?;
 
     let (client_connection, server_connection) = tokio::join!(
-        timeout(TEST_TIMEOUT, client.connect(&url, Some(server_addr))),
-        timeout(TEST_TIMEOUT, server.accept()),
+        timeout(
+            TEST_TIMEOUT,
+            client.connect_target(&target, quic::SubstratePolicy::RawQuic, Some(server_addr)),
+        ),
+        timeout(TEST_TIMEOUT, server.accept_connection()),
     );
-    let (client_connection, _, client_transport) = client_connection??;
-    let (server_connection, _, server_transport) =
+    let client_connection = client_connection??;
+    let server_connection =
         server_connection?.context("server stopped before accepting test connection")?;
 
     let (client_setup, server_setup) = tokio::join!(
-        Subscriber::connect(client_connection, client_transport),
-        Publisher::accept(server_connection, server_transport),
+        Subscriber::connect(client_connection.session, client_connection.negotiated),
+        Publisher::accept(server_connection.session, server_connection.negotiated),
     );
     let (client_session, mut subscriber) = client_setup?;
     let (server_session, mut publisher) = server_setup?;

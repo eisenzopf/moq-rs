@@ -17,7 +17,7 @@ use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use url::Url;
 
-use moq_transport::session::Transport;
+use moq_transport::session::{NegotiatedTransport, SessionTarget, Transport};
 
 use crate::tls;
 
@@ -37,6 +37,102 @@ pub enum AddressFamily {
 pub enum Host {
     Ip(IpAddr),
     Name(String),
+}
+
+/// Substrate selection policy for a canonical `moqt://` session target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubstratePolicy {
+    /// Offer raw MOQT ALPNs and HTTP/3; the TLS peer selects the substrate.
+    Auto,
+    /// Require a raw QUIC MOQT ALPN.
+    RawQuic,
+    /// Require HTTP/3 followed by a WebTransport CONNECT request.
+    WebTransport,
+}
+
+/// Connected transport plus the protocol actually negotiated with the peer.
+pub struct SessionConnection {
+    pub session: web_transport::Session,
+    pub connection_id: String,
+    pub negotiated: NegotiatedTransport,
+}
+
+impl SessionConnection {
+    pub fn into_parts(self) -> (web_transport::Session, String, NegotiatedTransport) {
+        (self.session, self.connection_id, self.negotiated)
+    }
+}
+
+/// Translate the historical scheme-selected input into a canonical target and
+/// explicit policy. `https://` remains accepted only as a deprecated
+/// compatibility alias for WebTransport and emits an operator-visible warning.
+pub fn compatibility_target(url: &Url) -> anyhow::Result<(SessionTarget, SubstratePolicy)> {
+    match url.scheme() {
+        "moqt" => Ok((
+            SessionTarget::try_from_url(url.clone())?,
+            SubstratePolicy::RawQuic,
+        )),
+        "https" => {
+            tracing::warn!(
+                url = %url,
+                "https:// MOQT inputs are deprecated; use a canonical moqt:// target with an explicit WebTransport policy"
+            );
+            Ok((
+                SessionTarget::from_webtransport_url(url)?,
+                SubstratePolicy::WebTransport,
+            ))
+        }
+        scheme => {
+            anyhow::bail!("unsupported MOQT URL scheme {scheme:?}; canonical targets use 'moqt'")
+        }
+    }
+}
+
+fn format_url_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+fn supported_protocol(protocol: &[u8]) -> Option<&'static str> {
+    moq_transport::setup::SUPPORTED_ALPNS
+        .iter()
+        .copied()
+        .find(|supported| supported.as_bytes() == protocol)
+}
+
+fn policy_allows(policy: SubstratePolicy, substrate: Transport) -> bool {
+    matches!(policy, SubstratePolicy::Auto)
+        || matches!(
+            (policy, substrate),
+            (SubstratePolicy::RawQuic, Transport::RawQuic)
+                | (SubstratePolicy::WebTransport, Transport::WebTransport)
+        )
+}
+
+fn alpn_protocols(policy: SubstratePolicy) -> Vec<Vec<u8>> {
+    let mut protocols = Vec::new();
+    if policy_allows(policy, Transport::WebTransport) {
+        protocols.push(web_transport_quinn::ALPN.as_bytes().to_vec());
+    }
+    if policy_allows(policy, Transport::RawQuic) {
+        protocols.extend(
+            moq_transport::setup::SUPPORTED_ALPNS
+                .iter()
+                .map(|protocol| protocol.as_bytes().to_vec()),
+        );
+    }
+    protocols
+}
+
+fn selected_webtransport_protocol(protocol: Option<&str>) -> anyhow::Result<&'static str> {
+    let protocol = protocol.context("WebTransport response did not select a MOQT protocol")?;
+    moq_transport::setup::SUPPORTED_ALPNS
+        .iter()
+        .copied()
+        .find(|supported| *supported == protocol)
+        .with_context(|| format!("WebTransport selected unsupported MOQT protocol {protocol:?}"))
 }
 
 impl fmt::Display for AddressFamily {
@@ -317,15 +413,14 @@ impl Endpoint {
 
 pub struct Server {
     quic: quinn::Endpoint,
-    accept: FuturesUnordered<
-        BoxFuture<'static, anyhow::Result<(web_transport::Session, String, Transport)>>,
-    >,
+    accept: FuturesUnordered<BoxFuture<'static, anyhow::Result<SessionConnection>>>,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
 }
 
 impl Server {
-    pub async fn accept(&mut self) -> Option<(web_transport::Session, String, Transport)> {
+    /// Accept a connection and retain its actual negotiated protocol metadata.
+    pub async fn accept_connection(&mut self) -> Option<SessionConnection> {
         loop {
             tokio::select! {
                 res = self.quic.accept() => {
@@ -347,11 +442,20 @@ impl Server {
         }
     }
 
+    /// Tuple convenience wrapper retaining the actual negotiated protocol.
+    pub async fn accept(
+        &mut self,
+    ) -> Option<(web_transport::Session, String, NegotiatedTransport)> {
+        self.accept_connection()
+            .await
+            .map(SessionConnection::into_parts)
+    }
+
     async fn accept_session(
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+    ) -> anyhow::Result<SessionConnection> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
         let orig_dst_cid = conn.orig_dst_cid();
@@ -421,7 +525,7 @@ impl Server {
         );
 
         let alpn_bytes = alpn.as_bytes();
-        let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+        let (session, negotiated) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
             // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
             let request = web_transport_quinn::Request::accept(conn)
                 .await
@@ -439,24 +543,42 @@ impl Server {
                 .respond(response)
                 .await
                 .context("failed to respond to WebTransport request")?;
-            (session, Transport::WebTransport)
-        } else if moq_transport::setup::SUPPORTED_ALPNS
+            (
+                session,
+                NegotiatedTransport::new(Transport::WebTransport, selected),
+            )
+        } else if let Some(selected) = moq_transport::setup::SUPPORTED_ALPNS
             .iter()
-            .any(|v| v.as_bytes() == alpn_bytes)
+            .find(|version| version.as_bytes() == alpn_bytes)
+            .copied()
         {
             // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
-            let request = url::Url::parse("moqt://localhost").unwrap();
+            let accepted_host = if server_name.is_empty() {
+                conn.local_ip()
+                    .map(format_url_host)
+                    .context("raw QUIC connection has neither SNI nor a local IP")?
+            } else {
+                server_name.clone()
+            };
+            let request = url::Url::parse(&format!("moqt://{accepted_host}"))?;
             let session = web_transport_quinn::Session::raw(
                 conn,
                 request,
                 web_transport_quinn::proto::ConnectResponse::default(),
             );
-            (session, Transport::RawQuic)
+            (
+                session,
+                NegotiatedTransport::new(Transport::RawQuic, selected),
+            )
         } else {
             anyhow::bail!("unsupported ALPN: {}", alpn)
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        Ok(SessionConnection {
+            session: session.into(),
+            connection_id: connection_id_hex,
+            negotiated,
+        })
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
@@ -501,19 +623,17 @@ impl Client {
         }
     }
 
-    pub async fn connect(
+    /// Connect to a canonical `moqt://` target using the requested substrate
+    /// policy and return the actual protocol selected by TLS/HTTP negotiation.
+    pub async fn connect_target(
         &self,
-        url: &Url,
+        target: &SessionTarget,
+        policy: SubstratePolicy,
         socket_addr: Option<net::SocketAddr>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+    ) -> anyhow::Result<SessionConnection> {
         let mut config = self.config.clone();
 
-        // TODO support connecting to both ALPNs at the same time
-        config.alpn_protocols = vec![match url.scheme() {
-            "https" => web_transport_quinn::ALPN.as_bytes().to_vec(),
-            "moqt" => moq_transport::setup::ALPN.to_vec(),
-            _ => anyhow::bail!("url scheme must be 'https' or 'moqt'"),
-        }];
+        config.alpn_protocols = alpn_protocols(policy);
 
         config.key_log = Arc::new(rustls::KeyLogFile::new());
 
@@ -535,12 +655,12 @@ impl Client {
             cid
         }));
 
-        let host = match url.host().context("missing host")? {
+        let host = match target.host().context("missing host")? {
             url::Host::Domain(d) => d.to_string(),
             url::Host::Ipv4(ip) => ip.to_string(),
             url::Host::Ipv6(ip) => ip.to_string(), // No brackets
         };
-        let port = url.port().unwrap_or(443);
+        let port = target.port().unwrap_or(443);
 
         // Look up the DNS entry and filter by socket address family.
         let addr = match socket_addr {
@@ -554,6 +674,15 @@ impl Client {
 
         let connection = self.quic.connect_with(config, addr, &host)?.await?;
 
+        let handshake = connection
+            .handshake_data()
+            .context("established QUIC connection is missing handshake metadata")?
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .map_err(|_| anyhow::anyhow!("unexpected QUIC handshake metadata type"))?;
+        let selected_alpn = handshake
+            .protocol
+            .context("QUIC peer did not select an ALPN")?;
+
         // Extract the CID that was used
         let connection_id_hex = cid_capture
             .lock()
@@ -562,30 +691,68 @@ impl Client {
             .context("CID not captured")?
             .to_string();
 
-        let (session, transport) = match url.scheme() {
-            "https" => {
-                // Offer all supported MoQT versions via WT-Available-Protocols.
-                let mut request = web_transport_quinn::proto::ConnectRequest::new(url.clone());
-                for alpn in moq_transport::setup::SUPPORTED_ALPNS {
-                    request = request.with_protocol(alpn.to_string());
-                }
-                (
-                    web_transport_quinn::Session::connect(connection, request).await?,
-                    Transport::WebTransport,
-                )
+        let (session, negotiated) = if selected_alpn == web_transport_quinn::ALPN.as_bytes() {
+            if !policy_allows(policy, Transport::WebTransport) {
+                anyhow::bail!(
+                    "peer selected WebTransport contrary to the requested substrate policy"
+                );
             }
-            "moqt" => (
+
+            let request_url = target.webtransport_url();
+            // Offer all supported MoQT versions via WT-Available-Protocols.
+            let mut request = web_transport_quinn::proto::ConnectRequest::new(request_url);
+            for protocol in moq_transport::setup::SUPPORTED_ALPNS {
+                request = request.with_protocol(protocol.to_string());
+            }
+            let session = web_transport_quinn::Session::connect(connection, request)
+                .await
+                .context("failed to establish WebTransport session")?;
+            let protocol = selected_webtransport_protocol(session.response().protocol.as_deref())?;
+            (
+                session,
+                NegotiatedTransport::new(Transport::WebTransport, protocol),
+            )
+        } else if let Some(protocol) = supported_protocol(&selected_alpn) {
+            if !policy_allows(policy, Transport::RawQuic) {
+                anyhow::bail!("peer selected raw QUIC contrary to the requested substrate policy");
+            }
+            (
                 web_transport_quinn::Session::raw(
                     connection,
-                    url.clone(),
+                    target.network_url(),
                     web_transport_quinn::proto::ConnectResponse::default(),
                 ),
-                Transport::RawQuic,
-            ),
-            _ => unreachable!(),
+                NegotiatedTransport::new(Transport::RawQuic, protocol),
+            )
+        } else {
+            anyhow::bail!(
+                "QUIC peer selected unsupported ALPN {:?}",
+                String::from_utf8_lossy(&selected_alpn)
+            )
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        Ok(SessionConnection {
+            session: session.into(),
+            connection_id: connection_id_hex,
+            negotiated,
+        })
+    }
+
+    /// Compatibility entry point for historical scheme-selected URLs.
+    ///
+    /// `https://` is a deprecated alias for a canonical `moqt://` target with
+    /// [`SubstratePolicy::WebTransport`]. New callers should use
+    /// [`Self::connect_target`] and select the substrate independently.
+    pub async fn connect(
+        &self,
+        url: &Url,
+        socket_addr: Option<net::SocketAddr>,
+    ) -> anyhow::Result<(web_transport::Session, String, NegotiatedTransport)> {
+        let (target, policy) = compatibility_target(url)?;
+        Ok(self
+            .connect_target(&target, policy, socket_addr)
+            .await?
+            .into_parts())
     }
 
     /// Default DNS resolution logic that filters results by address family.
@@ -672,5 +839,43 @@ impl Client {
     fn parse_socket_addr(host: &str, port: u16) -> Result<net::SocketAddr, net::AddrParseError> {
         let host = format!("{}:{}", host, port);
         host.parse::<net::SocketAddr>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substrate_policy_controls_offered_alpns() {
+        let h3 = web_transport_quinn::ALPN.as_bytes().to_vec();
+        let moqt = moq_transport::setup::ALPN.to_vec();
+
+        assert_eq!(alpn_protocols(SubstratePolicy::RawQuic), vec![moqt.clone()]);
+        assert_eq!(
+            alpn_protocols(SubstratePolicy::WebTransport),
+            vec![h3.clone()]
+        );
+        let auto = alpn_protocols(SubstratePolicy::Auto);
+        assert!(auto.contains(&h3));
+        assert!(auto.contains(&moqt));
+    }
+
+    #[test]
+    fn webtransport_protocol_must_be_explicit_and_supported() {
+        assert_eq!(
+            selected_webtransport_protocol(Some("moqt-19")).unwrap(),
+            "moqt-19"
+        );
+        assert!(selected_webtransport_protocol(None).is_err());
+        assert!(selected_webtransport_protocol(Some("moqt-16")).is_err());
+    }
+
+    #[test]
+    fn legacy_https_alias_derives_a_canonical_target() {
+        let url = Url::parse("https://Relay.Example/live?q=1").unwrap();
+        let (target, policy) = compatibility_target(&url).unwrap();
+        assert_eq!(target.to_string(), "moqt://relay.example/live?q=1");
+        assert_eq!(policy, SubstratePolicy::WebTransport);
     }
 }
