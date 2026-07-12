@@ -8,6 +8,7 @@ const ADMISSION: &str = include_str!("../src/admission.rs");
 #[test]
 fn complete_runtime_remains_the_default_and_is_required_by_the_binary() {
     assert!(MANIFEST.contains("default = [\"runtime\"]"));
+    assert!(MANIFEST.contains("runtime = [\n    \"relay-runtime\","));
     assert!(MANIFEST.contains("required-features = [\"runtime\"]"));
     assert!(MANIFEST
         .contains("metrics-prometheus = [\"runtime\", \"dep:metrics-exporter-prometheus\"]"));
@@ -44,12 +45,11 @@ fn runtime_dependencies_are_optional() {
 }
 
 #[test]
-fn admission_is_unconditional_and_relay_modules_are_runtime_gated() {
+fn admission_is_unconditional_and_relay_modules_use_the_narrowest_gate() {
     assert!(LIBRARY.contains("\nmod admission;\n"));
     assert!(LIBRARY.contains("\npub use admission::*;\n"));
 
     for declaration in [
-        "mod api;",
         "mod capacity;",
         "mod consumer;",
         "mod coordinator;",
@@ -60,11 +60,41 @@ fn admission_is_unconditional_and_relay_modules_are_runtime_gated() {
         "mod relay;",
         "mod remote;",
         "mod session;",
-        "mod web;",
     ] {
         assert!(
+            LIBRARY.contains(&format!(
+                "#[cfg(feature = \"relay-runtime\")]\n{declaration}"
+            )),
+            "relay core module is not feature-gated: {declaration}"
+        );
+    }
+
+    for declaration in ["mod api;", "mod web;"] {
+        assert!(
             LIBRARY.contains(&format!("#[cfg(feature = \"runtime\")]\n{declaration}")),
-            "runtime module is not feature-gated: {declaration}"
+            "process-facing module is not runtime-gated: {declaration}"
+        );
+    }
+}
+
+#[test]
+fn embedded_relay_feature_excludes_http_and_cli_dependencies() {
+    let relay_runtime = MANIFEST
+        .split("relay-runtime = [")
+        .nth(1)
+        .and_then(|tail| tail.split("\n]").next())
+        .expect("relay-runtime feature");
+    for dependency in [
+        "moq-api",
+        "axum",
+        "hyper-serve",
+        "tower-http",
+        "fs2",
+        "clap",
+    ] {
+        assert!(
+            !relay_runtime.contains(dependency),
+            "embedded relay feature contains process dependency: {dependency}"
         );
     }
 }

@@ -72,24 +72,27 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 [features]
 default = ["runtime"]
-runtime = [
-    "dep:moq-api",
+relay-runtime = [
     "dep:web-transport",
     "dep:url",
     "tokio/full",
     "tokio/test-util",
     "dep:tokio-util",
     "dep:futures",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tracing",
+    "dep:metrics",
+]
+runtime = [
+    "relay-runtime",
+    "dep:moq-api",
     "dep:axum",
     "dep:hyper-serve",
     "dep:tower-http",
-    "dep:serde",
-    "dep:serde_json",
     "dep:fs2",
     "dep:clap",
-    "dep:tracing",
     "dep:tracing-subscriber",
-    "dep:metrics",
 ]
 metrics-prometheus = ["runtime", "dep:metrics-exporter-prometheus"]
 

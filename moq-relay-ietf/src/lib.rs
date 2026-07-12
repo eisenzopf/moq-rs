@@ -10,9 +10,11 @@
 //! - Routing media between local and remote endpoints
 //! - Coordinating namespace/track registration across relay clusters
 //!
-//! The default `runtime` feature provides the complete relay and its binary.
-//! Disable default features to depend only on the admission contract, including
-//! [`SessionAdmission`], [`AdmissionLease`], and [`AdmissionSessionId`].
+//! The `relay-runtime` feature provides the embeddable relay without its HTTP
+//! status server or CLI dependencies. The default `runtime` feature adds those
+//! process-facing components and the binary. Disable default features to depend
+//! only on the admission contract, including [`SessionAdmission`],
+//! [`AdmissionLease`], and [`AdmissionSessionId`].
 //!
 //! # Example
 //!
@@ -38,25 +40,25 @@
 mod admission;
 #[cfg(feature = "runtime")]
 mod api;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod capacity;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod consumer;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod coordinator;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod diagnostics;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod local;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub mod metrics;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod producer;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod relay;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod remote;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 mod session;
 #[cfg(feature = "runtime")]
 mod web;
@@ -64,26 +66,26 @@ mod web;
 pub use admission::*;
 #[cfg(feature = "runtime")]
 pub use api::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use capacity::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use consumer::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use coordinator::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use diagnostics::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use local::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use producer::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use relay::*;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use remote::{
     RemoteCapacityError, RemoteCapacityResource, RemoteManager, RemoteManagerLimits,
     RemoteManagerLimitsError, RemoteManagerSnapshot,
 };
-#[cfg(feature = "runtime")]
+#[cfg(feature = "relay-runtime")]
 pub use session::*;
 #[cfg(feature = "runtime")]
 pub use web::*;
