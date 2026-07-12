@@ -537,8 +537,15 @@ impl Subscriber {
                 match response {
                     Ok(msg) => {
                         if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
+                            let terminal = matches!(pub_msg, message::Publisher::PublishDone(_));
                             if let Err(e) = subscriber_clone.recv_message(pub_msg) {
                                 tracing::warn!(error = %e, "error handling bidi response");
+                                break;
+                            }
+                            if terminal {
+                                subscriber_clone
+                                    .await_subscribe_done_cleanup(request_id)
+                                    .await;
                                 break;
                             }
                         }
@@ -1019,13 +1026,17 @@ impl Subscriber {
 
     /// Handle the reception of a PublishDone message from the publisher.
     fn recv_publish_done(&mut self, msg: &message::PublishDone) -> Result<(), SessionError> {
-        if let Some(subscribe) = self.remove_subscribe(msg.id) {
-            let result = if msg.status_code == message::PublishDoneCode::TrackEnded as u64 {
-                ServeError::Done
-            } else {
-                ServeError::Closed(msg.status_code)
-            };
-            subscribe.error(result)?;
+        let subscribe_complete = {
+            let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
+            match subscribes.get_mut(&msg.id) {
+                Some(subscribe) => Some(subscribe.recv_done(msg.status_code, msg.stream_count)?),
+                None => None,
+            }
+        };
+        if let Some(complete) = subscribe_complete {
+            if complete {
+                self.remove_subscribe(msg.id);
+            }
             return Ok(());
         }
 
@@ -1044,6 +1055,34 @@ impl Subscriber {
         }
 
         Ok(())
+    }
+
+    /// Keep the SUBSCRIBE response task alive until every subgroup stream
+    /// declared by PUBLISH_DONE has been received, with a hard upper bound.
+    async fn await_subscribe_done_cleanup(&mut self, request_id: u64) {
+        let deadline = tokio::time::sleep(PUBLISH_DONE_CLEANUP_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            let progress = self.subscribes.lock().ok().and_then(|subscribes| {
+                subscribes.get(&request_id).and_then(|subscribe| {
+                    subscribe.awaiting_streams().then(|| subscribe.progress())
+                })
+            });
+            let Some(progress) = progress else {
+                return;
+            };
+            tokio::select! {
+                _ = progress.notified() => {}
+                _ = &mut deadline => {
+                    if let Some(subscribe) = self.remove_subscribe(request_id) {
+                        let _ = subscribe.error(ServeError::internal_ctx(
+                            "timed out waiting for declared SUBSCRIBE streams",
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Keep the supervised request-stream task alive until every stream
@@ -1240,6 +1279,20 @@ impl Subscriber {
         Ok(())
     }
 
+    fn finish_subscribe_stream(&mut self, id: u64) -> Result<(), SessionError> {
+        let complete = {
+            let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
+            match subscribes.get_mut(&id) {
+                Some(subscribe) => subscribe.finish_stream()?,
+                None => false,
+            }
+        };
+        if complete {
+            self.remove_subscribe(id);
+        }
+        Ok(())
+    }
+
     fn begin_publish_stream(&mut self, id: u64) -> Result<(), SessionError> {
         self.publishes_received
             .lock()
@@ -1252,6 +1305,26 @@ impl Subscriber {
             })?
             .begin_stream(MAX_STREAMS_PER_PUBLICATION)?;
         Ok(())
+    }
+
+    fn begin_subscribe_stream(&mut self, id: u64) -> Result<(), SessionError> {
+        self.subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&id)
+            .ok_or_else(|| {
+                SessionError::Serve(ServeError::not_found_ctx(format!(
+                    "subscribe_id={id} not found"
+                )))
+            })?
+            .begin_stream(MAX_STREAMS_PER_PUBLICATION)?;
+        Ok(())
+    }
+
+    fn fail_subscribe_stream(&mut self, id: u64, error: ServeError) {
+        if let Some(mut subscribe) = self.remove_subscribe(id) {
+            subscribe.recv_stream_error(error);
+        }
     }
 
     fn register_alias(
@@ -1603,17 +1676,27 @@ impl Subscriber {
 
         tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
         let mut active_bindings = Vec::with_capacity(bindings.len());
+        let mut subscribe_ids = Vec::new();
         let mut publish_ids = Vec::new();
         for binding in bindings {
-            if let AliasBinding::Publish(id) = binding {
-                if self.begin_publish_stream(id).is_err() {
-                    self.cancel_publish_received(
-                        id,
-                        message::RequestErrorCode::ExcessiveLoad as u32,
-                    );
-                    continue;
+            match binding {
+                AliasBinding::Subscribe(id) => {
+                    if let Err(error) = self.begin_subscribe_stream(id) {
+                        self.fail_subscribe_stream(id, ServeError::internal_ctx(error.to_string()));
+                        continue;
+                    }
+                    subscribe_ids.push(id);
                 }
-                publish_ids.push(id);
+                AliasBinding::Publish(id) => {
+                    if self.begin_publish_stream(id).is_err() {
+                        self.cancel_publish_received(
+                            id,
+                            message::RequestErrorCode::ExcessiveLoad as u32,
+                        );
+                        continue;
+                    }
+                    publish_ids.push(id);
+                }
             }
             active_bindings.push(binding);
         }
@@ -1634,11 +1717,17 @@ impl Subscriber {
 
         match result {
             Ok(()) => {
+                for id in subscribe_ids {
+                    self.finish_subscribe_stream(id)?;
+                }
                 for id in publish_ids {
                     self.finish_publish_stream(id)?;
                 }
             }
             Err(error) => {
+                for id in subscribe_ids {
+                    self.fail_subscribe_stream(id, ServeError::internal_ctx(error.to_string()));
+                }
                 for id in publish_ids {
                     self.fail_publish_received(id, ServeError::internal_ctx(error.to_string()));
                 }

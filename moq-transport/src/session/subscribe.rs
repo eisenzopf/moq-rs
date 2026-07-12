@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::BytesMut;
+use tokio::sync::Notify;
 
 use crate::{
     coding::{Encode, KeyValuePairs, Location, TrackName, TrackNamespace},
@@ -505,6 +506,10 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
+            processed_streams: 0,
+            active_streams: 0,
+            terminal: None,
+            progress: Arc::new(Notify::new()),
             info: send.info.clone(),
             delivery_filter: None,
             joining_location: None,
@@ -582,6 +587,10 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
+    processed_streams: u64,
+    active_streams: u64,
+    terminal: Option<(u64, u64)>,
+    progress: Arc<Notify>,
     info: SubscribeInfo,
     delivery_filter: Option<DeliveryFilter>,
     joining_location: Option<Location>,
@@ -624,6 +633,94 @@ impl SubscribeRecv {
             namespace: self.info.track_namespace.clone(),
             name: self.info.track_name.clone(),
         }
+    }
+
+    pub(super) fn awaiting_streams(&self) -> bool {
+        self.terminal
+            .is_some_and(|(_, expected)| self.processed_streams < expected)
+    }
+
+    pub(super) fn progress(&self) -> Arc<Notify> {
+        self.progress.clone()
+    }
+
+    /// Record PUBLISH_DONE without dropping the track writer until every
+    /// declared subgroup stream has been received. The request stream can
+    /// outrun independently scheduled data streams.
+    pub(super) fn recv_done(
+        &mut self,
+        status_code: u64,
+        stream_count: u64,
+    ) -> Result<bool, SessionError> {
+        if self.processed_streams.saturating_add(self.active_streams) > stream_count {
+            return Err(SessionError::ProtocolViolation(format!(
+                "PUBLISH_DONE declared {} streams after {} SUBSCRIBE streams were received",
+                stream_count,
+                self.processed_streams.saturating_add(self.active_streams)
+            )));
+        }
+        self.terminal = Some((status_code, stream_count));
+        self.progress.notify_one();
+        Ok(self.maybe_finish())
+    }
+
+    pub(super) fn begin_stream(&mut self, limit: u64) -> Result<(), ServeError> {
+        if self.active_streams >= limit {
+            return Err(ServeError::Closed(
+                message::RequestErrorCode::ExcessiveLoad as u64,
+            ));
+        }
+        if let Some((_, expected)) = self.terminal {
+            if self.processed_streams.saturating_add(self.active_streams) >= expected {
+                return Err(ServeError::Size);
+            }
+        }
+        self.active_streams = self.active_streams.saturating_add(1);
+        Ok(())
+    }
+
+    pub(super) fn finish_stream(&mut self) -> Result<bool, SessionError> {
+        self.active_streams = self.active_streams.saturating_sub(1);
+        self.processed_streams = self.processed_streams.saturating_add(1);
+        self.progress.notify_one();
+        if let Some((_, expected)) = self.terminal {
+            if self.processed_streams > expected {
+                return Err(SessionError::ProtocolViolation(format!(
+                    "received more SUBSCRIBE streams than declared: {} > {}",
+                    self.processed_streams, expected
+                )));
+            }
+        }
+        Ok(self.maybe_finish())
+    }
+
+    fn maybe_finish(&mut self) -> bool {
+        let Some((status_code, stream_count)) = self.terminal else {
+            return false;
+        };
+        if self.processed_streams < stream_count {
+            return false;
+        }
+        if let Some(mut state) = self.state.lock_mut() {
+            state.closed = if status_code == message::PublishDoneCode::TrackEnded as u64 {
+                Err(ServeError::Done)
+            } else {
+                Err(ServeError::Closed(status_code))
+            };
+        }
+        self.joining_writers.clear();
+        self.writer = None;
+        true
+    }
+
+    pub(super) fn recv_stream_error(&mut self, err: ServeError) {
+        self.active_streams = self.active_streams.saturating_sub(1);
+        self.progress.notify_one();
+        if let Some(mut state) = self.state.lock_mut() {
+            state.closed = Err(err);
+        }
+        self.joining_writers.clear();
+        self.writer = None;
     }
 
     pub fn allows(&self, group_id: u64, object_id: u64) -> bool {
@@ -912,6 +1009,10 @@ mod tests {
             SubscribeRecv {
                 state,
                 writer: Some(writer.into()),
+                processed_streams: 0,
+                active_streams: 0,
+                terminal: None,
+                progress: Arc::new(Notify::new()),
                 info: subscribe_info_with(KeyValuePairs::default()),
                 delivery_filter: None,
                 joining_location: None,
@@ -925,6 +1026,61 @@ mod tests {
             },
             reader,
         )
+    }
+
+    fn terminal_recv() -> (State<SubscribeState>, SubscribeRecv, serve::TrackReader) {
+        let (writer, reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/session"), "audio").produce();
+        let (app_state, transport_state) = State::default().split();
+        (
+            app_state,
+            SubscribeRecv {
+                state: transport_state,
+                writer: Some(writer.into()),
+                processed_streams: 0,
+                active_streams: 0,
+                terminal: None,
+                progress: Arc::new(Notify::new()),
+                info: subscribe_info_with(KeyValuePairs::default()),
+                delivery_filter: None,
+                joining_location: None,
+                join_barrier: None,
+                joining_writers: HashMap::new(),
+                seen_objects: HashSet::new(),
+                _request_lease: crate::session::test_request_lease(
+                    crate::session::RequestDirection::Outbound,
+                    crate::session::RequestClass::Subscribe,
+                ),
+            },
+            reader,
+        )
+    }
+
+    #[test]
+    fn publish_done_retains_subscribe_until_every_declared_stream_finishes() {
+        let (app_state, mut recv, reader) = terminal_recv();
+
+        assert!(!recv
+            .recv_done(message::PublishDoneCode::TrackEnded as u64, 1)
+            .unwrap());
+        assert!(app_state.lock().closed.is_ok());
+        assert!(!reader.is_closed());
+
+        recv.begin_stream(4).unwrap();
+        assert!(recv.finish_stream().unwrap());
+        assert!(matches!(app_state.lock().closed, Err(ServeError::Done)));
+        assert!(reader.is_closed());
+    }
+
+    #[test]
+    fn publish_done_rejects_a_stream_count_smaller_than_observed() {
+        let (_app_state, mut recv, _reader) = terminal_recv();
+        recv.begin_stream(4).unwrap();
+        assert!(!recv.finish_stream().unwrap());
+        assert!(matches!(
+            recv.recv_done(message::PublishDoneCode::TrackEnded as u64, 0),
+            Err(SessionError::ProtocolViolation(_))
+        ));
     }
 
     fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
@@ -1162,6 +1318,10 @@ mod tests {
         let mut recv = SubscribeRecv {
             state,
             writer: Some(writer.into()),
+            processed_streams: 0,
+            active_streams: 0,
+            terminal: None,
+            progress: Arc::new(Notify::new()),
             info: subscribe_info_with(KeyValuePairs::default()),
             delivery_filter: None,
             joining_location: None,
