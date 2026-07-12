@@ -23,8 +23,8 @@ use crate::watch::Queue;
 
 use super::{
     BidiCommand, BidiResponseMap, PublishReceived, PublishReceivedRecv, PublishedNamespace,
-    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe, SubscribeRecv,
-    Writer,
+    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe, SubscribeOptions,
+    SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -377,10 +377,21 @@ impl Subscriber {
         &mut self,
         track: serve::TrackWriter,
     ) -> Result<Subscribe, ServeError> {
+        self.subscribe_open_with(track, SubscribeOptions::default())
+            .await
+    }
+
+    /// Subscribe with explicit draft-19 request parameters and wait for the
+    /// publisher to acknowledge the request.
+    pub async fn subscribe_open_with(
+        &mut self,
+        track: serve::TrackWriter,
+        options: SubscribeOptions,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
-        let (send, recv) = Subscribe::new(self.clone(), request_id, track);
+        let (send, recv) = Subscribe::new_with_options(self.clone(), request_id, track, options)?;
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if

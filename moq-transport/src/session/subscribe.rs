@@ -4,8 +4,10 @@
 
 use std::{collections::HashSet, ops};
 
+use bytes::BytesMut;
+
 use crate::{
-    coding::{KeyValuePairs, Location, TrackName, TrackNamespace},
+    coding::{Encode, KeyValuePairs, Location, TrackName, TrackNamespace},
     data,
     message::{self, FilterType, GroupOrder, SubscriptionFilter},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
@@ -44,6 +46,172 @@ impl DeliveryFilter {
 
         true
     }
+}
+
+/// Transport-owned configuration for an outbound SUBSCRIBE request.
+///
+/// `None` leaves a typed parameter off the wire and therefore uses its MOQT
+/// default. This keeps [`Subscriber::subscribe_open`] wire-compatible while
+/// allowing callers to explicitly send values such as `Forward=1`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SubscribeOptions {
+    pub forward: Option<bool>,
+    pub filter: Option<SubscriptionFilter>,
+    pub group_order: Option<GroupOrder>,
+    pub subscriber_priority: Option<u8>,
+    /// Additional request parameters, such as authorization or delivery
+    /// policy. Typed fields above may not also appear here.
+    pub request_parameters: KeyValuePairs,
+}
+
+impl SubscribeOptions {
+    pub fn with_forward(mut self, forward: bool) -> Self {
+        self.forward = Some(forward);
+        self
+    }
+
+    pub fn with_filter(mut self, filter: SubscriptionFilter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    pub fn with_group_order(mut self, group_order: GroupOrder) -> Self {
+        self.group_order = Some(group_order);
+        self
+    }
+
+    pub fn with_subscriber_priority(mut self, subscriber_priority: u8) -> Self {
+        self.subscriber_priority = Some(subscriber_priority);
+        self
+    }
+
+    pub fn with_request_parameters(mut self, request_parameters: KeyValuePairs) -> Self {
+        self.request_parameters = request_parameters;
+        self
+    }
+
+    /// Validate and merge typed and additional parameters without dropping or
+    /// overwriting either source.
+    pub fn to_request_parameters(&self) -> Result<KeyValuePairs, SubscribeOptionsError> {
+        if let Some(filter) = &self.filter {
+            validate_subscription_filter(filter)?;
+        }
+        if self.group_order == Some(GroupOrder::Publisher) {
+            return Err(SubscribeOptionsError::InvalidGroupOrder);
+        }
+
+        for forbidden in [
+            message::parameter_type::EXPIRES,
+            message::parameter_type::LARGEST_OBJECT,
+        ] {
+            if self.request_parameters.has(forbidden) {
+                return Err(SubscribeOptionsError::ParameterNotAllowed(forbidden));
+            }
+        }
+
+        for (present, parameter) in [
+            (self.forward.is_some(), message::parameter_type::FORWARD),
+            (
+                self.filter.is_some(),
+                message::parameter_type::SUBSCRIPTION_FILTER,
+            ),
+            (
+                self.group_order.is_some(),
+                message::parameter_type::GROUP_ORDER,
+            ),
+            (
+                self.subscriber_priority.is_some(),
+                message::parameter_type::SUBSCRIBER_PRIORITY,
+            ),
+        ] {
+            if present && self.request_parameters.has(parameter) {
+                return Err(SubscribeOptionsError::ConflictingParameter(parameter));
+            }
+        }
+
+        let mut parameters = self.request_parameters.clone();
+        if let Some(forward) = self.forward {
+            parameters.set_forward(forward);
+        }
+        if let Some(filter) = &self.filter {
+            parameters
+                .set_subscription_filter(filter)
+                .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)?;
+        }
+        if let Some(group_order) = self.group_order {
+            parameters.set_group_order(group_order);
+        }
+        if let Some(priority) = self.subscriber_priority {
+            parameters.set_subscriber_priority(priority);
+        }
+
+        validate_request_parameters(&parameters)?;
+        Ok(parameters)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SubscribeOptionsError {
+    #[error("Publisher group order is an omission sentinel and cannot be sent")]
+    InvalidGroupOrder,
+    #[error("invalid fields for subscription filter {0:?}")]
+    InvalidFilter(FilterType),
+    #[error("typed option conflicts with request parameter 0x{0:x}")]
+    ConflictingParameter(u64),
+    #[error("request parameter 0x{0:x} is not allowed on SUBSCRIBE")]
+    ParameterNotAllowed(u64),
+    #[error("request parameters are not valid MOQT parameters")]
+    InvalidRequestParameters,
+}
+
+impl From<SubscribeOptionsError> for ServeError {
+    fn from(error: SubscribeOptionsError) -> Self {
+        ServeError::Internal(error.to_string())
+    }
+}
+
+fn validate_subscription_filter(filter: &SubscriptionFilter) -> Result<(), SubscribeOptionsError> {
+    let valid = match filter.filter_type {
+        FilterType::NextGroupStart | FilterType::LargestObject => {
+            filter.start_location.is_none() && filter.end_group_id.is_none()
+        }
+        FilterType::AbsoluteStart => {
+            filter.start_location.is_some() && filter.end_group_id.is_none()
+        }
+        FilterType::AbsoluteRange => {
+            filter.start_location.is_some() && filter.end_group_id.is_some()
+        }
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(SubscribeOptionsError::InvalidFilter(filter.filter_type))
+    }
+}
+
+fn validate_request_parameters(parameters: &KeyValuePairs) -> Result<(), SubscribeOptionsError> {
+    let mut encoded = BytesMut::new();
+    parameters
+        .encode(&mut encoded)
+        .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)?;
+    parameters
+        .forward()
+        .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)?;
+    parameters
+        .subscriber_priority()
+        .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)?;
+    parameters
+        .group_order()
+        .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)?;
+    if let Some(filter) = parameters
+        .subscription_filter()
+        .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)?
+    {
+        validate_subscription_filter(&filter)?;
+    }
+
+    Ok(())
 }
 
 // TODO rename to SubscriptionInfo when used for Publishes as well?
@@ -174,42 +342,31 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    fn build_info(request_id: u64, track: &TrackWriter) -> (message::Subscribe, SubscribeInfo) {
+    fn build_info(
+        request_id: u64,
+        track: &TrackWriter,
+        options: &SubscribeOptions,
+    ) -> Result<SubscribeInfo, SubscribeOptionsError> {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            params: KeyValuePairs::default(),
+            params: options.to_request_parameters()?,
         };
-        let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "failed to decode outbound subscribe parameters");
-            SubscribeInfo {
-                id: request_id,
-                track_namespace: track.namespace.clone(),
-                track_name: track.name.clone(),
-                subscriber_priority: 128,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::AbsoluteStart,
-                start_location: None,
-                end_group_id: None,
-                filter: None,
-                params: Default::default(),
-                track_status: false,
-            }
-        });
-        (subscribe_message, info)
+        SubscribeInfo::new_from_subscribe(&subscribe_message)
+            .map_err(|_| SubscribeOptionsError::InvalidRequestParameters)
     }
 
-    /// Create a Subscribe without sending on the control stream.
-    /// The caller sends via a bidi request stream (draft-19).
-    pub(super) fn new(
+    /// Create a configured Subscribe without sending on the control stream.
+    /// The caller sends it via a bidirectional request stream.
+    pub(super) fn new_with_options(
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv) {
-        let (_msg, info) = Self::build_info(request_id, &track);
-        Self::from_parts(subscriber, info, track)
+        options: SubscribeOptions,
+    ) -> Result<(Subscribe, SubscribeRecv), SubscribeOptionsError> {
+        let info = Self::build_info(request_id, &track, &options)?;
+        Ok(Self::from_parts(subscriber, info, track))
     }
 
     /// Return the wire message to send on the request stream.
@@ -437,6 +594,12 @@ impl SubscribeRecv {
 mod tests {
     use super::*;
 
+    fn track_writer() -> TrackWriter {
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/session"), "audio").produce();
+        writer
+    }
+
     fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
         SubscribeInfo::new_from_subscribe(&message::Subscribe {
             id: 0,
@@ -500,5 +663,167 @@ mod tests {
 
         assert!(!filter.allows(0, 0));
         assert!(!filter.allows(100, 100));
+    }
+
+    #[test]
+    fn explicit_forward_one_and_largest_object_have_stable_wire_and_model() {
+        let options = SubscribeOptions::default()
+            .with_forward(true)
+            .with_filter(SubscriptionFilter::largest_object());
+        let parameters = options.to_request_parameters().unwrap();
+        let mut wire = BytesMut::new();
+        parameters.encode(&mut wire).unwrap();
+
+        // count=2, FORWARD(type=0x10,value=1), then LOCATION_FILTER
+        // (delta=0x11,length=1,LargestObject=0x2).
+        assert_eq!(wire.as_ref(), &[0x02, 0x10, 0x01, 0x11, 0x01, 0x02]);
+        let info = Subscribe::build_info(8, &track_writer(), &options).unwrap();
+        assert_eq!(info.id, 8);
+        assert!(info.forward);
+        assert_eq!(info.filter, Some(SubscriptionFilter::largest_object()));
+        assert_eq!(info.params, parameters);
+    }
+
+    #[test]
+    fn default_options_preserve_legacy_empty_parameters_and_semantics() {
+        let options = SubscribeOptions::default();
+        assert!(options.to_request_parameters().unwrap().0.is_empty());
+
+        let info = Subscribe::build_info(10, &track_writer(), &options).unwrap();
+        assert!(info.params.0.is_empty());
+        assert!(info.forward);
+        assert_eq!(info.subscriber_priority, 128);
+        assert_eq!(info.group_order, GroupOrder::Publisher);
+        assert_eq!(info.filter, None);
+    }
+
+    #[test]
+    fn explicit_priority_and_group_order_round_trip_into_model() {
+        let options = SubscribeOptions::default()
+            .with_subscriber_priority(7)
+            .with_group_order(GroupOrder::Descending);
+        let parameters = options.to_request_parameters().unwrap();
+        assert_eq!(parameters.subscriber_priority().unwrap(), Some(7));
+        assert_eq!(
+            parameters.group_order().unwrap(),
+            Some(GroupOrder::Descending)
+        );
+
+        let info = Subscribe::build_info(12, &track_writer(), &options).unwrap();
+        assert_eq!(info.subscriber_priority, 7);
+        assert_eq!(info.group_order, GroupOrder::Descending);
+    }
+
+    #[test]
+    fn invalid_option_combinations_are_rejected_before_wire_encoding() {
+        assert_eq!(
+            SubscribeOptions::default()
+                .with_group_order(GroupOrder::Publisher)
+                .to_request_parameters(),
+            Err(SubscribeOptionsError::InvalidGroupOrder)
+        );
+
+        for filter in [
+            SubscriptionFilter {
+                filter_type: FilterType::LargestObject,
+                start_location: Some(Location::new(1, 0)),
+                end_group_id: None,
+            },
+            SubscriptionFilter {
+                filter_type: FilterType::AbsoluteStart,
+                start_location: None,
+                end_group_id: None,
+            },
+            SubscriptionFilter {
+                filter_type: FilterType::AbsoluteRange,
+                start_location: Some(Location::new(1, 0)),
+                end_group_id: None,
+            },
+        ] {
+            let filter_type = filter.filter_type;
+            assert_eq!(
+                SubscribeOptions::default()
+                    .with_filter(filter)
+                    .to_request_parameters(),
+                Err(SubscribeOptionsError::InvalidFilter(filter_type))
+            );
+        }
+
+        let mut collision = KeyValuePairs::default();
+        collision.set_forward(false);
+        assert_eq!(
+            SubscribeOptions::default()
+                .with_forward(true)
+                .with_request_parameters(collision)
+                .to_request_parameters(),
+            Err(SubscribeOptionsError::ConflictingParameter(
+                message::parameter_type::FORWARD
+            ))
+        );
+
+        let mut response_only = KeyValuePairs::default();
+        response_only.set_intvalue(message::parameter_type::EXPIRES, 1);
+        assert_eq!(
+            SubscribeOptions::default()
+                .with_request_parameters(response_only)
+                .to_request_parameters(),
+            Err(SubscribeOptionsError::ParameterNotAllowed(
+                message::parameter_type::EXPIRES
+            ))
+        );
+
+        let invalid_wire = KeyValuePairs(vec![crate::coding::KeyValuePair::new_bytes(
+            message::parameter_type::DELIVERY_TIMEOUT,
+            vec![1],
+        )]);
+        assert_eq!(
+            SubscribeOptions::default()
+                .with_request_parameters(invalid_wire)
+                .to_request_parameters(),
+            Err(SubscribeOptionsError::InvalidRequestParameters)
+        );
+    }
+
+    #[test]
+    fn additional_request_parameters_are_preserved_without_silent_overwrite() {
+        let mut request_parameters = KeyValuePairs::default();
+        request_parameters.set_intvalue(message::parameter_type::DELIVERY_TIMEOUT, 250);
+        request_parameters.set_bytesvalue(0x41, vec![1, 2, 3]);
+        let original = request_parameters.clone();
+
+        let merged = SubscribeOptions::default()
+            .with_forward(true)
+            .with_subscriber_priority(9)
+            .with_request_parameters(request_parameters)
+            .to_request_parameters()
+            .unwrap();
+
+        assert_eq!(
+            merged.get(message::parameter_type::DELIVERY_TIMEOUT),
+            original.get(message::parameter_type::DELIVERY_TIMEOUT)
+        );
+        assert_eq!(merged.get(0x41), original.get(0x41));
+        assert_eq!(merged.forward().unwrap(), Some(true));
+        assert_eq!(merged.subscriber_priority().unwrap(), Some(9));
+        assert_eq!(merged.0.len(), original.0.len() + 2);
+    }
+
+    #[test]
+    fn valid_typed_request_parameter_is_preserved_when_option_is_omitted() {
+        let mut request_parameters = KeyValuePairs::default();
+        request_parameters.set_forward(false);
+        let parameters = SubscribeOptions::default()
+            .with_request_parameters(request_parameters)
+            .to_request_parameters()
+            .unwrap();
+        assert_eq!(parameters.forward().unwrap(), Some(false));
+
+        let info = Subscribe::build_info(
+            14,
+            &track_writer(),
+            &SubscribeOptions::default().with_request_parameters(parameters),
+        )
+        .unwrap();
+        assert!(!info.forward);
     }
 }
