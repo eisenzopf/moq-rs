@@ -133,13 +133,27 @@ impl Drop for PublishedNamespace {
                 "publish_namespace",
                 message::RequestError {
                     id: self.info.request_id,
-                    error_code: RequestErrorCode::Uninterested as u64,
-                    retry_interval: 0,
+                    error_code: request_error_code(&err),
+                    retry_interval: retry_interval(&err),
                     reason: ReasonPhrase(err.to_string()),
                     redirect: None,
                 },
             );
         }
+    }
+}
+
+fn request_error_code(err: &ServeError) -> u64 {
+    match err {
+        ServeError::Closed(code) => *code,
+        _ => RequestErrorCode::Uninterested as u64,
+    }
+}
+
+fn retry_interval(err: &ServeError) -> u64 {
+    match err {
+        ServeError::Closed(code) if *code == RequestErrorCode::ExcessiveLoad as u64 => 1_001,
+        _ => 0,
     }
 }
 
@@ -185,5 +199,16 @@ mod tests {
 
         assert!(send_state.lock().done);
         assert!(send_state.lock().modified().is_none());
+    }
+
+    #[test]
+    fn excessive_load_rejection_is_retryable() {
+        let error = ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
+        assert_eq!(
+            request_error_code(&error),
+            RequestErrorCode::ExcessiveLoad as u64
+        );
+        assert_eq!(retry_interval(&error), 1_001);
+        assert_eq!(retry_interval(&ServeError::Cancel), 0);
     }
 }

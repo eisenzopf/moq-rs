@@ -6,11 +6,15 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::serve::{
+    RetentionBudget, RetentionBudgetLimits, RetentionBudgetPool, RetentionBudgetPoolStats,
+    RetentionBudgetStats, RetentionLimits,
+};
+
 /// A logical MoQT request family with independently reservable capacity.
 ///
-/// `Fetch` is reserved here even though FETCH lifecycle support is not yet
-/// implemented. Reserving its class now prevents a future FETCH flood from
-/// consuming capacity intended for established request families.
+/// Each class is independently bounded so one request family cannot consume
+/// capacity reserved for another.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RequestClass {
     PublishNamespace,
@@ -64,28 +68,38 @@ impl RequestLimitSet {
     }
 
     fn validate(self, scope: &'static str) -> Result<(), RequestCapacityError> {
-        if self.total == 0 {
-            return Err(RequestCapacityError::ZeroLimit {
-                scope,
-                field: "total",
-            });
-        }
+        validate_semaphore_limit(scope, "total", self.total)?;
         for class in RequestClass::ALL {
-            if self.class(class) == 0 {
-                return Err(RequestCapacityError::ZeroLimit {
-                    scope,
-                    field: match class {
-                        RequestClass::PublishNamespace => "publish_namespace",
-                        RequestClass::Subscribe => "subscribe",
-                        RequestClass::Publish => "publish",
-                        RequestClass::TrackStatus => "track_status",
-                        RequestClass::Fetch => "fetch",
-                    },
-                });
-            }
+            let field = match class {
+                RequestClass::PublishNamespace => "publish_namespace",
+                RequestClass::Subscribe => "subscribe",
+                RequestClass::Publish => "publish",
+                RequestClass::TrackStatus => "track_status",
+                RequestClass::Fetch => "fetch",
+            };
+            validate_semaphore_limit(scope, field, self.class(class))?;
         }
         Ok(())
     }
+}
+
+fn validate_semaphore_limit(
+    scope: &'static str,
+    field: &'static str,
+    value: usize,
+) -> Result<(), RequestCapacityError> {
+    if value == 0 {
+        return Err(RequestCapacityError::ZeroLimit { scope, field });
+    }
+    if value > Semaphore::MAX_PERMITS {
+        return Err(RequestCapacityError::LimitTooLarge {
+            scope,
+            field,
+            value,
+            maximum: Semaphore::MAX_PERMITS,
+        });
+    }
+    Ok(())
 }
 
 /// Logical request and outbound queue limits owned by the transport.
@@ -99,6 +113,8 @@ pub struct RequestLimits {
     pub max_outbound_messages: usize,
     pub max_response_commands: usize,
     pub max_reverse_updates: usize,
+    pub retention: RetentionBudgetLimits,
+    pub retention_track: RetentionLimits,
 }
 
 impl RequestLimits {
@@ -120,6 +136,15 @@ impl RequestLimits {
                 });
             }
         }
+        RetentionBudgetPool::new(self.retention).map_err(|_| {
+            RequestCapacityError::InvalidRetentionLimits {
+                session_bytes: self.retention.max_session_bytes,
+                process_bytes: self.retention.max_process_bytes,
+            }
+        })?;
+        self.retention_track
+            .validate()
+            .map_err(|_| RequestCapacityError::InvalidRetentionTrackLimits)?;
         Ok(())
     }
 }
@@ -151,6 +176,8 @@ impl Default for RequestLimits {
             max_outbound_messages: 512,
             max_response_commands: 32,
             max_reverse_updates: 64,
+            retention: RetentionBudgetLimits::default(),
+            retention_track: RetentionLimits::default(),
         }
     }
 }
@@ -162,12 +189,26 @@ pub enum RequestCapacityError {
         scope: &'static str,
         field: &'static str,
     },
+    #[error("request capacity limit {scope}.{field}={value} exceeds semaphore maximum {maximum}")]
+    LimitTooLarge {
+        scope: &'static str,
+        field: &'static str,
+        value: usize,
+        maximum: usize,
+    },
     #[error("{scope:?} {direction:?} {class:?} request capacity exhausted")]
     Exhausted {
         scope: RequestCapacityScope,
         direction: RequestDirection,
         class: RequestClass,
     },
+    #[error("retention byte limits are invalid: session={session_bytes}, process={process_bytes}")]
+    InvalidRetentionLimits {
+        session_bytes: usize,
+        process_bytes: usize,
+    },
+    #[error("per-track retention limits are invalid")]
+    InvalidRetentionTrackLimits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +292,7 @@ impl CapacityPools {
 #[derive(Clone, Debug)]
 pub struct RequestCapacity {
     process: Arc<CapacityPools>,
+    retention: RetentionBudgetPool,
     limits: Arc<RequestLimits>,
 }
 
@@ -262,6 +304,12 @@ impl RequestCapacity {
                 limits.process_inbound,
                 limits.process_outbound,
             )),
+            retention: RetentionBudgetPool::new(limits.retention).map_err(|_| {
+                RequestCapacityError::InvalidRetentionLimits {
+                    session_bytes: limits.retention.max_session_bytes,
+                    process_bytes: limits.retention.max_process_bytes,
+                }
+            })?,
             limits: Arc::new(limits),
         })
     }
@@ -273,12 +321,18 @@ impl RequestCapacity {
                 self.limits.session_outbound,
             )),
             process: self.process.clone(),
+            retention: self.retention.session(),
             limits: self.limits.clone(),
         }
     }
 
     pub fn limits(&self) -> &RequestLimits {
         &self.limits
+    }
+
+    /// Return the process-wide retained-byte gauge for diagnostics and metrics.
+    pub fn retention_stats(&self) -> RetentionBudgetPoolStats {
+        self.retention.stats()
     }
 }
 
@@ -293,6 +347,7 @@ impl Default for RequestCapacity {
 pub struct SessionRequestCapacity {
     session: Arc<CapacityPools>,
     process: Arc<CapacityPools>,
+    retention: RetentionBudget,
     limits: Arc<RequestLimits>,
 }
 
@@ -361,6 +416,19 @@ impl SessionRequestCapacity {
 
     pub fn limits(&self) -> &RequestLimits {
         &self.limits
+    }
+
+    pub fn retention_budget(&self) -> RetentionBudget {
+        self.retention.clone()
+    }
+
+    pub fn retention_track_limits(&self) -> RetentionLimits {
+        self.limits.retention_track
+    }
+
+    /// Return session and process retained-byte gauges for diagnostics.
+    pub fn retention_stats(&self) -> RetentionBudgetStats {
+        self.retention.stats()
     }
 }
 
@@ -448,6 +516,8 @@ mod tests {
             max_outbound_messages: 2,
             max_response_commands: 2,
             max_reverse_updates: 2,
+            retention: RetentionBudgetLimits::default(),
+            retention_track: RetentionLimits::default(),
         }
     }
 
@@ -462,6 +532,67 @@ mod tests {
                 field: "fetch"
             })
         ));
+    }
+
+    #[test]
+    fn rejects_every_request_limit_above_tokios_semaphore_maximum() {
+        for field in [
+            "total",
+            "publish_namespace",
+            "subscribe",
+            "publish",
+            "track_status",
+            "fetch",
+        ] {
+            let mut configured = limits(1, 1, 1);
+            let limits = &mut configured.session_inbound;
+            match field {
+                "total" => limits.total = Semaphore::MAX_PERMITS + 1,
+                "publish_namespace" => limits.publish_namespace = Semaphore::MAX_PERMITS + 1,
+                "subscribe" => limits.subscribe = Semaphore::MAX_PERMITS + 1,
+                "publish" => limits.publish = Semaphore::MAX_PERMITS + 1,
+                "track_status" => limits.track_status = Semaphore::MAX_PERMITS + 1,
+                "fetch" => limits.fetch = Semaphore::MAX_PERMITS + 1,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                RequestCapacity::new(configured),
+                Err(RequestCapacityError::LimitTooLarge {
+                    scope: "session_inbound",
+                    field: rejected,
+                    value,
+                    maximum,
+                }) if rejected == field
+                    && value == Semaphore::MAX_PERMITS + 1
+                    && maximum == Semaphore::MAX_PERMITS
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_and_threads_retention_limits_into_each_session() {
+        let mut invalid = limits(1, 1, 1);
+        invalid.retention.max_session_bytes = 0;
+        assert!(matches!(
+            RequestCapacity::new(invalid),
+            Err(RequestCapacityError::InvalidRetentionLimits { .. })
+        ));
+
+        let mut configured = limits(1, 2, 2);
+        configured.retention = RetentionBudgetLimits {
+            max_session_bytes: 64,
+            max_process_bytes: 128,
+        };
+        configured.retention_track.max_object_bytes = 32;
+        let capacity = RequestCapacity::new(configured).unwrap();
+        let session = capacity.session();
+        assert_eq!(capacity.retention_stats().process_bytes, 0);
+        assert_eq!(capacity.retention_stats().max_process_bytes, 128);
+        assert_eq!(session.retention_budget().limits().max_session_bytes, 64);
+        assert_eq!(session.retention_budget().limits().max_process_bytes, 128);
+        assert_eq!(session.retention_track_limits().max_object_bytes, 32);
+        assert_eq!(session.retention_stats().session_bytes, 0);
+        assert_eq!(session.retention_stats().process_bytes, 0);
     }
 
     #[test]

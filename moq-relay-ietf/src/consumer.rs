@@ -7,14 +7,14 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     message::RequestErrorCode,
-    serve::{self, Tracks},
+    serve::{self, Tracks, TracksLimits},
     session::{PublishReceived, PublishedNamespace, SessionError, Subscriber},
 };
-use tokio::sync::Semaphore;
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
-
-const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
+use crate::{
+    metrics::GaugeGuard, Coordinator, Locals, Producer, RelayCapacity, RelayCapacityLease,
+    RelayIdentity, RelayResource,
+};
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -26,11 +26,15 @@ pub struct Consumer {
     /// The resolved scope identity for this session, if any.
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to coordinator register/lookup calls to isolate namespaces.
-    scope: Option<String>,
-    publish_track_permits: Arc<Semaphore>,
+    identity: RelayIdentity,
+    capacity: RelayCapacity,
+    tracks_limits: TracksLimits,
 }
 
 impl Consumer {
+    /// Compatibility constructor with an isolated operator capacity pool.
+    /// Production embedders should use [`Self::new_admitted`] and share one
+    /// [`RelayCapacity`] across every producer and consumer.
     pub fn new(
         subscriber: Subscriber,
         locals: Locals,
@@ -38,14 +42,41 @@ impl Consumer {
         forward: Option<Producer>,
         scope: Option<String>,
     ) -> Self {
+        let identity = RelayIdentity::operator(scope);
+        Self::new_admitted(
+            subscriber,
+            locals,
+            coordinator,
+            forward,
+            identity,
+            RelayCapacity::default(),
+            TracksLimits::default(),
+        )
+    }
+
+    /// Construct a consumer with authenticated identity and process-shared capacity.
+    pub fn new_admitted(
+        subscriber: Subscriber,
+        locals: Locals,
+        coordinator: Arc<dyn Coordinator>,
+        forward: Option<Producer>,
+        identity: RelayIdentity,
+        capacity: RelayCapacity,
+        tracks_limits: TracksLimits,
+    ) -> Self {
         Self {
             subscriber,
             locals,
             coordinator,
             forward,
-            scope,
-            publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
+            identity,
+            capacity,
+            tracks_limits,
         }
+    }
+
+    pub fn identity(&self) -> &RelayIdentity {
+        &self.identity
     }
 
     /// Run the consumer to handle inbound namespace and exact-track publishes.
@@ -60,6 +91,21 @@ impl Consumer {
                 Some(published_ns) = namespace_subscriber.published_namespace() => {
                     metrics::counter!("moq_relay_publishers_total").increment(1);
 
+                    let capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::PublishNamespace,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "publish_namespace").increment(1);
+                            tracing::warn!(%error, "rejecting PUBLISH_NAMESPACE at relay capacity");
+                            let _ = published_ns.close(serve::ServeError::Closed(
+                                RequestErrorCode::ExcessiveLoad as u64,
+                            ));
+                            continue;
+                        }
+                    };
+
                     let this = self.clone();
 
                     tasks.push(async move {
@@ -70,7 +116,7 @@ impl Consumer {
                             "serving PUBLISH_NAMESPACE: {:?}", info
                         );
 
-                        if let Err(err) = this.serve(published_ns).await {
+                        if let Err(err) = this.serve(published_ns, capacity_lease).await {
                             tracing::warn!(
                                 namespace = %namespace,
                                 error = %err,
@@ -81,11 +127,25 @@ impl Consumer {
                 },
                 Some(publish) = publish_subscriber.publish_received() => {
                     metrics::counter!("moq_relay_published_tracks_total").increment(1);
+                    let capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::PublishTrack,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "publish_track").increment(1);
+                            tracing::warn!(%error, "rejecting PUBLISH at relay capacity");
+                            publish.close(serve::ServeError::Closed(
+                                RequestErrorCode::ExcessiveLoad as u64,
+                            ));
+                            continue;
+                        }
+                    };
                     let this = self.clone();
                     tasks.push(async move {
                         let namespace = publish.namespace().to_utf8_path();
                         let track = publish.name().clone();
-                        if let Err(err) = this.serve_track(publish).await {
+                        if let Err(err) = this.serve_track(publish, capacity_lease).await {
                             tracing::warn!(namespace = %namespace, track = %track, error = %err, "failed serving PUBLISH");
                         }
                     }.boxed());
@@ -97,13 +157,18 @@ impl Consumer {
     }
 
     /// Serve an inbound PUBLISH_NAMESPACE.
-    async fn serve(mut self, mut published_ns: PublishedNamespace) -> Result<(), anyhow::Error> {
+    async fn serve(
+        mut self,
+        mut published_ns: PublishedNamespace,
+        _capacity_lease: RelayCapacityLease,
+    ) -> Result<(), anyhow::Error> {
         // Track active publishers - decrements when this function returns.
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
 
         let mut tasks = FuturesUnordered::new();
 
-        let (_, mut request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
+        let (_, mut request, reader) =
+            Tracks::new(published_ns.namespace.clone()).produce_with_limits(self.tracks_limits)?;
 
         let ns = reader.namespace.to_utf8_path();
 
@@ -111,7 +176,7 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace in locals");
         let _register = match self
             .locals
-            .register(self.scope.as_deref(), reader.clone())
+            .register(self.identity.scope(), reader.clone())
             .await
         {
             Ok(reg) => reg,
@@ -127,10 +192,17 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
-            .register_namespace(self.scope.as_deref(), &reader.namespace)
+            .register_namespace(self.identity.scope(), &reader.namespace)
             .await
         {
             Ok(reg) => reg,
+            Err(crate::CoordinatorError::CapacityExhausted { resource }) => {
+                metrics::counter!("moq_relay_request_overload_total", "resource" => "coordinator_namespace").increment(1);
+                tracing::warn!(resource, "coordinator namespace capacity exhausted");
+                let overload = serve::ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
+                published_ns.close(overload.clone())?;
+                return Err(overload.into());
+            }
             Err(err) => {
                 metrics::counter!("moq_relay_announce_errors_total", "phase" => "coordinator_register")
                     .increment(1);
@@ -174,9 +246,24 @@ impl Consumer {
                     return Ok(());
                 },
                 Some(track) = request.next() => {
+                    let track_capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::PublishTrack,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "namespace_publish_track").increment(1);
+                            tracing::warn!(%error, "rejecting namespace track at relay capacity");
+                            let _ = track.close(serve::ServeError::Closed(
+                                RequestErrorCode::ExcessiveLoad as u64,
+                            ));
+                            continue;
+                        }
+                    };
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
+                        let _track_capacity_lease = track_capacity_lease;
                         let info = track.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
@@ -204,23 +291,17 @@ impl Consumer {
         }
     }
 
-    async fn serve_track(mut self, mut publish: PublishReceived) -> Result<(), anyhow::Error> {
-        let _permit = match self.publish_track_permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                publish.close(serve::ServeError::Closed(
-                    RequestErrorCode::ExcessiveLoad as u64,
-                ));
-                return Err(serve::ServeError::Cancel.into());
-            }
-        };
-
+    async fn serve_track(
+        mut self,
+        mut publish: PublishReceived,
+        _capacity_lease: RelayCapacityLease,
+    ) -> Result<(), anyhow::Error> {
         let namespace = publish.namespace().clone();
         let track_name = publish.name().clone();
         let reader = publish.take_reader()?;
         let _local_registration = match self
             .locals
-            .register_track(self.scope.as_deref(), reader.clone())
+            .register_track(self.identity.scope(), reader.clone())
             .await
         {
             Ok(registration) => registration,
@@ -233,10 +314,17 @@ impl Consumer {
         let track_name_string = track_name.to_string();
         let _coordinator_registration = match self
             .coordinator
-            .register_track(self.scope.as_deref(), &namespace, &track_name_string)
+            .register_track(self.identity.scope(), &namespace, &track_name_string)
             .await
         {
             Ok(registration) => registration,
+            Err(crate::CoordinatorError::CapacityExhausted { resource }) => {
+                metrics::counter!("moq_relay_request_overload_total", "resource" => "coordinator_track").increment(1);
+                tracing::warn!(resource, "coordinator track capacity exhausted");
+                let overload = serve::ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
+                publish.close(overload.clone());
+                return Err(overload.into());
+            }
             Err(err) => {
                 publish.close(serve::ServeError::Closed(
                     RequestErrorCode::InternalError as u64,

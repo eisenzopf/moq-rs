@@ -39,21 +39,85 @@ impl Tracks {
     }
 
     pub fn produce(self) -> (TracksWriter, TracksRequest, TracksReader) {
+        self.produce_with_limits(TracksLimits::default())
+            .expect("default track limits are valid")
+    }
+
+    pub fn produce_with_limits(
+        self,
+        limits: TracksLimits,
+    ) -> Result<(TracksWriter, TracksRequest, TracksReader), TracksLimitsError> {
+        limits.validate()?;
         let info = Arc::new(self);
-        let state = State::default().split();
-        let queue = Queue::default().split();
+        let state = State::new(TracksState {
+            tracks: HashMap::new(),
+            max_cached_tracks: limits.max_cached_tracks,
+        })
+        .split();
+        let queue = Queue::bounded(limits.max_pending_requests).split();
 
         let writer = TracksWriter::new(state.0.clone(), info.clone());
         let request = TracksRequest::new(state.0, queue.0, info.clone());
         let reader = TracksReader::new(state.1, queue.1, info);
 
-        (writer, request, reader)
+        Ok((writer, request, reader))
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TracksLimits {
+    pub max_cached_tracks: usize,
+    pub max_pending_requests: usize,
+}
+
+impl Default for TracksLimits {
+    fn default() -> Self {
+        Self {
+            max_cached_tracks: 4_096,
+            max_pending_requests: 1_024,
+        }
+    }
+}
+
+impl TracksLimits {
+    pub fn validate(self) -> Result<(), TracksLimitsError> {
+        if self.max_cached_tracks == 0 {
+            return Err(TracksLimitsError::ZeroLimit("max_cached_tracks"));
+        }
+        if self.max_pending_requests == 0 {
+            return Err(TracksLimitsError::ZeroLimit("max_pending_requests"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TracksLimitsError {
+    #[error("track limit {0} must be greater than zero")]
+    ZeroLimit(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TrackRequestError {
+    #[error("track request state is closed")]
+    Closed,
+    #[error("track request capacity exhausted")]
+    CapacityExhausted,
+}
+
 pub struct TracksState {
     tracks: HashMap<FullTrackName, TrackReader>,
+    max_cached_tracks: usize,
+}
+
+impl TracksState {
+    fn prune_closed(&mut self) {
+        self.tracks.retain(|_, reader| !reader.is_closed());
+    }
+
+    fn has_capacity_for(&self, name: &FullTrackName) -> bool {
+        self.tracks.contains_key(name) || self.tracks.len() < self.max_cached_tracks
+    }
 }
 
 /// Publish new tracks for a broadcast by name.
@@ -72,18 +136,27 @@ impl TracksWriter {
     /// None is returned if all [TracksReader]s have been dropped.
     pub fn create(&mut self, track: impl Into<TrackName>) -> Option<TrackWriter> {
         let track = track.into();
-        let (writer, reader) = Track {
+        let full_name = FullTrackName {
             namespace: self.namespace.clone(),
             name: track.clone(),
+        };
+        let mut state = self.state.lock_mut()?;
+        state.prune_closed();
+        if !state.has_capacity_for(&full_name) {
+            tracing::debug!(
+                target: "moq_transport::tracks",
+                "track cache capacity exhausted while publishing"
+            );
+            return None;
+        }
+        let (writer, reader) = Track {
+            namespace: self.namespace.clone(),
+            name: track,
         }
         .produce();
 
         // NOTE: We overwrite the track if it already exists.
-        let full_name = FullTrackName {
-            namespace: self.namespace.clone(),
-            name: track,
-        };
-        self.state.lock_mut()?.tracks.insert(full_name, reader);
+        state.tracks.insert(full_name, reader);
 
         Some(writer)
     }
@@ -194,8 +267,8 @@ impl TracksReader {
             if !track_reader.is_closed() {
                 return Some(track_reader.clone());
             }
-            // Track exists but is closed/stale - don't return it
         }
+        state.into_mut()?.tracks.remove(&full_name);
         None
     }
 
@@ -207,6 +280,15 @@ impl TracksReader {
         namespace: TrackNamespace,
         track_name: impl Into<TrackName>,
     ) -> Option<TrackReader> {
+        self.try_subscribe(namespace, track_name).ok()
+    }
+
+    /// Get or request a track while preserving overload versus closed-state failures.
+    pub fn try_subscribe(
+        &mut self,
+        namespace: TrackNamespace,
+        track_name: impl Into<TrackName>,
+    ) -> Result<TrackReader, TrackRequestError> {
         let track_name = track_name.into();
         let state = self.state.lock();
         let full_name = FullTrackName {
@@ -224,7 +306,7 @@ impl TracksReader {
                     track = %track_name,
                     "track cache hit (active)"
                 );
-                return Some(track_reader.clone());
+                return Ok(track_reader.clone());
             }
             // Track is closed/stale, fall through to create a new one
             tracing::debug!(
@@ -235,10 +317,16 @@ impl TracksReader {
             );
         }
 
-        let mut state = state.into_mut()?;
+        let mut state = state.into_mut().ok_or(TrackRequestError::Closed)?;
 
-        // Remove the stale track if it exists (it was closed)
-        state.tracks.remove(&full_name);
+        state.prune_closed();
+        if !state.has_capacity_for(&full_name) {
+            tracing::debug!(
+                target: "moq_transport::tracks",
+                "track cache capacity exhausted while subscribing"
+            );
+            return Err(TrackRequestError::CapacityExhausted);
+        }
         // Use the full requested namespace, not self.namespace
         let track_writer_reader = Track {
             namespace: namespace.clone(),
@@ -253,7 +341,17 @@ impl TracksReader {
                 track = %track_name,
                 "track request queue closed"
             );
-            return None;
+            return Err(
+                if self
+                    .queue
+                    .capacity()
+                    .is_some_and(|capacity| self.queue.len() >= capacity)
+                {
+                    TrackRequestError::CapacityExhausted
+                } else {
+                    TrackRequestError::Closed
+                },
+            );
         }
 
         // We requested the track successfully so we can deduplicate it by full name.
@@ -268,7 +366,16 @@ impl TracksReader {
             "track cache miss, requested from upstream"
         );
 
-        Some(track_writer_reader.1)
+        Ok(track_writer_reader.1)
+    }
+
+    /// Aggregate retained-state diagnostics for this namespace.
+    pub fn cached_tracks(&self) -> usize {
+        self.state.lock().tracks.len()
+    }
+
+    pub fn pending_requests(&self) -> usize {
+        self.queue.len()
     }
 }
 
@@ -283,6 +390,87 @@ impl Deref for TracksReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_limits_reject_zero() {
+        let namespace = TrackNamespace::from_utf8_path("limited");
+        assert!(matches!(
+            Tracks::new(namespace.clone()).produce_with_limits(TracksLimits {
+                max_cached_tracks: 0,
+                max_pending_requests: 1,
+            }),
+            Err(TracksLimitsError::ZeroLimit("max_cached_tracks"))
+        ));
+        assert!(Tracks::new(namespace)
+            .produce_with_limits(TracksLimits {
+                max_cached_tracks: 1,
+                max_pending_requests: 0,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn writer_cache_rejects_n_plus_one_and_reuses_closed_capacity() {
+        let namespace = TrackNamespace::from_utf8_path("limited");
+        let (mut writer, _requests, reader) = Tracks::new(namespace)
+            .produce_with_limits(TracksLimits {
+                max_cached_tracks: 2,
+                max_pending_requests: 2,
+            })
+            .unwrap();
+        let first = writer.create("first").unwrap();
+        let _second = writer.create("second").unwrap();
+        assert!(writer.create("third").is_none());
+        assert_eq!(reader.cached_tracks(), 2);
+
+        drop(first);
+        assert!(writer.create("third").is_some());
+        assert_eq!(reader.cached_tracks(), 2);
+    }
+
+    #[tokio::test]
+    async fn pending_request_queue_rejects_n_plus_one_and_reuses_capacity() {
+        let namespace = TrackNamespace::from_utf8_path("limited");
+        let (_writer, mut requests, mut reader) = Tracks::new(namespace.clone())
+            .produce_with_limits(TracksLimits {
+                max_cached_tracks: 2,
+                max_pending_requests: 1,
+            })
+            .unwrap();
+        let _first_reader = reader.subscribe(namespace.clone(), "first").unwrap();
+        assert!(matches!(
+            reader.try_subscribe(namespace.clone(), "second"),
+            Err(TrackRequestError::CapacityExhausted)
+        ));
+        assert_eq!(reader.pending_requests(), 1);
+
+        let _first_writer = requests.next().await.unwrap();
+        assert_eq!(reader.pending_requests(), 0);
+        assert!(reader.subscribe(namespace, "second").is_some());
+    }
+
+    #[test]
+    fn request_flood_stays_bounded_and_namespaces_are_isolated() {
+        let limits = TracksLimits {
+            max_cached_tracks: 4,
+            max_pending_requests: 2,
+        };
+        let namespace_a = TrackNamespace::from_utf8_path("tenant-a");
+        let namespace_b = TrackNamespace::from_utf8_path("tenant-b");
+        let (_writer_a, _requests_a, mut reader_a) = Tracks::new(namespace_a.clone())
+            .produce_with_limits(limits)
+            .unwrap();
+        let (_writer_b, _requests_b, mut reader_b) = Tracks::new(namespace_b.clone())
+            .produce_with_limits(limits)
+            .unwrap();
+
+        for index in 0..1_000 {
+            let _ = reader_a.subscribe(namespace_a.clone(), format!("track-{index}"));
+        }
+        assert!(reader_a.cached_tracks() <= limits.max_cached_tracks);
+        assert!(reader_a.pending_requests() <= limits.max_pending_requests);
+        assert!(reader_b.subscribe(namespace_b, "independent").is_some());
+    }
 
     /// Regression test for the stale track caching bug.
     ///

@@ -4,6 +4,7 @@
 
 mod capacity;
 mod error;
+mod fetch;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -21,6 +22,7 @@ mod writer;
 
 pub use capacity::*;
 pub use error::*;
+pub use fetch::*;
 pub use publish_namespace::*;
 pub use publish_received::*;
 pub use published::*;
@@ -115,8 +117,12 @@ impl Drop for InboundRequestGuard {
                     publisher.cleanup_inbound_track_status(self.id);
                 }
             }
-            RequestKind::Fetch | RequestKind::SubscribeNamespace | RequestKind::SubscribeTracks => {
+            RequestKind::Fetch => {
+                if let Some(publisher) = self.publisher.as_mut() {
+                    publisher.cleanup_inbound_fetch(self.id);
+                }
             }
+            RequestKind::SubscribeNamespace | RequestKind::SubscribeTracks => {}
         }
         self.request_lease.release();
     }
@@ -775,8 +781,8 @@ impl Session {
         mlog: Option<mlog::MlogWriter>,
         request_id: RequestId,
         config: SessionConfig,
+        request_capacity: SessionRequestCapacity,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
-        let request_capacity = GLOBAL_REQUEST_CAPACITY.session();
         let limits = request_capacity.limits();
         let outgoing = Queue::bounded(limits.max_outbound_messages).split();
 
@@ -843,6 +849,25 @@ impl Session {
         Self::connect_with_authorization(session, mlog_path, negotiated, None).await
     }
 
+    /// Create an outbound session using caller-owned process and session
+    /// limits. Reuse one [`RequestCapacity`] for every process connection so
+    /// request and retained-byte limits are enforced and observable globally.
+    pub async fn connect_with_capacity(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        negotiated: NegotiatedTransport,
+        request_capacity: &RequestCapacity,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_authorization_and_capacity(
+            session,
+            mlog_path,
+            negotiated,
+            None,
+            request_capacity,
+        )
+        .await
+    }
+
     /// Create an outbound session and include bounded authorization material
     /// in the SETUP option block.
     pub async fn connect_with_authorization(
@@ -850,6 +875,24 @@ impl Session {
         mlog_path: Option<PathBuf>,
         negotiated: NegotiatedTransport,
         authorization: Option<SetupAuthorization>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_authorization_and_capacity(
+            session,
+            mlog_path,
+            negotiated,
+            authorization,
+            &GLOBAL_REQUEST_CAPACITY,
+        )
+        .await
+    }
+
+    /// Create an authorized outbound session using caller-owned limits.
+    pub async fn connect_with_authorization_and_capacity(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        negotiated: NegotiatedTransport,
+        authorization: Option<SetupAuthorization>,
+        request_capacity: &RequestCapacity,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         Self::validate_negotiated_transport(&session, negotiated)?;
         let url = session.url().clone();
@@ -937,6 +980,7 @@ impl Session {
                 setup_authorization: None,
                 peer_max_request_updates,
             },
+            request_capacity.session(),
         );
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
@@ -950,6 +994,17 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         negotiated: NegotiatedTransport,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        Self::accept_with_capacity(session, mlog_path, negotiated, &GLOBAL_REQUEST_CAPACITY).await
+    }
+
+    /// Accept an inbound session using caller-owned process and session
+    /// limits. Reuse one [`RequestCapacity`] for every accepted connection.
+    pub async fn accept_with_capacity(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        negotiated: NegotiatedTransport,
+        request_capacity: &RequestCapacity,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         Self::validate_negotiated_transport(&session, negotiated)?;
         let mut mlog = mlog_path.and_then(|p| {
@@ -1027,7 +1082,18 @@ impl Session {
                 setup_authorization,
                 peer_max_request_updates,
             },
+            request_capacity.session(),
         ))
+    }
+
+    /// Return session and process retained-byte gauges for diagnostics.
+    pub fn retention_stats(&self) -> crate::serve::RetentionBudgetStats {
+        self.request_capacity.retention_stats()
+    }
+
+    /// Return the effective limits used by this session.
+    pub fn request_limits(&self) -> &RequestLimits {
+        self.request_capacity.limits()
     }
 
     /// Run Tasks for the session, including sending of control messages, receiving and processing
@@ -1530,14 +1596,7 @@ impl Session {
                         update_credits.respond();
                     }
 
-                    let request_error_is_terminal = matches!(&response, Message::RequestError(_))
-                        && !(is_update_response
-                            && matches!(request_kind, RequestKind::Subscribe | RequestKind::Publish));
-                    let terminal = request_error_is_terminal
-                        || matches!(&response, Message::PublishDone(_))
-                        || (request_kind == RequestKind::TrackStatus
-                            && matches!(&response, Message::RequestOk(_)));
-                    if terminal {
+                    if Self::response_is_terminal(request_kind, is_update_response, &response) {
                         break Ok(());
                     }
                 }
@@ -1586,6 +1645,24 @@ impl Session {
             reason: crate::coding::ReasonPhrase("request capacity exhausted".to_string()),
             redirect: None,
         })
+    }
+
+    fn response_is_terminal(
+        request_kind: RequestKind,
+        is_update_response: bool,
+        response: &Message,
+    ) -> bool {
+        let request_error_is_terminal = matches!(response, Message::RequestError(_))
+            && !(is_update_response
+                && matches!(
+                    request_kind,
+                    RequestKind::Subscribe | RequestKind::Publish | RequestKind::Fetch
+                ));
+        request_error_is_terminal
+            || matches!(response, Message::PublishDone(_))
+            || (request_kind == RequestKind::Fetch && matches!(response, Message::FetchOk(_)))
+            || (request_kind == RequestKind::TrackStatus
+                && matches!(response, Message::RequestOk(_)))
     }
 
     fn effective_reverse_update_limit(limits: RequestUpdateLimits) -> usize {
@@ -2133,6 +2210,37 @@ mod tests {
         assert_eq!(error.retry_interval, 1001);
         assert!(error.redirect.is_none());
         assert!(!error.reason.0.is_empty());
+    }
+
+    #[test]
+    fn fetch_update_not_supported_is_scoped_to_the_update_request() {
+        let update_error = Message::RequestError(message::RequestError::new(
+            43,
+            message::RequestErrorCode::NotSupported,
+            0,
+            "FETCH updates are not supported",
+        ));
+        assert!(!Session::response_is_terminal(
+            RequestKind::Fetch,
+            true,
+            &update_error
+        ));
+        assert!(Session::response_is_terminal(
+            RequestKind::Fetch,
+            false,
+            &update_error
+        ));
+        assert!(Session::response_is_terminal(
+            RequestKind::Fetch,
+            false,
+            &Message::FetchOk(message::FetchOk {
+                id: 42,
+                end_of_track: false,
+                end_location: crate::coding::Location::new(1, 2),
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+        ));
     }
 
     #[test]

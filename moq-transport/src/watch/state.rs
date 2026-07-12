@@ -102,6 +102,11 @@ impl<T> State<T> {
             },
         )
     }
+
+    /// Number of strong handles sharing this side of the state split.
+    pub fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.drop)
+    }
 }
 
 impl<T> Clone for State<T> {

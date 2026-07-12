@@ -23,10 +23,11 @@ use super::subscribed::{
     JoiningSubscriptionLookupError,
 };
 use super::{
-    BidiCommand, BidiResponseMap, PublishNamespace, PublishNamespaceRecv,
-    PublishNamespaceRejection, Published, PublishedInfo, RequestClass, RequestDirection, RequestId,
-    RequestLease, RequestUpdateCredits, Session, SessionError, SessionRequestCapacity, Subscribed,
-    SubscribedRecv, TrackStatusRequested, DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
+    BidiCommand, BidiResponseMap, FetchRequested, FetchRequestedRecv, PublishNamespace,
+    PublishNamespaceRecv, PublishNamespaceRejection, Published, PublishedInfo, RequestClass,
+    RequestDirection, RequestId, RequestLease, RequestUpdateCredits, Session, SessionError,
+    SessionRequestCapacity, Subscribed, SubscribedRecv, TrackStatusRequested,
+    DEFAULT_PUBLISH_NAMESPACE_ACCEPTANCE_TIMEOUT,
 };
 use crate::message::RequestErrorCode;
 
@@ -82,6 +83,12 @@ pub struct Publisher {
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
 
+    /// Active inbound FETCH requests, keyed by request ID.
+    fetches: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
+
+    /// Joining FETCH requests waiting for application serving policy.
+    unknown_fetch_requested: Queue<FetchRequested>,
+
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
 
@@ -111,6 +118,14 @@ pub struct Publisher {
 }
 
 impl Publisher {
+    pub(super) fn retention_budget(&self) -> crate::serve::RetentionBudget {
+        self.request_capacity.retention_budget()
+    }
+
+    pub(super) fn retention_track_limits(&self) -> crate::serve::RetentionLimits {
+        self.request_capacity.retention_track_limits()
+    }
+
     pub(super) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
@@ -127,6 +142,8 @@ impl Publisher {
             subscribeds: Default::default(),
             published: Default::default(),
             unknown_subscribed: Queue::bounded(limits.session_inbound.subscribe),
+            fetches: Default::default(),
+            unknown_fetch_requested: Queue::bounded(limits.session_inbound.fetch),
             unknown_track_status_requested: Queue::bounded(limits.session_inbound.track_status),
             outgoing,
             request_id,
@@ -145,11 +162,31 @@ impl Publisher {
         Ok((session, publisher.unwrap()))
     }
 
+    pub async fn accept_with_capacity(
+        session: web_transport::Session,
+        negotiated: super::NegotiatedTransport,
+        request_capacity: &super::RequestCapacity,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::accept_with_capacity(session, None, negotiated, request_capacity).await?;
+        Ok((session, publisher.unwrap()))
+    }
+
     pub async fn connect(
         session: web_transport::Session,
         negotiated: super::NegotiatedTransport,
     ) -> Result<(Session, Publisher), SessionError> {
         let (session, publisher, _) = Session::connect(session, None, negotiated).await?;
+        Ok((session, publisher))
+    }
+
+    pub async fn connect_with_capacity(
+        session: web_transport::Session,
+        negotiated: super::NegotiatedTransport,
+        request_capacity: &super::RequestCapacity,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::connect_with_capacity(session, None, negotiated, request_capacity).await?;
         Ok((session, publisher))
     }
 
@@ -168,6 +205,31 @@ impl Publisher {
             .lock()
             .map_err(|_| JoiningSubscriptionLookupError::Internal)?;
         lookup_joining_subscription_in(&subscriptions, request_id)
+    }
+
+    pub(super) async fn resolve_joining_subscription(
+        &self,
+        request_id: u64,
+    ) -> Result<
+        (
+            super::subscribed::JoiningSubscription,
+            crate::serve::RetainedTrack,
+        ),
+        ServeError,
+    > {
+        let subscription = self
+            .subscribeds
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("joining subscription registry unavailable"))?
+            .get(&request_id)
+            .cloned()
+            .ok_or(ServeError::Closed(
+                RequestErrorCode::InvalidJoiningRequestId as u64,
+            ))?;
+        subscription
+            .wait_for_joining_fetch()
+            .await
+            .map_err(|error| ServeError::Closed(error.request_error_code() as u64))
     }
 
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
@@ -304,8 +366,10 @@ impl Publisher {
         publish_ns: PublishNamespace,
         tracks: TracksReader,
     ) -> Result<(), SessionError> {
+        let mut publisher_fetch = publish_ns.publisher();
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
+        let mut fetch_tasks = FuturesUnordered::new();
         let mut subscribe_done = false;
         let mut status_done = false;
 
@@ -347,8 +411,17 @@ impl Publisher {
                         None => status_done = true,
                     }
                 },
+                Some(fetch) = publisher_fetch.fetch_requested() => {
+                    fetch_tasks.push(async move {
+                        let id = fetch.id();
+                        if let Err(error) = fetch.serve().await {
+                            tracing::warn!(request_id = id, %error, "failed serving Joining FETCH");
+                        }
+                    });
+                },
                 Some(res) = subscribe_tasks.next() => res,
                 Some(res) = status_tasks.next() => res,
+                Some(()) = fetch_tasks.next() => {},
                 else => return Ok(()),
             }
         }
@@ -711,6 +784,11 @@ impl Publisher {
         self.unknown_subscribed.pop().await
     }
 
+    /// Return the next supported inbound Relative Joining FETCH.
+    pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
+        self.unknown_fetch_requested.pop().await
+    }
+
     /// Returns the next TRACK_STATUS request that did not match any active PUBLISH_NAMESPACE.
     pub async fn track_status_requested(&mut self) -> Option<TrackStatusRequested> {
         self.unknown_track_status_requested.pop().await
@@ -776,9 +854,12 @@ impl Publisher {
                     self.recv_publish_namespace_error(msg)?;
                 }
             }
-            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id, "fetch");
+                let lease = Arc::new(
+                    self.request_capacity
+                        .try_acquire(RequestDirection::Inbound, RequestClass::Fetch)?,
+                );
+                self.recv_fetch(msg, lease)?;
             }
             message::Subscriber::TrackStatus(msg) => {
                 let lease = Arc::new(
@@ -810,6 +891,7 @@ impl Publisher {
     ) -> Result<(), SessionError> {
         match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg, request_lease),
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg, request_lease),
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg, request_lease),
             other => self.recv_message(other),
         }
@@ -820,6 +902,16 @@ impl Publisher {
         initial_request_id: u64,
         update: message::RequestUpdate,
     ) -> Result<(), SessionError> {
+        let fetch_found = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .contains_key(&initial_request_id);
+        if fetch_found {
+            self.send_not_supported(update.id, "fetch_request_update");
+            return Ok(());
+        }
+
         let found = {
             let mut subscribeds = self
                 .subscribeds
@@ -996,6 +1088,48 @@ impl Publisher {
         Ok(())
     }
 
+    fn recv_fetch(
+        &mut self,
+        msg: message::Fetch,
+        request_lease: Arc<RequestLease>,
+    ) -> Result<(), SessionError> {
+        // Reject unsupported variants at the request boundary. They are
+        // request-scoped capability errors, never connection failures.
+        if let Err(error) = super::fetch::validate_joining_request(&msg) {
+            let code = match error {
+                SessionError::Serve(ServeError::NotImplemented(_))
+                | SessionError::Serve(ServeError::NotImplementedWithId(_, _)) => {
+                    RequestErrorCode::NotSupported
+                }
+                _ => RequestErrorCode::InvalidRange,
+            };
+            self.send_request_error(
+                "fetch",
+                message::RequestError::new(msg.id, code, 0, &error.to_string()),
+            );
+            request_lease.release();
+            return Ok(());
+        }
+
+        let id = msg.id;
+        let (requested, recv) = FetchRequested::new(self.clone(), msg, request_lease);
+        {
+            let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+            if fetches.insert(id, recv).is_some() {
+                return Err(SessionError::InvalidRequestId);
+            }
+        }
+        if let Err(mut requested) = self.unknown_fetch_requested.push(requested) {
+            requested.reject_with_retry(
+                RequestErrorCode::ExcessiveLoad,
+                super::fetch::FETCH_OVERLOAD_RETRY_INTERVAL,
+                "FETCH queue capacity exhausted",
+            )?;
+            self.cleanup_inbound_fetch(id);
+        }
+        Ok(())
+    }
+
     /// Pre-send hook: clean up internal state when terminal publisher messages are enqueued.
     fn act_on_message_to_send<T: Into<message::Publisher>>(
         &mut self,
@@ -1067,6 +1201,15 @@ impl Publisher {
                 namespace.remove_track_status(id);
             }
         }
+    }
+
+    /// Remove every retained representation of a peer-opened FETCH.
+    pub(super) fn cleanup_inbound_fetch(&mut self, id: u64) {
+        if let Some(fetch) = self.fetches.lock().ok().and_then(|mut map| map.remove(&id)) {
+            fetch.cancel();
+        }
+        self.unknown_fetch_requested
+            .remove_where(|request| request.id() == id);
     }
 
     pub(super) fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {

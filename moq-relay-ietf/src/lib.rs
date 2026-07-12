@@ -33,6 +33,7 @@
 
 mod admission;
 mod api;
+mod capacity;
 mod consumer;
 mod coordinator;
 mod diagnostics;
@@ -46,12 +47,16 @@ mod web;
 
 pub use admission::*;
 pub use api::*;
+pub use capacity::*;
 pub use consumer::*;
 pub use coordinator::*;
 pub use diagnostics::*;
 pub use local::*;
 pub use producer::*;
 pub use relay::*;
-pub use remote::RemoteManager;
+pub use remote::{
+    RemoteCapacityError, RemoteCapacityResource, RemoteManager, RemoteManagerLimits,
+    RemoteManagerLimitsError, RemoteManagerSnapshot,
+};
 pub use session::*;
 pub use web::*;

@@ -183,13 +183,11 @@ pub struct Registration {
 /// Deregister local tracks on drop.
 impl Drop for Registration {
     fn drop(&mut self) {
-        let ns = self.namespace.to_utf8_path();
-        let scope = if self.scope_key.is_empty() {
-            "<unscoped>"
-        } else {
-            &self.scope_key
-        };
-        tracing::debug!(namespace = %ns, scope = %scope, "deregistering namespace from locals");
+        tracing::debug!(
+            scoped = !self.scope_key.is_empty(),
+            namespace_fields = self.namespace.fields.len(),
+            "deregistering namespace from locals"
+        );
 
         let mut lookup = self.locals.lookup.lock().unwrap();
         if let Some(bucket) = lookup.get_mut(self.scope_key.as_str()) {

@@ -260,6 +260,11 @@ impl TrackReader {
         // transitioning to a specific mode.
         state.modified().is_none()
     }
+
+    /// Number of live reader handles for this track.
+    pub fn reader_count(&self) -> usize {
+        self.state.handle_count()
+    }
 }
 
 impl Deref for TrackReader {
@@ -334,6 +339,17 @@ mod tests {
     use super::*;
     use crate::coding::TrackNamespace;
     use crate::serve::Subgroup;
+
+    #[test]
+    fn reader_count_tracks_external_clones() {
+        let (_writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string()).produce();
+        assert_eq!(reader.reader_count(), 1);
+        let clone = reader.clone();
+        assert_eq!(reader.reader_count(), 2);
+        drop(clone);
+        assert_eq!(reader.reader_count(), 1);
+    }
 
     #[test]
     fn test_is_closed_false_before_mode_set() {

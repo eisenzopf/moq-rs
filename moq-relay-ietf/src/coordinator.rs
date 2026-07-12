@@ -18,6 +18,9 @@ pub enum CoordinatorError {
     #[error("namespace already registered")]
     NamespaceAlreadyRegistered,
 
+    #[error("coordinator capacity exhausted for {resource}")]
+    CapacityExhausted { resource: &'static str },
+
     #[error("Internal Error: {0}")]
     Other(anyhow::Error),
 }

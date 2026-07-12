@@ -16,6 +16,190 @@ use thiserror::Error;
 use crate::coding::{Encode, Location};
 use crate::data::ExtensionHeaders;
 use crate::message::GroupOrder;
+use crate::watch::State;
+
+/// Aggregate byte limits shared by all retained tracks in a session and in
+/// the process. Bytes are charged lazily when Objects are committed, not when
+/// a subscription allocates an empty cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionBudgetLimits {
+    pub max_session_bytes: usize,
+    pub max_process_bytes: usize,
+}
+
+impl Default for RetentionBudgetLimits {
+    fn default() -> Self {
+        Self {
+            max_session_bytes: 64 * 1024 * 1024,
+            max_process_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RetentionBudgetState {
+    used: usize,
+    limit: usize,
+}
+
+/// Process-owned retention budget. Derive one session view per MOQT session.
+#[derive(Clone, Debug)]
+pub struct RetentionBudgetPool {
+    process: Arc<Mutex<RetentionBudgetState>>,
+    limits: RetentionBudgetLimits,
+}
+
+impl RetentionBudgetPool {
+    pub fn new(limits: RetentionBudgetLimits) -> Result<Self, RetentionBudgetError> {
+        if limits.max_session_bytes == 0
+            || limits.max_process_bytes == 0
+            || limits.max_session_bytes > limits.max_process_bytes
+        {
+            return Err(RetentionBudgetError::InvalidLimits);
+        }
+        Ok(Self {
+            process: Arc::new(Mutex::new(RetentionBudgetState {
+                used: 0,
+                limit: limits.max_process_bytes,
+            })),
+            limits,
+        })
+    }
+
+    pub fn session(&self) -> RetentionBudget {
+        RetentionBudget {
+            process: self.process.clone(),
+            session: Arc::new(Mutex::new(RetentionBudgetState {
+                used: 0,
+                limit: self.limits.max_session_bytes,
+            })),
+            limits: self.limits,
+        }
+    }
+
+    pub fn limits(&self) -> RetentionBudgetLimits {
+        self.limits
+    }
+
+    /// Return a point-in-time process-wide retained-byte gauge.
+    ///
+    /// Clones of this pool share the same process counter, so a long-lived
+    /// runtime can retain one clone and poll this snapshot after individual
+    /// sessions have been moved into their serving tasks.
+    pub fn stats(&self) -> RetentionBudgetPoolStats {
+        RetentionBudgetPoolStats {
+            process_bytes: lock(&self.process).used,
+            max_process_bytes: self.limits.max_process_bytes,
+        }
+    }
+}
+
+impl Default for RetentionBudgetPool {
+    fn default() -> Self {
+        Self::new(RetentionBudgetLimits::default())
+            .expect("default retention budget limits are valid")
+    }
+}
+
+/// One session's view over both the session-local and process-wide byte
+/// counters. Clones share the same counters.
+#[derive(Clone, Debug)]
+pub struct RetentionBudget {
+    process: Arc<Mutex<RetentionBudgetState>>,
+    session: Arc<Mutex<RetentionBudgetState>>,
+    limits: RetentionBudgetLimits,
+}
+
+impl RetentionBudget {
+    fn try_reserve(
+        &self,
+        bytes: usize,
+    ) -> Result<Arc<RetentionBudgetReservation>, RetentionBudgetError> {
+        // Every acquisition and release uses process -> session lock order.
+        let mut process = lock(&self.process);
+        let mut session = lock(&self.session);
+        let process_total = process
+            .used
+            .checked_add(bytes)
+            .ok_or(RetentionBudgetError::ProcessBytes)?;
+        if process_total > process.limit {
+            return Err(RetentionBudgetError::ProcessBytes);
+        }
+        let session_total = session
+            .used
+            .checked_add(bytes)
+            .ok_or(RetentionBudgetError::SessionBytes)?;
+        if session_total > session.limit {
+            return Err(RetentionBudgetError::SessionBytes);
+        }
+
+        // All checks completed before either counter is mutated, so a failed
+        // process or session admission cannot strand partial capacity.
+        process.used = process_total;
+        session.used = session_total;
+        Ok(Arc::new(RetentionBudgetReservation {
+            process: self.process.clone(),
+            session: self.session.clone(),
+            bytes,
+        }))
+    }
+
+    pub fn stats(&self) -> RetentionBudgetStats {
+        let process_bytes = lock(&self.process).used;
+        let session_bytes = lock(&self.session).used;
+        RetentionBudgetStats {
+            session_bytes,
+            process_bytes,
+            limits: self.limits,
+        }
+    }
+
+    pub fn limits(&self) -> RetentionBudgetLimits {
+        self.limits
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionBudgetStats {
+    pub session_bytes: usize,
+    pub process_bytes: usize,
+    pub limits: RetentionBudgetLimits,
+}
+
+/// Process-wide retained-byte gauge exposed by [`RetentionBudgetPool`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionBudgetPoolStats {
+    pub process_bytes: usize,
+    pub max_process_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RetentionBudgetError {
+    #[error("retention budget limits are invalid")]
+    InvalidLimits,
+    #[error("session retained-byte budget exhausted")]
+    SessionBytes,
+    #[error("process retained-byte budget exhausted")]
+    ProcessBytes,
+}
+
+#[derive(Debug)]
+struct RetentionBudgetReservation {
+    process: Arc<Mutex<RetentionBudgetState>>,
+    session: Arc<Mutex<RetentionBudgetState>>,
+    bytes: usize,
+}
+
+impl Drop for RetentionBudgetReservation {
+    fn drop(&mut self) {
+        let mut process = lock(&self.process);
+        let mut session = lock(&self.session);
+        debug_assert!(process.used >= self.bytes);
+        debug_assert!(session.used >= self.bytes);
+        process.used = process.used.saturating_sub(self.bytes);
+        session.used = session.used.saturating_sub(self.bytes);
+    }
+}
 
 /// Hard bounds for retained objects, groups, and active snapshots.
 ///
@@ -49,7 +233,7 @@ impl Default for RetentionLimits {
 }
 
 impl RetentionLimits {
-    fn validate(self) -> Result<Self, RetentionError> {
+    pub fn validate(self) -> Result<Self, RetentionError> {
         let nonzero = self.max_object_bytes > 0
             && self.max_group_bytes > 0
             && self.max_objects_per_group > 0
@@ -81,6 +265,8 @@ pub enum RetentionLimit {
     StoreObjects,
     ActiveSnapshots,
     PinnedGroups,
+    SessionBytes,
+    ProcessBytes,
 }
 
 /// A deterministic validation error for a retention or range operation.
@@ -120,12 +306,23 @@ pub struct RetainedObjectMetadata {
 }
 
 /// A complete immutable object whose payload remains reference-counted.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RetainedObject {
     metadata: RetainedObjectMetadata,
     payload: Bytes,
     retained_bytes: usize,
+    budget: Option<Arc<RetentionBudgetReservation>>,
 }
+
+impl PartialEq for RetainedObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.metadata == other.metadata
+            && self.payload == other.payload
+            && self.retained_bytes == other.retained_bytes
+    }
+}
+
+impl Eq for RetainedObject {}
 
 impl RetainedObject {
     pub fn new(metadata: RetainedObjectMetadata, payload: Bytes) -> Result<Self, RetentionError> {
@@ -145,6 +342,7 @@ impl RetainedObject {
             metadata,
             payload,
             retained_bytes,
+            budget: None,
         })
     }
 
@@ -238,10 +436,25 @@ struct TrackState {
 #[derive(Clone, Debug)]
 pub struct RetainedTrack {
     state: Arc<Mutex<TrackState>>,
+    revision: State<u64>,
+    budget: RetentionBudget,
 }
 
 impl RetainedTrack {
     pub fn new(limits: RetentionLimits) -> Result<Self, RetentionError> {
+        let budget = RetentionBudgetPool::new(RetentionBudgetLimits {
+            max_session_bytes: limits.max_store_bytes,
+            max_process_bytes: limits.max_store_bytes,
+        })
+        .map_err(|_| RetentionError::InvalidRange(RetentionRangeError::InvalidLimits))?
+        .session();
+        Self::new_with_budget(limits, budget)
+    }
+
+    pub fn new_with_budget(
+        limits: RetentionLimits,
+        budget: RetentionBudget,
+    ) -> Result<Self, RetentionError> {
         let limits = limits.validate()?;
         Ok(Self {
             state: Arc::new(Mutex::new(TrackState {
@@ -252,6 +465,8 @@ impl RetainedTrack {
                 completed_bytes: 0,
                 active_snapshots: 0,
             })),
+            revision: State::default(),
+            budget,
         })
     }
 
@@ -259,7 +474,7 @@ impl RetainedTrack {
     ///
     /// Objects may arrive out of object-ID order, but only one group may be
     /// pending. An exact duplicate is idempotent.
-    pub fn commit(&self, object: RetainedObject) -> Result<(), RetentionError> {
+    pub fn commit(&self, mut object: RetainedObject) -> Result<(), RetentionError> {
         let mut state = lock(&self.state);
         let limits = state.limits;
 
@@ -323,6 +538,22 @@ impl RetainedTrack {
             RetentionLimit::StoreBytes,
         )?;
 
+        let reservation = self
+            .budget
+            .try_reserve(object.retained_bytes())
+            .map_err(|error| match error {
+                RetentionBudgetError::SessionBytes => {
+                    RetentionError::ExcessiveLoad(RetentionLimit::SessionBytes)
+                }
+                RetentionBudgetError::ProcessBytes => {
+                    RetentionError::ExcessiveLoad(RetentionLimit::ProcessBytes)
+                }
+                RetentionBudgetError::InvalidLimits => {
+                    RetentionError::InvalidRange(RetentionRangeError::InvalidLimits)
+                }
+            })?;
+        object.budget = Some(reservation);
+
         let pending = state.pending.get_or_insert_with(|| PendingGroup {
             group_id,
             objects: BTreeMap::new(),
@@ -376,7 +607,53 @@ impl RetainedTrack {
         state.completed_objects += group.objects.len();
         state.completed_bytes += group.bytes;
         state.groups.insert(group_id, group);
+        drop(state);
+        if let Some(mut revision) = self.revision.lock_mut() {
+            *revision = revision.saturating_add(1);
+        }
         Ok(())
+    }
+
+    /// Discard an incomplete Group after the live path determined it cannot
+    /// be represented by the bounded FETCH profile. Completed snapshots are
+    /// unaffected.
+    pub(crate) fn discard_pending(&self, group_id: u64) {
+        let mut state = lock(&self.state);
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.group_id == group_id)
+        {
+            state.pending = None;
+        }
+    }
+
+    /// Wait until the requested immutable range is retained.
+    ///
+    /// Only transient "not published yet" range errors wait for another
+    /// completed-group revision. Structural range and capacity errors remain
+    /// immediate so a malformed FETCH cannot retain an unbounded waiter.
+    pub async fn snapshot_when_available(
+        &self,
+        range: RetainedRange,
+        group_order: GroupOrder,
+    ) -> Result<RetainedSnapshot, RetentionError> {
+        loop {
+            let revision = self.revision.lock();
+            match self.snapshot(range, group_order) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(RetentionError::InvalidRange(
+                    RetentionRangeError::NoObjects
+                    | RetentionRangeError::StartAfterLargest
+                    | RetentionRangeError::NotRetained,
+                )) => {}
+                Err(error) => return Err(error),
+            }
+            let modified = revision.modified().ok_or(RetentionError::InvalidRange(
+                RetentionRangeError::NotRetained,
+            ))?;
+            modified.await;
+        }
     }
 
     /// Create an immutable range snapshot and pin every selected group.
@@ -497,6 +774,10 @@ impl RetainedTrack {
             active_snapshots: state.active_snapshots,
             largest_location: largest_location(&state),
         }
+    }
+
+    pub fn limits(&self) -> RetentionLimits {
+        lock(&self.state).limits
     }
 }
 
@@ -676,6 +957,14 @@ mod tests {
         assert_eq!(result.err(), Some(expected));
     }
 
+    fn budget(session_bytes: usize, process_bytes: usize) -> RetentionBudgetPool {
+        RetentionBudgetPool::new(RetentionBudgetLimits {
+            max_session_bytes: session_bytes,
+            max_process_bytes: process_bytes,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn incomplete_object_is_rejected_and_invisible() {
         let track = RetainedTrack::new(limits()).unwrap();
@@ -709,6 +998,129 @@ mod tests {
     }
 
     #[test]
+    fn session_budget_rejects_n_plus_one_and_releases_on_cache_drop() {
+        let charge = object(1, 0, Some(0), 4).retained_bytes();
+        let pool = budget(charge * 2, charge * 8);
+        let session = pool.session();
+        let first = RetainedTrack::new_with_budget(limits(), session.clone()).unwrap();
+        let second = RetainedTrack::new_with_budget(limits(), session.clone()).unwrap();
+        let third = RetainedTrack::new_with_budget(limits(), session.clone()).unwrap();
+
+        first.commit(object(1, 0, Some(0), 4)).unwrap();
+        second.commit(object(2, 0, Some(0), 4)).unwrap();
+        assert_eq!(
+            third.commit(object(3, 0, Some(0), 4)),
+            Err(RetentionError::ExcessiveLoad(RetentionLimit::SessionBytes))
+        );
+        assert_eq!(session.stats().session_bytes, charge * 2);
+
+        drop(first);
+        assert_eq!(session.stats().session_bytes, charge);
+        third.commit(object(3, 0, Some(0), 4)).unwrap();
+        assert_eq!(session.stats().session_bytes, charge * 2);
+    }
+
+    #[test]
+    fn process_budget_failure_rolls_back_the_other_sessions_counter() {
+        let charge = object(1, 0, Some(0), 4).retained_bytes();
+        let pool = budget(charge * 2, charge * 2);
+        let first_session = pool.session();
+        let second_session = pool.session();
+        let first = RetainedTrack::new_with_budget(limits(), first_session.clone()).unwrap();
+        let second = RetainedTrack::new_with_budget(limits(), second_session.clone()).unwrap();
+
+        first.commit(object(1, 0, Some(0), 4)).unwrap();
+        first.commit(object(1, 1, Some(0), 4)).unwrap();
+        assert_eq!(
+            second.commit(object(2, 0, Some(0), 4)),
+            Err(RetentionError::ExcessiveLoad(RetentionLimit::ProcessBytes))
+        );
+        assert_eq!(second_session.stats().session_bytes, 0);
+        assert_eq!(second_session.stats().process_bytes, charge * 2);
+
+        drop(first);
+        assert_eq!(second_session.stats().process_bytes, 0);
+        second.commit(object(2, 0, Some(0), 4)).unwrap();
+        assert_eq!(second_session.stats().session_bytes, charge);
+        assert_eq!(second_session.stats().process_bytes, charge);
+    }
+
+    #[test]
+    fn process_pool_snapshot_aggregates_sessions_and_releases_raii_bytes() {
+        let charge = object(1, 0, Some(0), 4).retained_bytes();
+        let pool = budget(charge * 2, charge * 4);
+        let first = RetainedTrack::new_with_budget(limits(), pool.session()).unwrap();
+        let second = RetainedTrack::new_with_budget(limits(), pool.session()).unwrap();
+
+        assert_eq!(
+            pool.stats(),
+            RetentionBudgetPoolStats {
+                process_bytes: 0,
+                max_process_bytes: charge * 4,
+            }
+        );
+        first.commit(object(1, 0, Some(0), 4)).unwrap();
+        second.commit(object(2, 0, Some(0), 4)).unwrap();
+        assert_eq!(pool.stats().process_bytes, charge * 2);
+
+        drop(first);
+        assert_eq!(pool.stats().process_bytes, charge);
+        drop(second);
+        assert_eq!(pool.stats().process_bytes, 0);
+    }
+
+    #[test]
+    fn completed_group_eviction_releases_shared_byte_capacity() {
+        let charge = object(1, 0, Some(0), 4).retained_bytes();
+        let pool = budget(charge * 3, charge * 3);
+        let session = pool.session();
+        let mut config = limits();
+        config.max_groups = 1;
+        let track = RetainedTrack::new_with_budget(config, session.clone()).unwrap();
+
+        track.commit(object(1, 0, Some(0), 4)).unwrap();
+        track.complete_group(1).unwrap();
+        assert_eq!(session.stats().session_bytes, charge);
+        track.commit(object(2, 0, Some(0), 4)).unwrap();
+        assert_eq!(session.stats().session_bytes, charge * 2);
+        track.complete_group(2).unwrap();
+        assert_eq!(session.stats().session_bytes, charge);
+    }
+
+    #[test]
+    fn pinned_snapshot_holds_budget_until_eviction_or_final_snapshot_drop() {
+        let charge = object(1, 0, Some(0), 4).retained_bytes();
+        let pool = budget(charge * 3, charge * 3);
+        let session = pool.session();
+        let mut config = limits();
+        config.max_groups = 1;
+        let track = RetainedTrack::new_with_budget(config, session.clone()).unwrap();
+
+        track.commit(object(1, 0, Some(0), 4)).unwrap();
+        track.complete_group(1).unwrap();
+        let pinned = track
+            .snapshot(range((1, 0), (2, 0)), GroupOrder::Ascending)
+            .unwrap();
+        track.commit(object(2, 0, Some(0), 4)).unwrap();
+        assert_eq!(
+            track.complete_group(2),
+            Err(RetentionError::ExcessiveLoad(RetentionLimit::PinnedGroups))
+        );
+        assert_eq!(session.stats().session_bytes, charge * 2);
+        drop(pinned);
+        track.complete_group(2).unwrap();
+        assert_eq!(session.stats().session_bytes, charge);
+
+        let final_snapshot = track
+            .snapshot(range((2, 0), (3, 0)), GroupOrder::Ascending)
+            .unwrap();
+        drop(track);
+        assert_eq!(session.stats().session_bytes, charge);
+        drop(final_snapshot);
+        assert_eq!(session.stats().session_bytes, 0);
+    }
+
+    #[test]
     fn pending_group_is_invisible_until_atomic_completion() {
         let track = RetainedTrack::new(limits()).unwrap();
         track.commit(object(1, 1, None, 4)).unwrap();
@@ -730,6 +1142,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_waiter_wakes_only_after_atomic_group_completion() {
+        let track = RetainedTrack::new(limits()).unwrap();
+        let waiting = {
+            let track = track.clone();
+            tokio::spawn(async move {
+                track
+                    .snapshot_when_available(range((1, 0), (1, 2)), GroupOrder::Ascending)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        track.commit(object(1, 0, Some(0), 4)).unwrap();
+        track.commit(object(1, 1, Some(0), 4)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "pending Objects must stay invisible"
+        );
+        track.complete_group(1).unwrap();
+
+        let snapshot = waiting.await.unwrap().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(track.stats().active_snapshots, 1);
+        drop(snapshot);
+        assert_eq!(track.stats().active_snapshots, 0);
     }
 
     #[test]

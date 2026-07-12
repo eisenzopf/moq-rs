@@ -22,10 +22,10 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    BidiCommand, BidiResponseMap, PublishReceived, PublishReceivedRecv, PublishedNamespace,
-    PublishedNamespaceRecv, Reader, RequestClass, RequestDirection, RequestId, RequestLease,
-    Session, SessionError, SessionRequestCapacity, Subscribe, SubscribeOptions, SubscribeRecv,
-    Writer,
+    BidiCommand, BidiResponseMap, BufferedJoinObject, Fetch, FetchRecv, FetchedObject,
+    PublishReceived, PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader,
+    RequestClass, RequestDirection, RequestId, RequestLease, Session, SessionError,
+    SessionRequestCapacity, Subscribe, SubscribeOptions, SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -50,6 +50,18 @@ struct SubscribeResponseGuard {
     request_id: u64,
 }
 
+struct FetchResponseGuard {
+    subscriber: Subscriber,
+    request_id: u64,
+}
+
+impl Drop for FetchResponseGuard {
+    fn drop(&mut self) {
+        self.subscriber
+            .fetch_response_stream_closed(self.request_id);
+    }
+}
+
 impl Drop for SubscribeResponseGuard {
     fn drop(&mut self) {
         self.subscriber.cleanup_outbound_subscribe(self.request_id);
@@ -67,6 +79,9 @@ pub struct Subscriber {
 
     /// The currently active outbound subscribes, keyed by request id.
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
+
+    /// Active outbound Joining FETCH requests, keyed by request ID.
+    fetches: Arc<Mutex<HashMap<u64, FetchRecv>>>,
 
     /// Session-scoped aliases. One alias may fan out to multiple requests only
     /// when every request names the exact same track.
@@ -110,6 +125,11 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
+    fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.subscribes, &other.subscribes)
+            && Arc::ptr_eq(&self.fetches, &other.fetches)
+    }
+
     pub(super) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
@@ -124,6 +144,7 @@ impl Subscriber {
             published_namespaces: Default::default(),
             published_namespace_queue: Queue::bounded(limits.session_inbound.publish_namespace),
             subscribes: Default::default(),
+            fetches: Default::default(),
             alias_map: Default::default(),
             publishes_received: Default::default(),
             publish_received_queue: Queue::bounded(limits.session_inbound.publish),
@@ -215,12 +236,32 @@ impl Subscriber {
         Ok((session, subscriber.unwrap()))
     }
 
+    pub async fn accept_with_capacity(
+        session: web_transport::Session,
+        negotiated: super::NegotiatedTransport,
+        request_capacity: &super::RequestCapacity,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) =
+            Session::accept_with_capacity(session, None, negotiated, request_capacity).await?;
+        Ok((session, subscriber.unwrap()))
+    }
+
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
     pub async fn connect(
         session: web_transport::Session,
         negotiated: super::NegotiatedTransport,
     ) -> Result<(Session, Self), SessionError> {
         let (session, _, subscriber) = Session::connect(session, None, negotiated).await?;
+        Ok((session, subscriber))
+    }
+
+    pub async fn connect_with_capacity(
+        session: web_transport::Session,
+        negotiated: super::NegotiatedTransport,
+        request_capacity: &super::RequestCapacity,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) =
+            Session::connect_with_capacity(session, None, negotiated, request_capacity).await?;
         Ok((session, subscriber))
     }
 
@@ -423,6 +464,16 @@ impl Subscriber {
         track: serve::TrackWriter,
         options: SubscribeOptions,
     ) -> Result<Subscribe, ServeError> {
+        self.subscribe_open_with_barrier(track, options, false)
+            .await
+    }
+
+    async fn subscribe_open_with_barrier(
+        &mut self,
+        track: serve::TrackWriter,
+        options: SubscribeOptions,
+        joining_fetch: bool,
+    ) -> Result<Subscribe, ServeError> {
         let request_lease = Arc::new(
             self.request_capacity
                 .try_acquire(RequestDirection::Outbound, RequestClass::Subscribe)
@@ -431,8 +482,11 @@ impl Subscriber {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
-        let (mut send, recv) =
+        let (mut send, mut recv) =
             Subscribe::new_with_options(self.clone(), request_id, track, options, request_lease)?;
+        if joining_fetch {
+            recv.begin_joining_fetch()?;
+        }
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if
@@ -508,6 +562,142 @@ impl Subscriber {
         Ok(send)
     }
 
+    /// Subscribe to the live edge and atomically join it to a Relative
+    /// Joining FETCH. Fetched Objects are emitted first, followed by live
+    /// Objects buffered behind the frozen Joining Location.
+    pub async fn subscribe_joining(
+        &mut self,
+        track: serve::TrackWriter,
+    ) -> Result<(Subscribe, Fetch), ServeError> {
+        let options = SubscribeOptions::default()
+            .with_forward(true)
+            .with_filter(message::SubscriptionFilter::largest_object())
+            .with_group_order(message::GroupOrder::Ascending);
+        let subscribe = self
+            .subscribe_open_with_barrier(track, options, true)
+            .await?;
+        let fetch = self.fetch_joining(&subscribe).await?;
+        Ok((subscribe, fetch))
+    }
+
+    /// Start the supported Relative Joining FETCH for an established
+    /// subscription in this same session.
+    pub async fn fetch_joining(&mut self, joining: &Subscribe) -> Result<Fetch, ServeError> {
+        if !self.same_session(joining.subscriber()) {
+            return Err(ServeError::internal_ctx(
+                "Joining FETCH cannot reference a subscription from another session",
+            ));
+        }
+        let joining_request_id = joining.info.id;
+        let joining_location = {
+            let mut subscribes = self
+                .subscribes
+                .lock()
+                .map_err(|_| ServeError::internal_ctx("subscribe registry unavailable"))?;
+            let subscribe = subscribes.get_mut(&joining_request_id).ok_or_else(|| {
+                ServeError::internal_ctx(
+                    "Joining FETCH reference is not active in this Subscriber session",
+                )
+            })?;
+            if !subscribe.has_joining_barrier() {
+                subscribe.begin_joining_fetch()?;
+            }
+            subscribe
+                .joining_location()
+                .ok_or_else(|| ServeError::internal_ctx("subscription has no Joining Location"))?
+        };
+
+        let request_lease = Arc::new(
+            self.request_capacity
+                .try_acquire(RequestDirection::Outbound, RequestClass::Fetch)
+                .map_err(|error| ServeError::internal_ctx(error.to_string()))?,
+        );
+        let request_id = self
+            .get_next_request_id()
+            .map_err(|error| ServeError::internal_ctx(error.to_string()))?;
+        let request = super::fetch::outbound_joining_message(request_id, joining_request_id);
+        let (mut fetch, recv) = Fetch::new(
+            self.clone(),
+            request_id,
+            joining_request_id,
+            joining_location,
+            request_lease,
+        );
+
+        let (send_stream, recv_stream) = self
+            .webtransport
+            .open_bi()
+            .await
+            .map_err(|error| ServeError::internal_ctx(error.to_string()))?;
+        self.fetches
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("FETCH registry unavailable"))?
+            .insert(request_id, recv);
+        let mut writer = Writer::new(send_stream);
+        if let Err(error) = writer.encode(&Message::Fetch(request)).await {
+            let error = ServeError::internal_ctx(error.to_string());
+            self.fail_fetch(request_id, error.clone());
+            return Err(error);
+        }
+        writer.finish();
+        let (response_cancel, mut response_cancelled) = tokio::sync::oneshot::channel();
+        fetch.attach_response_cancel(response_cancel);
+
+        let mut subscriber = self.clone();
+        let response_guard = FetchResponseGuard {
+            subscriber: subscriber.clone(),
+            request_id,
+        };
+        let handle = tokio::spawn(async move {
+            let _response_guard = response_guard;
+            let mut reader = Reader::new(recv_stream);
+            let response = tokio::select! {
+                _ = &mut response_cancelled => {
+                    reader.stop(Session::REQUEST_STREAM_CANCELLED);
+                    return;
+                }
+                response = Session::decode_bidi_response(
+                    &mut reader,
+                    request_id,
+                    super::RequestKind::Fetch,
+                ) => response,
+            };
+            match response {
+                Ok(message) => match TryInto::<message::Publisher>::try_into(message) {
+                    Ok(message) => {
+                        if let Err(error) = subscriber.recv_message(message) {
+                            subscriber.fail_fetch(
+                                request_id,
+                                ServeError::internal_ctx(error.to_string()),
+                            );
+                        }
+                    }
+                    Err(message) => subscriber.fail_fetch(
+                        request_id,
+                        ServeError::internal_ctx(format!(
+                            "unexpected {} on FETCH response stream",
+                            message.name()
+                        )),
+                    ),
+                },
+                Err(error) => subscriber.fail_fetch(
+                    request_id,
+                    ServeError::internal_ctx(format!("FETCH response failed: {error}")),
+                ),
+            }
+        });
+        if let Err(error) = self.bidi_task_tx.send(handle) {
+            error.abort_and_wait().await;
+            self.cancel_fetch(request_id, ServeError::Cancel);
+            return Err(ServeError::internal_ctx(
+                "session request task collector closed",
+            ));
+        }
+
+        fetch.ok().await?;
+        Ok(fetch)
+    }
+
     /// Enqueue a response for routing to its owning request stream.
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
@@ -554,14 +744,7 @@ impl Subscriber {
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
-            // FETCH_OK is part of draft-16, but FETCH is not implemented here yet.
-            message::Publisher::FetchOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received FETCH_OK for unsupported FETCH — ignoring"
-                );
-            }
+            message::Publisher::FetchOk(msg) => self.recv_fetch_ok(msg)?,
         }
 
         Ok(())
@@ -682,6 +865,21 @@ impl Subscriber {
         Ok(())
     }
 
+    fn recv_fetch_ok(&mut self, msg: &message::FetchOk) -> Result<(), SessionError> {
+        let complete = {
+            let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+            let Some(fetch) = fetches.get_mut(&msg.id) else {
+                return Ok(());
+            };
+            fetch.recv_ok(msg)?;
+            fetch.is_complete()
+        };
+        if complete {
+            self.remove_fetch(msg.id);
+        }
+        Ok(())
+    }
+
     /// Remove a subscribe from our map of active subscribes, and the alias map if present.
     pub(super) fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
         let subscribe = self.subscribes.lock().ok().and_then(|mut s| s.remove(&id));
@@ -697,6 +895,60 @@ impl Subscriber {
     fn cleanup_outbound_subscribe(&mut self, id: u64) {
         if let Some(subscribe) = self.remove_subscribe(id) {
             let _ = subscribe.error(ServeError::Cancel);
+        }
+    }
+
+    fn remove_fetch(&mut self, id: u64) -> Option<FetchRecv> {
+        let fetch = self.fetches.lock().ok()?.remove(&id);
+        if let Some(fetch) = &fetch {
+            fetch.release_request_lease();
+        }
+        fetch
+    }
+
+    pub(super) fn fail_fetch(&mut self, id: u64, error: ServeError) {
+        let joining_request_id = self
+            .fetches
+            .lock()
+            .ok()
+            .and_then(|fetches| fetches.get(&id).map(|fetch| fetch.joining_request_id));
+        let abort_failed = joining_request_id.is_some_and(|joining_request_id| {
+            self.subscribes
+                .lock()
+                .ok()
+                .and_then(|mut subscribes| {
+                    subscribes
+                        .get_mut(&joining_request_id)
+                        .map(SubscribeRecv::abort_joining_fetch)
+                })
+                .is_some_and(|result| result.is_err())
+        });
+        if abort_failed {
+            if let Some(subscribe) = joining_request_id.and_then(|id| self.remove_subscribe(id)) {
+                let _ = subscribe.error(error.clone());
+            }
+        }
+        if let Some(mut fetch) = self.remove_fetch(id) {
+            fetch.fail(error);
+        }
+    }
+
+    pub(super) fn cancel_fetch(&mut self, id: u64, error: ServeError) {
+        self.cancel_request_stream(id, Session::REQUEST_STREAM_CANCELLED);
+        self.fail_fetch(id, error);
+    }
+
+    fn fetch_response_stream_closed(&mut self, id: u64) {
+        let response_received = self
+            .fetches
+            .lock()
+            .ok()
+            .and_then(|fetches| fetches.get(&id).map(FetchRecv::response_received));
+        if response_received == Some(false) {
+            self.fail_fetch(
+                id,
+                ServeError::internal_ctx("FETCH response stream closed before a response"),
+            );
         }
     }
 
@@ -844,6 +1096,16 @@ impl Subscriber {
     /// exists, otherwise logs and ignores.  Full per-flow routing is
     /// wired up (TODO itzmanish).
     fn recv_request_error(&mut self, msg: &message::RequestError) -> Result<(), SessionError> {
+        if self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .contains_key(&msg.id)
+        {
+            self.log_request_error_parsed("fetch", msg);
+            self.fail_fetch(msg.id, Self::request_error_to_serve_error(msg));
+            return Ok(());
+        }
         // Route to a matching subscribe if present.
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             self.log_request_error_parsed("subscribe", msg);
@@ -1078,7 +1340,13 @@ impl Subscriber {
             stream_header.header_type
         );
 
-        // No fetch support yet
+        if stream_header.header_type.is_fetch() {
+            let fetch_header = stream_header.fetch_header.ok_or_else(|| {
+                SessionError::ProtocolViolation("FETCH stream omitted its header".to_string())
+            })?;
+            return self.recv_fetch_stream(reader, fetch_header).await;
+        }
+
         if !stream_header.header_type.is_subgroup() {
             return Err(SessionError::unimplemented("non-SUBGROUP stream types"));
         }
@@ -1134,6 +1402,162 @@ impl Subscriber {
         }
 
         res
+    }
+
+    async fn recv_fetch_stream(
+        &mut self,
+        mut reader: Reader,
+        header: data::FetchHeader,
+    ) -> Result<(), SessionError> {
+        let request_id = header.request_id;
+        {
+            let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+            let fetch = fetches.get_mut(&request_id).ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "FETCH data stream references inactive request {request_id}"
+                ))
+            })?;
+            fetch.start_data()?;
+        }
+
+        let result = async {
+            let mut decoder = data::FetchObjectDecoder::new(message::GroupOrder::Ascending)?;
+            loop {
+                let Some(item) = reader.decode_with(|cursor| decoder.decode(cursor)).await? else {
+                    break;
+                };
+                let data::FetchItem::Object(object) = item else {
+                    return Err(SessionError::unimplemented(
+                        "FETCH non-existent/unknown range markers",
+                    ));
+                };
+                let subgroup_id = match object.forwarding_preference {
+                    data::FetchForwardingPreference::Subgroup(id) => id,
+                    data::FetchForwardingPreference::Datagram => {
+                        return Err(SessionError::unimplemented(
+                            "datagram forwarding preference on Joining FETCH",
+                        ));
+                    }
+                };
+                if object.payload_length > serve::RetentionLimits::default().max_object_bytes {
+                    return Err(SessionError::Serve(ServeError::internal_ctx(
+                        "FETCH Object exceeds the bounded receive limit",
+                    )));
+                }
+                let mut payload = bytes::BytesMut::with_capacity(object.payload_length);
+                while payload.len() < object.payload_length {
+                    let remaining = object.payload_length - payload.len();
+                    let chunk = reader.read_chunk(remaining).await?.ok_or_else(|| {
+                        SessionError::ProtocolViolation(
+                            "FETCH stream ended inside an Object payload".to_string(),
+                        )
+                    })?;
+                    payload.extend_from_slice(&chunk);
+                }
+                let fetched = FetchedObject {
+                    location: object.location(),
+                    subgroup_id,
+                    publisher_priority: object.publisher_priority,
+                    properties: object.properties,
+                    payload: payload.freeze(),
+                };
+                self.recv_fetch_object(request_id, fetched)?;
+            }
+            self.finish_fetch_data(request_id)
+        }
+        .await;
+
+        if let Err(error) = &result {
+            self.fail_fetch(request_id, ServeError::internal_ctx(error.to_string()));
+        }
+        result
+    }
+
+    fn recv_fetch_object(
+        &mut self,
+        request_id: u64,
+        object: FetchedObject,
+    ) -> Result<(), SessionError> {
+        let joining_request_id = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&request_id)
+            .ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "FETCH Object references inactive request {request_id}"
+                ))
+            })?
+            .joining_request_id;
+        // Validate ordering/range and reserve bounded observation capacity
+        // before mutating the application-visible handoff track.
+        self.fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&request_id)
+            .ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "FETCH Object references inactive request {request_id}"
+                ))
+            })?
+            .recv_object(object.clone())?;
+        self.subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&joining_request_id)
+            .ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "Joining FETCH references inactive subscription {joining_request_id}"
+                ))
+            })?
+            .recv_fetched_object(BufferedJoinObject {
+                location: object.location,
+                subgroup_id: object.subgroup_id,
+                publisher_priority: object.publisher_priority,
+                properties: object.properties.clone(),
+                payload: object.payload.clone(),
+                first_object: object.location.object_id == 0,
+                end_of_group: false,
+            })?;
+        Ok(())
+    }
+
+    fn finish_fetch_data(&mut self, request_id: u64) -> Result<(), SessionError> {
+        let joining_request_id = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&request_id)
+            .ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "FETCH FIN references inactive request {request_id}"
+                ))
+            })?
+            .joining_request_id;
+        self.subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&joining_request_id)
+            .ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "Joining FETCH references inactive subscription {joining_request_id}"
+                ))
+            })?
+            .finish_joining_fetch()?;
+        let complete = {
+            let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+            let fetch = fetches.get_mut(&request_id).ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "FETCH FIN references inactive request {request_id}"
+                ))
+            })?;
+            fetch.finish_data()?;
+            fetch.is_complete()
+        };
+        if complete {
+            self.remove_fetch(request_id);
+        }
+        Ok(())
     }
 
     /// Continue handling the reception of a new stream from the QUIC session.
@@ -1269,6 +1693,39 @@ impl Subscriber {
         }
     }
 
+    fn binding_has_joining_barrier(&self, binding: AliasBinding) -> Result<bool, SessionError> {
+        match binding {
+            AliasBinding::Subscribe(id) => Ok(self
+                .subscribes
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .get(&id)
+                .is_some_and(SubscribeRecv::has_joining_barrier)),
+            AliasBinding::Publish(_) => Ok(false),
+        }
+    }
+
+    fn binding_recv_joining_live_object(
+        &mut self,
+        binding: AliasBinding,
+        object: BufferedJoinObject,
+    ) -> Result<(), SessionError> {
+        let AliasBinding::Subscribe(id) = binding else {
+            return Err(SessionError::Internal);
+        };
+        self.subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&id)
+            .ok_or_else(|| {
+                SessionError::Serve(ServeError::not_found_ctx(format!(
+                    "subscription {id} closed during Joining FETCH handoff"
+                )))
+            })?
+            .recv_joining_live_object(object)?;
+        Ok(())
+    }
+
     /// If new stream is a Subgroup stream, handle reception of subgroup objects and payloads.
     async fn recv_subgroup(
         &mut self,
@@ -1399,6 +1856,7 @@ impl Subscriber {
             }
 
             let mut claimed_bindings = Vec::new();
+            let mut barrier_bindings = Vec::new();
             for binding in bindings {
                 if !self.binding_claims_object(
                     *binding,
@@ -1408,6 +1866,10 @@ impl Subscriber {
                     continue;
                 }
                 claimed_bindings.push(*binding);
+                if self.binding_has_joining_barrier(*binding)? {
+                    barrier_bindings.push(*binding);
+                    continue;
+                }
                 if subgroup_writers
                     .iter()
                     .any(|(existing, _)| existing == binding)
@@ -1485,7 +1947,19 @@ impl Subscriber {
                 remaining_bytes
             );
 
+            if !barrier_bindings.is_empty()
+                && remaining_bytes > serve::RetentionLimits::default().max_object_bytes
+            {
+                for binding in barrier_bindings.drain(..) {
+                    self.fail_alias_binding(
+                        binding,
+                        ServeError::Closed(message::RequestErrorCode::ExcessiveLoad as u64),
+                    );
+                }
+            }
             let mut chunks_read = 0;
+            let mut joining_payload = (!barrier_bindings.is_empty())
+                .then(|| bytes::BytesMut::with_capacity(remaining_bytes));
             while remaining_bytes > 0 {
                 let data = reader
                     .read_chunk(remaining_bytes)
@@ -1506,6 +1980,9 @@ impl Subscriber {
                     remaining_bytes - data.len()
                 );
                 remaining_bytes -= data.len();
+                if let Some(payload) = joining_payload.as_mut() {
+                    payload.extend_from_slice(&data);
+                }
                 let mut failed_bindings = Vec::new();
                 for (binding, object_writer) in &mut object_writers {
                     if let Err(err) = object_writer.write(data.clone()) {
@@ -1518,6 +1995,35 @@ impl Subscriber {
                     self.fail_alias_binding(binding, err);
                 }
                 chunks_read += 1;
+            }
+
+            if let Some(payload) = joining_payload {
+                let payload = payload.freeze();
+                let mut failed_bindings = Vec::new();
+                for binding in barrier_bindings {
+                    let object = BufferedJoinObject {
+                        location: crate::coding::Location::new(
+                            subgroup_header.group_id,
+                            current_object_id,
+                        ),
+                        subgroup_id: subgroup_header.subgroup_id.unwrap_or(0),
+                        publisher_priority: subgroup_header.publisher_priority,
+                        properties: extension_headers.clone().unwrap_or_default(),
+                        payload: payload.clone(),
+                        first_object: stream_header_type.is_first_object(),
+                        end_of_group: stream_header_type.contains_end_of_group(),
+                    };
+                    if let Err(error) = self.binding_recv_joining_live_object(binding, object) {
+                        failed_bindings.push((binding, error));
+                    }
+                }
+                for (binding, error) in failed_bindings {
+                    let serve_error = match error {
+                        SessionError::Serve(error) => error,
+                        other => ServeError::internal_ctx(other.to_string()),
+                    };
+                    self.fail_alias_binding(binding, serve_error);
+                }
             }
 
             tracing::trace!(

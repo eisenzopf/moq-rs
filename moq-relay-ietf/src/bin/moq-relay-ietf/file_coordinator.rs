@@ -11,55 +11,257 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
+#[cfg(test)]
+use std::sync::{Barrier, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fs2::FileExt;
 use moq_native_ietf::quic::Client;
-use moq_transport::coding::TrackNamespace;
+use moq_transport::coding::{TrackNamespace, TupleField};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorError, CoordinatorResult, NamespaceOrigin, NamespaceRegistration,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileCoordinatorLimits {
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for FileCoordinatorLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+            max_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl FileCoordinatorLimits {
+    fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            self.max_entries > 0,
+            "file coordinator entry limit must be positive"
+        );
+        anyhow::ensure!(
+            self.max_bytes > 0,
+            "file coordinator byte limit must be positive"
+        );
+        Ok(self)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("file coordinator capacity exhausted for {resource}")]
+struct FileCoordinatorCapacityError {
+    resource: &'static str,
+}
+
+const COORDINATOR_DATA_VERSION: u8 = 1;
+const NAMESPACE_KEY_PREFIX: &str = "v1:";
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Data stored in the shared file
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CoordinatorData {
+    #[serde(default)]
+    version: u8,
     /// Maps connection scope to namespace map
     namespaces: HashMap<String, HashMap<String, String>>,
 }
 
-impl CoordinatorData {
-    fn scope_key(scope: Option<&str>) -> String {
-        scope.unwrap_or("").to_string()
-    }
-
-    fn namespace_key(namespace: &TrackNamespace) -> String {
-        namespace.to_utf8_path()
+impl Default for CoordinatorData {
+    fn default() -> Self {
+        Self {
+            version: COORDINATOR_DATA_VERSION,
+            namespaces: HashMap::new(),
+        }
     }
 }
 
-/// Handle that unregisters a namespace when dropped
-struct NamespaceUnregisterHandle {
+impl CoordinatorData {
+    fn scope_key(scope: Option<&str>) -> String {
+        match scope {
+            Some(scope) => format!("s:{}", hex::encode(scope.as_bytes())),
+            None => "u".to_string(),
+        }
+    }
+
+    fn namespace_key(namespace: &TrackNamespace) -> String {
+        let fields = namespace
+            .fields
+            .iter()
+            .map(|field| hex::encode(&field.value))
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("{NAMESPACE_KEY_PREFIX}{fields}")
+    }
+
+    fn namespace_from_key(key: &str) -> Result<TrackNamespace> {
+        let encoded = key
+            .strip_prefix(NAMESPACE_KEY_PREFIX)
+            .context("unsupported coordinator namespace key version")?;
+        let fields = encoded
+            .split('.')
+            .map(|field| {
+                Ok(TupleField {
+                    value: hex::decode(field).context("invalid coordinator namespace key")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        TrackNamespace::try_from(fields).context("invalid coordinator namespace")
+    }
+
+    fn migrate_and_validate(&mut self) -> Result<()> {
+        match self.version {
+            COORDINATOR_DATA_VERSION => {
+                for (scope, bucket) in &self.namespaces {
+                    if scope != "u" {
+                        let encoded = scope
+                            .strip_prefix("s:")
+                            .context("invalid coordinator scope key")?;
+                        hex::decode(encoded).context("invalid coordinator scope key")?;
+                    }
+                    for key in bucket.keys() {
+                        Self::namespace_from_key(key)?;
+                    }
+                }
+            }
+            0 => {
+                let legacy_scopes = std::mem::take(&mut self.namespaces);
+                for (scope, legacy) in legacy_scopes {
+                    let scope = if scope.is_empty() {
+                        Self::scope_key(None)
+                    } else {
+                        Self::scope_key(Some(&scope))
+                    };
+                    let bucket = self.namespaces.entry(scope).or_default();
+                    for (key, url) in legacy {
+                        let namespace = TrackNamespace::try_from(key.as_str())
+                            .context("invalid legacy coordinator namespace")?;
+                        let key = Self::namespace_key(&namespace);
+                        anyhow::ensure!(
+                            bucket.insert(key, url).is_none(),
+                            "legacy coordinator namespace migration collision"
+                        );
+                    }
+                }
+                self.version = COORDINATOR_DATA_VERSION;
+            }
+            version => anyhow::bail!("unsupported coordinator data version {version}"),
+        }
+        Ok(())
+    }
+
+    fn entry_count(&self) -> usize {
+        self.namespaces
+            .values()
+            .map(HashMap::len)
+            .fold(0usize, usize::saturating_add)
+    }
+}
+
+struct FileCleanupRequest {
     scope_key: String,
     namespace_key: String,
-    file_path: PathBuf,
+    _capacity: OwnedSemaphorePermit,
+}
+
+struct FileCleanupWorker {
+    sender: mpsc::SyncSender<FileCleanupRequest>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl FileCleanupWorker {
+    fn new(file_path: PathBuf, limits: FileCoordinatorLimits) -> Result<Arc<Self>> {
+        let (sender, receiver) = mpsc::sync_channel::<FileCleanupRequest>(limits.max_entries);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let worker_notify = notify.clone();
+        std::thread::Builder::new()
+            .name("moq-file-coordinator-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    if let Err(error) = unregister_namespace_sync(
+                        &file_path,
+                        &request.scope_key,
+                        &request.namespace_key,
+                        limits,
+                    ) {
+                        tracing::warn!(%error, "file coordinator cleanup failed");
+                    }
+                    drop(request);
+                    worker_notify.notify_one();
+                }
+            })?;
+        Ok(Arc::new(Self { sender, notify }))
+    }
+
+    fn enqueue(&self, request: FileCleanupRequest) {
+        if let Err(error) = self.sender.try_send(request) {
+            metrics::counter!(
+                "moq_relay_coordinator_capacity_rejections_total",
+                "kind" => "file_cleanup_queue"
+            )
+            .increment(1);
+            tracing::error!(%error, "bounded file coordinator cleanup queue invariant violated");
+        }
+    }
+}
+
+/// Handle that asynchronously unregisters a namespace when dropped.
+struct NamespaceUnregisterHandle {
+    request: Option<FileCleanupRequest>,
+    worker: Arc<FileCleanupWorker>,
 }
 
 impl Drop for NamespaceUnregisterHandle {
     fn drop(&mut self) {
-        if let Err(err) =
-            unregister_namespace_sync(&self.file_path, &self.scope_key, &self.namespace_key)
-        {
-            tracing::warn!(namespace = %self.namespace_key, error = %err, "failed to unregister namespace on drop: {}", err);
+        if let Some(request) = self.request.take() {
+            self.worker.enqueue(request);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RegistrationCommitHook {
+    barriers: Arc<Mutex<Option<RegistrationBarriers>>>,
+}
+
+#[cfg(test)]
+type RegistrationBarriers = (Arc<Barrier>, Arc<Barrier>);
+
+#[cfg(test)]
+impl RegistrationCommitHook {
+    fn new(committed: Arc<Barrier>, release: Arc<Barrier>) -> Self {
+        Self {
+            barriers: Arc::new(Mutex::new(Some((committed, release)))),
+        }
+    }
+
+    fn after_commit(&self) {
+        let barriers = self.barriers.lock().unwrap().take();
+        if let Some((committed, release)) = barriers {
+            committed.wait();
+            release.wait();
         }
     }
 }
 
 /// Synchronous helper for unregistering namespace (used in Drop)
-fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &str) -> Result<()> {
+fn unregister_namespace_sync(
+    file_path: &Path,
+    scope_key: &str,
+    namespace_key: &str,
+    limits: FileCoordinatorLimits,
+) -> Result<()> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -69,8 +271,8 @@ fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &
 
     file.lock_exclusive()?;
 
-    let mut data = read_data(&file)?;
-    tracing::debug!(namespace = %namespace_key, scope = %scope_key, "unregistering namespace: {}", namespace_key);
+    let mut data = read_data(&file, limits)?;
+    tracing::debug!("unregistering namespace from file coordinator");
     if let Some(bucket) = data.namespaces.get_mut(scope_key) {
         bucket.remove(namespace_key);
         if bucket.is_empty() {
@@ -78,37 +280,66 @@ fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &
         }
     }
 
-    write_data(&file, &data)?;
+    write_data(&file, &data, limits)?;
     file.unlock()?;
 
     Ok(())
 }
 
 /// Read coordinator data from file
-fn read_data(file: &File) -> Result<CoordinatorData> {
+fn read_data(file: &File, limits: FileCoordinatorLimits) -> Result<CoordinatorData> {
     let mut file = file;
     file.seek(SeekFrom::Start(0))?;
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    anyhow::ensure!(
+        file.metadata()?.len() <= limits.max_bytes as u64,
+        "coordinator file exceeds configured byte limit"
+    );
+
+    let read_limit = u64::try_from(limits.max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut contents = Vec::with_capacity(limits.max_bytes.min(64 * 1024));
+    file.take(read_limit).read_to_end(&mut contents)?;
+    anyhow::ensure!(
+        contents.len() <= limits.max_bytes,
+        "coordinator file exceeds configured byte limit"
+    );
 
     if contents.is_empty() {
         return Ok(CoordinatorData::default());
     }
 
-    let data: CoordinatorData =
-        serde_json::from_str(&contents).context("failed to parse coordinator data")?;
+    let mut data: CoordinatorData =
+        serde_json::from_slice(&contents).context("failed to parse coordinator data")?;
+    data.migrate_and_validate()?;
+    anyhow::ensure!(
+        data.entry_count() <= limits.max_entries,
+        "coordinator file exceeds configured entry limit"
+    );
     Ok(data)
 }
 
 /// Write coordinator data to file
-fn write_data(file: &File, data: &CoordinatorData) -> Result<()> {
+fn write_data(file: &File, data: &CoordinatorData, limits: FileCoordinatorLimits) -> Result<()> {
+    anyhow::ensure!(
+        data.version == COORDINATOR_DATA_VERSION,
+        "coordinator data must be migrated before writing"
+    );
+    anyhow::ensure!(
+        data.entry_count() <= limits.max_entries,
+        "coordinator file exceeds configured entry limit"
+    );
+    let json = serde_json::to_vec_pretty(data)?;
+    anyhow::ensure!(
+        json.len() <= limits.max_bytes,
+        "coordinator file exceeds configured byte limit"
+    );
+
     let mut file = file;
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
-
-    let json = serde_json::to_string_pretty(data)?;
-    file.write_all(json.as_bytes())?;
+    file.write_all(&json)?;
     file.flush()?;
 
     Ok(())
@@ -123,19 +354,36 @@ pub struct FileCoordinator {
     file_path: PathBuf,
     /// URL of this relay (used when registering namespaces)
     relay_url: Url,
+    limits: FileCoordinatorLimits,
+    cleanup_capacity: Arc<Semaphore>,
+    cleanup_worker: Arc<FileCleanupWorker>,
+    #[cfg(test)]
+    registration_commit_hook: Option<RegistrationCommitHook>,
 }
 
 impl FileCoordinator {
-    /// Create a new file-based coordinator.
-    ///
-    /// # Arguments
-    /// * `file_path` - Path to the shared coordination file
-    /// * `relay_url` - URL of this relay instance (advertised to other relays)
-    pub fn new(file_path: impl AsRef<Path>, relay_url: Url) -> Self {
-        Self {
-            file_path: file_path.as_ref().to_path_buf(),
+    pub fn with_limits(
+        file_path: impl AsRef<Path>,
+        relay_url: Url,
+        limits: FileCoordinatorLimits,
+    ) -> Result<Self> {
+        let file_path = file_path.as_ref().to_path_buf();
+        let limits = limits.validate()?;
+        Ok(Self {
+            cleanup_worker: FileCleanupWorker::new(file_path.clone(), limits)?,
+            cleanup_capacity: Arc::new(Semaphore::new(limits.max_entries)),
+            file_path,
             relay_url,
-        }
+            limits,
+            #[cfg(test)]
+            registration_commit_hook: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_registration_commit_hook(mut self, hook: RegistrationCommitHook) -> Self {
+        self.registration_commit_hook = Some(hook);
+        self
     }
 }
 
@@ -146,15 +394,26 @@ impl Coordinator for FileCoordinator {
         scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<NamespaceRegistration> {
+        let cleanup_permit = self
+            .cleanup_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::CapacityExhausted {
+                resource: "file_registration_handles",
+            })?;
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
         let relay_url = self.relay_url.clone();
         let file_path = self.file_path.clone();
+        let limits = self.limits;
+        let cleanup_worker = self.cleanup_worker.clone();
+        #[cfg(test)]
+        let registration_commit_hook = self.registration_commit_hook.clone();
 
-        // Run blocking file I/O in a separate thread
-        let scope_clone = scope_key.clone();
-        let key_clone = namespace_key.clone();
-        tokio::task::spawn_blocking(move || {
+        // Move cleanup ownership into the blocking transaction. If this async
+        // request is cancelled after the file commit, the detached blocking
+        // task's output is dropped and queues bounded cleanup automatically.
+        let result = tokio::task::spawn_blocking(move || {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -164,25 +423,60 @@ impl Coordinator for FileCoordinator {
 
             file.lock_exclusive()?;
 
-            let mut data = read_data(&file)?;
-            tracing::info!(namespace = %key_clone, scope = %scope_clone, relay_url = %moq_relay_ietf::redact_url_for_logging(&relay_url), "registering namespace");
+            let mut data = read_data(&file, limits)?;
+            tracing::info!(relay_url = %moq_relay_ietf::redact_url_for_logging(&relay_url), "registering namespace in file coordinator");
+            let already_registered = data
+                .namespaces
+                .get(&scope_key)
+                .is_some_and(|bucket| bucket.contains_key(&namespace_key));
+            if !already_registered && data.entry_count() >= limits.max_entries {
+                return Err(anyhow::Error::new(FileCoordinatorCapacityError {
+                    resource: "file_entries",
+                }));
+            }
             data
                 .namespaces
-                .entry(scope_clone)
+                .entry(scope_key.clone())
                 .or_default()
-                .insert(key_clone, relay_url.to_string());
+                .insert(namespace_key.clone(), relay_url.to_string());
 
-            write_data(&file, &data)?;
+            let serialized = serde_json::to_vec_pretty(&data)?;
+            if serialized.len() > limits.max_bytes {
+                return Err(anyhow::Error::new(FileCoordinatorCapacityError {
+                    resource: "file_bytes",
+                }));
+            }
+            write_data(&file, &data, limits)?;
+
+            let handle = NamespaceUnregisterHandle {
+                request: Some(FileCleanupRequest {
+                    scope_key,
+                    namespace_key,
+                    _capacity: cleanup_permit,
+                }),
+                worker: cleanup_worker,
+            };
+
             file.unlock()?;
 
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
+            #[cfg(test)]
+            if let Some(hook) = registration_commit_hook {
+                hook.after_commit();
+            }
 
-        let handle = NamespaceUnregisterHandle {
-            scope_key,
-            namespace_key,
-            file_path: self.file_path.clone(),
+            Ok::<_, anyhow::Error>(handle)
+        })
+        .await?;
+        let handle = match result {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(capacity) = error.downcast_ref::<FileCoordinatorCapacityError>() {
+                    return Err(CoordinatorError::CapacityExhausted {
+                        resource: capacity.resource,
+                    });
+                }
+                return Err(CoordinatorError::Other(error));
+            }
         };
 
         Ok(NamespaceRegistration::new(handle))
@@ -198,9 +492,10 @@ impl Coordinator for FileCoordinator {
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
         let file_path = self.file_path.clone();
+        let limits = self.limits;
 
         tokio::task::spawn_blocking(move || {
-            unregister_namespace_sync(&file_path, &scope_key, &namespace_key)
+            unregister_namespace_sync(&file_path, &scope_key, &namespace_key, limits)
         })
         .await??;
 
@@ -216,6 +511,7 @@ impl Coordinator for FileCoordinator {
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(&namespace);
         let file_path = self.file_path.clone();
+        let limits = self.limits;
 
         let result = tokio::task::spawn_blocking(
             move || -> Result<Option<(NamespaceOrigin, Option<Client>)>> {
@@ -228,8 +524,8 @@ impl Coordinator for FileCoordinator {
 
                 file.lock_shared()?;
 
-                let data = read_data(&file)?;
-                tracing::debug!(namespace = %namespace_key, scope = %scope_key, "looking up namespace: {}", namespace_key);
+                let data = read_data(&file, limits)?;
+                tracing::debug!("looking up namespace in file coordinator");
 
                 let Some(bucket) = data.namespaces.get(&scope_key) else {
                     file.unlock()?;
@@ -244,20 +540,23 @@ impl Coordinator for FileCoordinator {
                 }
 
                 // Try prefix matching (find longest matching prefix)
-                let mut best_match: Option<(String, String)> = None;
+                let mut best_match: Option<(TrackNamespace, String)> = None;
                 for (registered_key, url) in bucket {
-                    // FIXME(itzmanish): it would be much better to compare on TupleField
-                    // instead of working on strings
-                    let is_prefix = registered_key
-                        .split('/')
-                        .zip(namespace_key.split('/'))
-                        .all(|(a, b)| a == b);
-                    match best_match {
-                        Some((ns, _)) if is_prefix && ns.len() < registered_key.len() => {
-                            best_match = Some((registered_key.clone(), url.clone()));
+                    let registered = CoordinatorData::namespace_from_key(registered_key)?;
+                    let is_prefix = registered.fields.len() <= namespace.fields.len()
+                        && registered
+                            .fields
+                            .iter()
+                            .zip(&namespace.fields)
+                            .all(|(registered, requested)| registered == requested);
+                    match &best_match {
+                        Some((best, _))
+                            if is_prefix && best.fields.len() < registered.fields.len() =>
+                        {
+                            best_match = Some((registered, url.clone()));
                         }
                         None if is_prefix => {
-                            best_match = Some((registered_key.clone(), url.clone()));
+                            best_match = Some((registered, url.clone()));
                         }
                         _ => {}
                     }
@@ -265,8 +564,7 @@ impl Coordinator for FileCoordinator {
 
                 file.unlock()?;
 
-                if let Some((matched_key, relay_url)) = best_match {
-                    let matched_ns = TrackNamespace::from_utf8_path(&matched_key);
+                if let Some((matched_ns, relay_url)) = best_match {
                     let url = Url::parse(&relay_url)?;
                     return Ok(Some((NamespaceOrigin::new(matched_ns, url, None), None)));
                 }
@@ -280,7 +578,321 @@ impl Coordinator for FileCoordinator {
     }
 
     async fn shutdown(&self) -> CoordinatorResult<()> {
-        // Nothing to clean up - file will be unlocked automatically
+        let wait = async {
+            while self.cleanup_capacity.available_permits() < self.limits.max_entries {
+                self.cleanup_worker.notify.notified().await;
+            }
+        };
+        tokio::time::timeout(CLEANUP_TIMEOUT, wait)
+            .await
+            .context("timed out waiting for file coordinator cleanup")
+            .map_err(CoordinatorError::Other)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn namespace(fields: &[&[u8]]) -> TrackNamespace {
+        TrackNamespace::try_from(
+            fields
+                .iter()
+                .map(|value| TupleField {
+                    value: value.to_vec(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn relay_url() -> Url {
+        Url::parse("https://relay.example.com").unwrap()
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let limits = FileCoordinatorLimits {
+            max_entries: 0,
+            max_bytes: 1,
+        };
+        assert!(FileCoordinator::with_limits(
+            directory.path().join("coordinator.json"),
+            relay_url(),
+            limits
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn entry_capacity_is_fail_fast_and_released_by_registration_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = FileCoordinator::with_limits(
+            directory.path().join("coordinator.json"),
+            relay_url(),
+            FileCoordinatorLimits {
+                max_entries: 1,
+                max_bytes: 4_096,
+            },
+        )
+        .unwrap();
+        let first_namespace = TrackNamespace::from_utf8_path("first");
+        let second_namespace = TrackNamespace::from_utf8_path("second");
+
+        let registration = coordinator
+            .register_namespace(Some("tenant-a"), &first_namespace)
+            .await
+            .unwrap();
+        let error = coordinator
+            .register_namespace(Some("tenant-b"), &second_namespace)
+            .await
+            .err()
+            .expect("N+1 file entry must be rejected");
+        assert!(matches!(
+            error,
+            CoordinatorError::CapacityExhausted {
+                resource: "file_registration_handles"
+            }
+        ));
+
+        drop(registration);
+        coordinator.shutdown().await.unwrap();
+        coordinator
+            .register_namespace(Some("tenant-b"), &second_namespace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_registration_after_commit_cleans_route_and_releases_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.json");
+        let committed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let coordinator = Arc::new(
+            FileCoordinator::with_limits(
+                &path,
+                relay_url(),
+                FileCoordinatorLimits {
+                    max_entries: 1,
+                    max_bytes: 4_096,
+                },
+            )
+            .unwrap()
+            .with_registration_commit_hook(RegistrationCommitHook::new(
+                committed.clone(),
+                release.clone(),
+            )),
+        );
+        let registered = TrackNamespace::from_utf8_path("cancelled");
+        let task_coordinator = coordinator.clone();
+        let task_namespace = registered.clone();
+
+        let registration = tokio::spawn(async move {
+            task_coordinator
+                .register_namespace(Some("tenant-a"), &task_namespace)
+                .await
+        });
+
+        // The blocking transaction has committed and owns the cleanup guard,
+        // but has not yet returned it to the cancelled async caller.
+        tokio::task::spawn_blocking(move || committed.wait())
+            .await
+            .unwrap();
+        registration.abort();
+        assert!(matches!(
+            registration.await,
+            Err(error) if error.is_cancelled()
+        ));
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        coordinator.shutdown().await.unwrap();
+        assert!(matches!(
+            coordinator.lookup(Some("tenant-a"), &registered).await,
+            Err(CoordinatorError::NamespaceNotFound)
+        ));
+        assert_eq!(coordinator.cleanup_capacity.available_permits(), 1);
+
+        // Both persistent-file capacity and the cleanup-handle permit are
+        // immediately reusable for the same route after cleanup completes.
+        let replacement_registration = coordinator
+            .register_namespace(Some("tenant-a"), &registered)
+            .await
+            .unwrap();
+        coordinator
+            .lookup(Some("tenant-a"), &registered)
+            .await
+            .unwrap();
+        drop(replacement_registration);
+        coordinator.shutdown().await.unwrap();
+        assert_eq!(coordinator.cleanup_capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_capacity_rejects_before_truncating_existing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.json");
+        let coordinator = FileCoordinator::with_limits(
+            &path,
+            relay_url(),
+            FileCoordinatorLimits {
+                max_entries: 4,
+                max_bytes: 128,
+            },
+        )
+        .unwrap();
+        let small = TrackNamespace::from_utf8_path("small");
+        let small_registration = coordinator.register_namespace(None, &small).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let oversized = TrackNamespace::from_utf8_path(&"x".repeat(256));
+
+        let error = coordinator
+            .register_namespace(None, &oversized)
+            .await
+            .err()
+            .expect("oversized file entry must be rejected");
+        assert!(matches!(
+            error,
+            CoordinatorError::CapacityExhausted {
+                resource: "file_bytes"
+            }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        coordinator.lookup(None, &small).await.unwrap();
+        drop(small_registration);
+        coordinator.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_existing_file_is_rejected_without_unbounded_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.json");
+        std::fs::write(&path, vec![b'x'; 65]).unwrap();
+        let coordinator = FileCoordinator::with_limits(
+            path,
+            relay_url(),
+            FileCoordinatorLimits {
+                max_entries: 4,
+                max_bytes: 64,
+            },
+        )
+        .unwrap();
+        let namespace = TrackNamespace::from_utf8_path("track");
+        assert!(coordinator.lookup(None, &namespace).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn binary_tuple_keys_and_prefixes_are_collision_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.json");
+        let limits = FileCoordinatorLimits {
+            max_entries: 8,
+            max_bytes: 8_192,
+        };
+        let slash_field = namespace(&[b"a/b"]);
+        let split_fields = namespace(&[b"a", b"b"]);
+        let binary_prefix = namespace(&[&[0xff, 0x00]]);
+        let binary_child = namespace(&[&[0xff, 0x00], b"child"]);
+        let first =
+            FileCoordinator::with_limits(&path, Url::parse("https://one.example").unwrap(), limits)
+                .unwrap();
+        let second =
+            FileCoordinator::with_limits(&path, Url::parse("https://two.example").unwrap(), limits)
+                .unwrap();
+
+        let slash_registration = first
+            .register_namespace(Some("/tenant?token=secret"), &slash_field)
+            .await
+            .unwrap();
+        let split_registration = second
+            .register_namespace(Some("/tenant?token=secret"), &split_fields)
+            .await
+            .unwrap();
+        let prefix_registration = first
+            .register_namespace(Some("/tenant?token=secret"), &binary_prefix)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first
+                .lookup(Some("/tenant?token=secret"), &slash_field)
+                .await
+                .unwrap()
+                .0
+                .url(),
+            Url::parse("https://one.example").unwrap()
+        );
+        assert_eq!(
+            first
+                .lookup(Some("/tenant?token=secret"), &split_fields)
+                .await
+                .unwrap()
+                .0
+                .url(),
+            Url::parse("https://two.example").unwrap()
+        );
+        assert_eq!(
+            first
+                .lookup(Some("/tenant?token=secret"), &binary_child)
+                .await
+                .unwrap()
+                .0
+                .namespace(),
+            &binary_prefix
+        );
+        let serialized = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(!serialized.contains("tenant"));
+        assert!(!serialized.contains("token"));
+
+        drop((slash_registration, split_registration, prefix_registration));
+        first.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_utf8_file_migrates_to_versioned_binary_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("coordinator.json");
+        std::fs::write(
+            &path,
+            br#"{"namespaces":{"tenant":{"/alpha/beta":"https://legacy.example/"}}}"#,
+        )
+        .unwrap();
+        let coordinator = FileCoordinator::with_limits(
+            &path,
+            relay_url(),
+            FileCoordinatorLimits {
+                max_entries: 4,
+                max_bytes: 4_096,
+            },
+        )
+        .unwrap();
+        let legacy = namespace(&[b"alpha", b"beta"]);
+        assert_eq!(
+            coordinator
+                .lookup(Some("tenant"), &legacy)
+                .await
+                .unwrap()
+                .0
+                .url(),
+            Url::parse("https://legacy.example/").unwrap()
+        );
+
+        let new_registration = coordinator
+            .register_namespace(Some("tenant"), &namespace(&[b"new"]))
+            .await
+            .unwrap();
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(data["version"], COORDINATOR_DATA_VERSION);
+        let serialized = data.to_string();
+        assert!(serialized.contains(NAMESPACE_KEY_PREFIX));
+        assert!(!serialized.contains("/alpha/beta"));
+        assert!(!serialized.contains("\"tenant\""));
+        drop(new_registration);
+        coordinator.shutdown().await.unwrap();
     }
 }

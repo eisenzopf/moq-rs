@@ -11,13 +11,15 @@
 //! - Automatic TTL refresh to maintain registrations
 //! - High availability when using the moq-api server
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use moq_api::{Client, Origin};
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use url::Url;
 
 use moq_relay_ietf::{
@@ -27,6 +29,9 @@ use moq_relay_ietf::{
 /// Default TTL for namespace registrations (in seconds)
 /// moq-api server uses 600 seconds (10 minutes) TTL
 const DEFAULT_REGISTRATION_TTL_SECS: u64 = 600;
+const DEFAULT_MAX_BACKGROUND_TASKS: usize = 4_096;
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_CLEANUP_TIMEOUT_MS: u64 = 2_000;
 
 /// Configuration for the API coordinator
 #[derive(Debug, Clone)]
@@ -39,6 +44,12 @@ pub struct ApiCoordinatorConfig {
     pub registration_ttl_secs: u64,
     /// Interval for refreshing registrations (should be less than TTL)
     pub refresh_interval_secs: u64,
+    /// Maximum retained namespace refresh/cleanup tasks.
+    pub max_background_tasks: usize,
+    /// Maximum time for one registry API request.
+    pub request_timeout: Duration,
+    /// Maximum time to wait for each API unregister and coordinator shutdown.
+    pub cleanup_timeout: Duration,
 }
 
 impl ApiCoordinatorConfig {
@@ -50,6 +61,9 @@ impl ApiCoordinatorConfig {
             registration_ttl_secs: DEFAULT_REGISTRATION_TTL_SECS,
             // Refresh at half the TTL to ensure we don't expire
             refresh_interval_secs: DEFAULT_REGISTRATION_TTL_SECS / 2,
+            max_background_tasks: DEFAULT_MAX_BACKGROUND_TASKS,
+            request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
+            cleanup_timeout: Duration::from_millis(DEFAULT_CLEANUP_TIMEOUT_MS),
         }
     }
 
@@ -59,13 +73,58 @@ impl ApiCoordinatorConfig {
         self.refresh_interval_secs = ttl_secs / 2;
         self
     }
+
+    pub fn with_background_task_limit(mut self, limit: usize) -> Self {
+        self.max_background_tasks = limit;
+        self
+    }
+
+    pub fn with_cleanup_timeout(mut self, timeout: Duration) -> Self {
+        self.cleanup_timeout = timeout;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.registration_ttl_secs >= 2,
+            "API registration TTL must be at least two seconds"
+        );
+        anyhow::ensure!(
+            self.refresh_interval_secs > 0,
+            "API refresh interval must be positive"
+        );
+        anyhow::ensure!(
+            self.refresh_interval_secs < self.registration_ttl_secs,
+            "API refresh interval must be less than its TTL"
+        );
+        anyhow::ensure!(
+            self.max_background_tasks > 0,
+            "API background task limit must be positive"
+        );
+        anyhow::ensure!(
+            self.max_background_tasks <= Semaphore::MAX_PERMITS,
+            "API background task limit exceeds the semaphore maximum"
+        );
+        anyhow::ensure!(
+            !self.request_timeout.is_zero(),
+            "API request timeout must be positive"
+        );
+        anyhow::ensure!(
+            !self.cleanup_timeout.is_zero(),
+            "API cleanup timeout must be positive"
+        );
+        Ok(())
+    }
 }
 
 /// Handle that unregisters a namespace when dropped and manages TTL refresh
 struct NamespaceUnregisterHandle {
-    namespace_key: String,
-    client: Client,
-    /// Channel to signal the refresh task to stop (wrapped in Option so we can take it in drop)
+    /// Channel to signal the supervised refresh/cleanup task to stop.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -75,22 +134,12 @@ impl Drop for NamespaceUnregisterHandle {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-
-        let namespace_key = self.namespace_key.clone();
-        let client = self.client.clone();
-
-        // Spawn a task to unregister since we can't do async in drop
-        tokio::spawn(async move {
-            if let Err(err) = unregister_namespace_async(&client, &namespace_key).await {
-                tracing::warn!(namespace = %namespace_key, error = %err, "failed to unregister namespace on drop: {}", err);
-            }
-        });
     }
 }
 
 /// Async helper for unregistering a namespace
 async fn unregister_namespace_async(client: &Client, namespace_key: &str) -> Result<()> {
-    tracing::debug!(namespace = %namespace_key, "unregistering namespace from API: {}", namespace_key);
+    tracing::debug!("unregistering namespace from API");
 
     client
         .delete_origin(namespace_key)
@@ -120,6 +169,9 @@ pub struct ApiCoordinator {
     client: Client,
     /// Configuration
     config: ApiCoordinatorConfig,
+    task_capacity: Arc<Semaphore>,
+    tasks: TaskTracker,
+    shutdown: CancellationToken,
 }
 
 impl ApiCoordinator {
@@ -130,33 +182,30 @@ impl ApiCoordinator {
     ///
     /// ## Format
     ///
-    /// Each namespace tuple field is hex-encoded and fields are joined with `.`.
-    /// The scope (if present) is prepended with a `:` separator:
-    ///
-    /// - Scoped:   `"{scope}:{hex_field0}.{hex_field1}..."`
-    /// - Unscoped: `":{hex_field0}.{hex_field1}..."`
+    /// Scope presence, scope bytes, tuple count, and every tuple-field length
+    /// are encoded unambiguously and SHA-256 hashed into one bounded URL-safe key.
     ///
     /// ## Why this is collision-free
     ///
-    /// - Hex encoding (`[0-9a-f]`) preserves arbitrary bytes without ambiguity
-    /// - `.` separates tuple fields (can't appear in hex output)
-    /// - `:` separates scope from namespace (can't appear in hex output, and
-    ///   scopes are validated connection paths that don't contain `:`)
-    /// - The leading `:` on unscoped keys prevents collision with scoped keys
-    ///   (scopes always start with `/` per `normalize_connection_path`)
-    /// - Different tuple field counts produce different keys (e.g., one field
-    ///   `"ab"` → `"6162"` vs two fields `"a","b"` → `"61.62"`)
+    /// Length-prefixing preserves arbitrary bytes and field boundaries, while
+    /// hashing prevents query-bearing scope identities from reaching HTTP URLs.
     fn registry_key(scope: Option<&str>, namespace: &TrackNamespace) -> String {
-        let ns_hex: String = namespace
-            .fields
-            .iter()
-            .map(|f| hex::encode(&f.value))
-            .collect::<Vec<_>>()
-            .join(".");
+        let mut encoded = Vec::new();
         match scope {
-            Some(s) => format!("{s}:{ns_hex}"),
-            None => format!(":{ns_hex}"),
+            Some(scope) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&(scope.len() as u64).to_be_bytes());
+                encoded.extend_from_slice(scope.as_bytes());
+            }
+            None => encoded.push(0),
         }
+        encoded.extend_from_slice(&(namespace.fields.len() as u32).to_be_bytes());
+        for field in &namespace.fields {
+            encoded.extend_from_slice(&(field.value.len() as u64).to_be_bytes());
+            encoded.extend_from_slice(&field.value);
+        }
+        let digest = ring::digest::digest(&ring::digest::SHA256, &encoded);
+        format!("v1-{}", hex::encode(digest.as_ref()))
     }
 
     /// Create a new API-based coordinator.
@@ -166,21 +215,38 @@ impl ApiCoordinator {
     ///
     /// # Returns
     /// A new `ApiCoordinator` instance
-    pub fn new(config: ApiCoordinatorConfig) -> Self {
+    pub fn new(config: ApiCoordinatorConfig) -> Result<Self> {
+        config.validate()?;
         let client = Client::new(config.api_url.clone());
+        let task_capacity = Arc::new(Semaphore::new(config.max_background_tasks));
 
-        Self { client, config }
+        Ok(Self {
+            client,
+            config,
+            task_capacity,
+            tasks: TaskTracker::new(),
+            shutdown: CancellationToken::new(),
+        })
     }
 
     /// Start a background task to refresh namespace registration
     fn start_refresh_task(
-        client: Client,
+        &self,
         namespace_key: String,
-        relay_url: Url,
-        refresh_interval: Duration,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        _permit: OwnedSemaphorePermit,
     ) {
-        tokio::spawn(async move {
+        let client = self.client.clone();
+        let relay_url = self.config.relay_url.clone();
+        let refresh_interval = Duration::from_secs(self.config.refresh_interval_secs);
+        let cleanup_timeout = self.config.cleanup_timeout;
+        let request_timeout = self.config.request_timeout;
+        let shutdown = self.shutdown.clone();
+        self.tasks.spawn(async move {
+            let _permit = _permit;
+            let _task_guard = moq_relay_ietf::metrics::GaugeGuard::new(
+                "moq_relay_coordinator_background_tasks",
+            );
             let mut interval = tokio::time::interval(refresh_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -189,23 +255,74 @@ impl ApiCoordinator {
                     _ = interval.tick() => {
                         let origin = Origin { url: relay_url.clone() };
 
-                        match client.patch_origin(&namespace_key, origin).await {
-                            Ok(()) => {
-                                tracing::trace!(namespace = %namespace_key, "refreshed namespace registration: {}", namespace_key);
+                        match tokio::time::timeout(request_timeout, client.patch_origin(&namespace_key, origin)).await {
+                            Ok(Ok(())) => {
+                                tracing::trace!("refreshed namespace registration");
                             }
-                            Err(err) => {
-                                tracing::warn!(namespace = %namespace_key, error = %err, "failed to refresh namespace registration: {}", err);
+                            Ok(Err(err)) => {
+                                tracing::warn!(error = %err, "failed to refresh namespace registration");
                             }
+                            Err(_) => tracing::warn!("namespace registration refresh timed out"),
                         }
                     }
                     _ = &mut shutdown_rx => {
                         tracing::debug!("namespace refresh task shutting down");
                         break;
                     }
+                    _ = shutdown.cancelled() => break,
                 }
+            }
+
+            if let Err(error) = tokio::time::timeout(
+                cleanup_timeout,
+                unregister_namespace_async(&client, &namespace_key),
+            )
+            .await
+            .context("namespace API unregister timed out")
+            .and_then(|result| result)
+            {
+                tracing::warn!(error = %error, "failed to unregister namespace during supervised cleanup");
             }
         });
     }
+
+    fn try_task_permit(&self) -> CoordinatorResult<OwnedSemaphorePermit> {
+        if self.shutdown.is_cancelled() {
+            return Err(CoordinatorError::Other(anyhow::anyhow!(
+                "API coordinator is shutting down"
+            )));
+        }
+        self.task_capacity.clone().try_acquire_owned().map_err(|_| {
+            metrics::counter!(
+                "moq_relay_coordinator_capacity_rejections_total",
+                "kind" => "api_task"
+            )
+            .increment(1);
+            CoordinatorError::CapacityExhausted {
+                resource: "api_background_task",
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> ApiCoordinatorSnapshot {
+        ApiCoordinatorSnapshot {
+            active_background_tasks: self
+                .config
+                .max_background_tasks
+                .saturating_sub(self.task_capacity.available_permits()),
+            supervised_tasks: self.tasks.len(),
+            max_background_tasks: self.config.max_background_tasks,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApiCoordinatorSnapshot {
+    active_background_tasks: usize,
+    supervised_tasks: usize,
+    max_background_tasks: usize,
 }
 
 #[async_trait]
@@ -219,35 +336,33 @@ impl Coordinator for ApiCoordinator {
         let origin = Origin {
             url: self.config.relay_url.clone(),
         };
+        let task_permit = self.try_task_permit()?;
 
         tracing::info!(
-            namespace = %namespace_str,
+            scoped = scope.is_some(),
+            namespace_fields = namespace.fields.len(),
             relay_url = %moq_relay_ietf::redact_url_for_logging(&self.config.relay_url),
             "registering namespace in API"
         );
 
         // Register the namespace with the API
-        self.client
-            .set_origin(&namespace_str, origin)
-            .await
-            .context("failed to register namespace in API")
-            .map_err(CoordinatorError::Other)?;
+        tokio::time::timeout(
+            self.config.request_timeout,
+            self.client.set_origin(&namespace_str, origin),
+        )
+        .await
+        .context("namespace API registration timed out")
+        .map_err(CoordinatorError::Other)?
+        .context("failed to register namespace in API")
+        .map_err(CoordinatorError::Other)?;
 
         // Create shutdown channel for the refresh task
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         // Start background refresh task
-        Self::start_refresh_task(
-            self.client.clone(),
-            namespace_str.clone(),
-            self.config.relay_url.clone(),
-            Duration::from_secs(self.config.refresh_interval_secs),
-            shutdown_rx,
-        );
+        self.start_refresh_task(namespace_str.clone(), shutdown_rx, task_permit);
 
         let handle = NamespaceUnregisterHandle {
-            namespace_key: namespace_str,
-            client: self.client.clone(),
             shutdown_tx: Some(shutdown_tx),
         };
 
@@ -260,13 +375,21 @@ impl Coordinator for ApiCoordinator {
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<()> {
         let namespace_str = Self::registry_key(scope, namespace);
-        tracing::info!(namespace = %namespace_str, "unregistering namespace from API: {}", namespace_str);
+        tracing::info!(
+            scoped = scope.is_some(),
+            namespace_fields = namespace.fields.len(),
+            "unregistering namespace from API"
+        );
 
-        self.client
-            .delete_origin(&namespace_str)
-            .await
-            .context("failed to unregister namespace from API")
-            .map_err(CoordinatorError::Other)?;
+        tokio::time::timeout(
+            self.config.request_timeout,
+            self.client.delete_origin(&namespace_str),
+        )
+        .await
+        .context("namespace API unregister timed out")
+        .map_err(CoordinatorError::Other)?
+        .context("failed to unregister namespace from API")
+        .map_err(CoordinatorError::Other)?;
 
         Ok(())
     }
@@ -277,26 +400,33 @@ impl Coordinator for ApiCoordinator {
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
         let namespace_str = Self::registry_key(scope, namespace);
-        tracing::debug!(scope = scope.unwrap_or("<unscoped>"), namespace = %namespace_str, "looking up namespace in API: {}", namespace_str);
+        tracing::debug!(
+            scoped = scope.is_some(),
+            namespace_fields = namespace.fields.len(),
+            "looking up namespace in API"
+        );
 
         // Query the API for the namespace
-        let result = self
-            .client
-            .get_origin(&namespace_str)
-            .await
-            .context("failed to lookup namespace in API")
-            .map_err(CoordinatorError::Other)?;
+        let result = tokio::time::timeout(
+            self.config.request_timeout,
+            self.client.get_origin(&namespace_str),
+        )
+        .await
+        .context("namespace API lookup timed out")
+        .map_err(CoordinatorError::Other)?
+        .context("failed to lookup namespace in API")
+        .map_err(CoordinatorError::Other)?;
 
         match result {
             Some(origin) => {
-                tracing::debug!(namespace = %namespace_str, origin_url = %moq_relay_ietf::redact_url_for_logging(&origin.url), "found namespace");
+                tracing::debug!(origin_url = %moq_relay_ietf::redact_url_for_logging(&origin.url), "found namespace");
                 Ok((
                     NamespaceOrigin::new(namespace.clone(), origin.url, None),
                     None,
                 ))
             }
             None => {
-                tracing::debug!(namespace = %namespace_str, "namespace not found: {}", namespace_str);
+                tracing::debug!("namespace not found");
                 Err(CoordinatorError::NamespaceNotFound)
             }
         }
@@ -304,7 +434,16 @@ impl Coordinator for ApiCoordinator {
 
     async fn shutdown(&self) -> CoordinatorResult<()> {
         tracing::info!("shutting down API coordinator");
-        // The moq-api client uses reqwest which handles connection cleanup internally
+        self.shutdown.cancel();
+        self.tasks.close();
+        let shutdown_timeout = self
+            .config
+            .request_timeout
+            .saturating_add(self.config.cleanup_timeout);
+        tokio::time::timeout(shutdown_timeout, self.tasks.wait())
+            .await
+            .context("timed out waiting for API coordinator tasks")
+            .map_err(CoordinatorError::Other)?;
         Ok(())
     }
 }
@@ -312,6 +451,32 @@ impl Coordinator for ApiCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moq_transport::coding::TupleField;
+
+    #[test]
+    fn registry_keys_are_scope_safe_and_tuple_collision_free() {
+        let one_field = TrackNamespace::try_from(vec![TupleField {
+            value: b"a/b".to_vec(),
+        }])
+        .unwrap();
+        let two_fields = TrackNamespace::try_from(vec![
+            TupleField {
+                value: b"a".to_vec(),
+            },
+            TupleField {
+                value: b"b".to_vec(),
+            },
+        ])
+        .unwrap();
+        let scope = "/tenant?token=secret";
+        let one = ApiCoordinator::registry_key(Some(scope), &one_field);
+        let two = ApiCoordinator::registry_key(Some(scope), &two_fields);
+        assert_ne!(one, two);
+        assert!(!one.contains("tenant"));
+        assert!(!one.contains("token"));
+        assert!(!one.contains('?'));
+        assert_ne!(one, ApiCoordinator::registry_key(None, &one_field));
+    }
 
     #[test]
     fn test_config_new() {
@@ -327,6 +492,15 @@ mod tests {
             config.refresh_interval_secs,
             DEFAULT_REGISTRATION_TTL_SECS / 2
         );
+        assert_eq!(config.max_background_tasks, DEFAULT_MAX_BACKGROUND_TASKS);
+        assert_eq!(
+            config.request_timeout,
+            Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            config.cleanup_timeout,
+            Duration::from_millis(DEFAULT_CLEANUP_TIMEOUT_MS)
+        );
     }
 
     #[test]
@@ -338,5 +512,40 @@ mod tests {
 
         assert_eq!(config.registration_ttl_secs, 120);
         assert_eq!(config.refresh_interval_secs, 60);
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected() {
+        let api_url = Url::parse("http://localhost:8080").unwrap();
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let config = ApiCoordinatorConfig::new(api_url, relay_url).with_background_task_limit(0);
+        assert!(ApiCoordinator::new(config).is_err());
+        let config = ApiCoordinatorConfig::new(
+            Url::parse("http://localhost:8080").unwrap(),
+            Url::parse("https://relay.example.com").unwrap(),
+        )
+        .with_background_task_limit(Semaphore::MAX_PERMITS.saturating_add(1));
+        assert!(ApiCoordinator::new(config).is_err());
+        let config = ApiCoordinatorConfig::new(
+            Url::parse("http://localhost:8080").unwrap(),
+            Url::parse("https://relay.example.com").unwrap(),
+        )
+        .with_request_timeout(Duration::ZERO);
+        assert!(ApiCoordinator::new(config).is_err());
+    }
+
+    #[test]
+    fn background_task_permits_are_fail_fast_and_reusable() {
+        let api_url = Url::parse("http://localhost:8080").unwrap();
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = ApiCoordinator::new(
+            ApiCoordinatorConfig::new(api_url, relay_url).with_background_task_limit(1),
+        )
+        .unwrap();
+        let permit = coordinator.try_task_permit().unwrap();
+        assert_eq!(coordinator.snapshot().active_background_tasks, 1);
+        assert!(coordinator.try_task_permit().is_err());
+        drop(permit);
+        assert!(coordinator.try_task_permit().is_ok());
     }
 }

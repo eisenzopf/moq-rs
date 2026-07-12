@@ -20,7 +20,7 @@ pub enum ListenerSecurityPolicy {
     Development,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AuthenticationMethod {
     MutualTls,
     SetupToken,

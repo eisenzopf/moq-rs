@@ -129,6 +129,10 @@ pub struct PublishNamespace {
 }
 
 impl PublishNamespace {
+    pub(super) fn publisher(&self) -> Publisher {
+        self.publisher.clone()
+    }
+
     /// Create a PublishNamespace without sending on the control stream.
     /// The caller sends via a bidi request stream (draft-19).
     pub(super) fn new(

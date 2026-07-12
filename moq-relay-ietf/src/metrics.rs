@@ -31,6 +31,11 @@
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
+//! | `moq_relay_request_overload_total` | `resource` | Relay requests rejected before retained-state mutation |
+//! | `moq_relay_capacity_rejections_total` | `level`, `resource` | Hierarchical capacity rejections |
+//! | `moq_relay_upstream_capacity_rejections_total` | `kind` | Upstream connection/track cache capacity rejections |
+//! | `moq_relay_upstream_idle_evictions_total` | `kind` | Idle upstream entries evicted |
+//! | `moq_relay_coordinator_capacity_rejections_total` | `kind` | Coordinator work rejected before mutation |
 //!
 //! ## Gauges
 //!
@@ -43,6 +48,12 @@
 //! | `moq_relay_announced_namespaces` | Current number of namespaces registered via PUBLISH_NAMESPACE |
 //! | `moq_relay_active_published_tracks` | Current number of exact PUBLISH tracks registered locally |
 //! | `moq_relay_upstream_connections` | Current number of upstream/origin connections |
+//! | `moq_relay_capacity_active` | Active hierarchical leases by fixed `level` and `resource` labels |
+//! | `moq_relay_upstream_retained_entries` | Retained upstream entries by fixed `kind` label |
+//! | `moq_relay_upstream_supervised_tasks` | Supervised upstream task count |
+//! | `moq_relay_coordinator_background_tasks` | Supervised API coordinator refresh/cleanup tasks |
+//! | `moq_relay_retained_bytes` | Process-wide retained FETCH payload bytes |
+//! | `moq_relay_retained_bytes_limit` | Configured process-wide retained FETCH byte limit |
 //!
 //! ## Histograms
 //!
@@ -106,6 +117,26 @@ pub fn describe_metrics() {
         "moq_relay_upstream_errors_total",
         "Upstream connection failures by stage (connect, session)"
     );
+    describe_counter!(
+        "moq_relay_request_overload_total",
+        "Relay requests rejected before retained-state mutation by resource"
+    );
+    describe_counter!(
+        "moq_relay_capacity_rejections_total",
+        "Hierarchical relay capacity rejections by level and resource"
+    );
+    describe_counter!(
+        "moq_relay_upstream_capacity_rejections_total",
+        "Upstream retained-state capacity rejections by kind"
+    );
+    describe_counter!(
+        "moq_relay_upstream_idle_evictions_total",
+        "Idle upstream retained-state evictions by kind"
+    );
+    describe_counter!(
+        "moq_relay_coordinator_capacity_rejections_total",
+        "Coordinator work rejected before mutation by fixed kind"
+    );
 
     // Gauges
     describe_gauge!(
@@ -135,6 +166,32 @@ pub fn describe_metrics() {
     describe_gauge!(
         "moq_relay_upstream_connections",
         "Current number of upstream/origin connections"
+    );
+    describe_gauge!(
+        "moq_relay_capacity_active",
+        "Active hierarchical relay capacity leases by level and resource"
+    );
+    describe_gauge!(
+        "moq_relay_upstream_retained_entries",
+        "Retained upstream connection and track entries"
+    );
+    describe_gauge!(
+        "moq_relay_upstream_supervised_tasks",
+        "Supervised upstream task count"
+    );
+    describe_gauge!(
+        "moq_relay_coordinator_background_tasks",
+        "Supervised API coordinator refresh and cleanup task count"
+    );
+    describe_gauge!(
+        "moq_relay_retained_bytes",
+        Unit::Bytes,
+        "Process-wide retained FETCH payload bytes"
+    );
+    describe_gauge!(
+        "moq_relay_retained_bytes_limit",
+        Unit::Bytes,
+        "Configured process-wide retained FETCH payload byte limit"
     );
 
     // Histograms

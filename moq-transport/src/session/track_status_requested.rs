@@ -36,12 +36,22 @@ impl TrackStatusRequested {
         error_code: u64,
         error_message: &str,
     ) -> Result<(), SessionError> {
+        self.respond_error_with_retry(error_code, 0, error_message)
+    }
+
+    /// Reject a TRACK_STATUS request and advertise when a retry is allowed.
+    pub fn respond_error_with_retry(
+        &mut self,
+        error_code: u64,
+        retry_interval: u64,
+        error_message: &str,
+    ) -> Result<(), SessionError> {
         self.publisher.send_request_error(
             "track_status",
             message::RequestError {
                 id: self.request_msg.id,
                 error_code,
-                retry_interval: 0,
+                retry_interval,
                 reason: ReasonPhrase(error_message.to_string()),
                 redirect: None,
             },

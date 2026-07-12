@@ -112,6 +112,40 @@ impl Reader {
         }
     }
 
+    /// Decode one stateful item whose decoder cannot implement [`Decode`]
+    /// independently (for example, delta-coded FETCH Objects).
+    pub async fn decode_with<T>(
+        &mut self,
+        mut decode: impl FnMut(&mut io::Cursor<&BytesMut>) -> Result<T, DecodeError>,
+    ) -> Result<Option<T>, SessionError> {
+        loop {
+            let mut cursor = io::Cursor::new(&self.buffer);
+            let required = match decode(&mut cursor) {
+                Ok(item) => {
+                    let consumed = cursor.position() as usize;
+                    self.buffer.advance(consumed);
+                    return Ok(Some(item));
+                }
+                Err(DecodeError::More(required)) => self.buffer.len() + required,
+                Err(error) => return Err(error.into()),
+            };
+
+            loop {
+                if self.stream.read_buf(&mut self.buffer).await?.is_none() {
+                    if self.buffer.is_empty() {
+                        return Ok(None);
+                    }
+                    return Err(
+                        DecodeError::More(required.saturating_sub(self.buffer.len())).into(),
+                    );
+                }
+                if self.buffer.len() >= required {
+                    break;
+                }
+            }
+        }
+    }
+
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, SessionError> {
         tracing::trace!(
             "[READER] read_chunk: requested max={} bytes (buffer_len={})",

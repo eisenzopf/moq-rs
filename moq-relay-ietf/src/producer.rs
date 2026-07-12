@@ -3,13 +3,14 @@
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::{FullTrackName, ServeError, TrackReader, TracksReader},
+    serve::{FullTrackName, ServeError, TrackReader, TrackRequestError, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Locals, RemoteManager,
+    Locals, RelayCapacity, RelayCapacityLease, RelayIdentity, RelayResource, RemoteCapacityError,
+    RemoteManager,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -21,22 +22,48 @@ pub struct Producer {
     /// The resolved scope identity for this session, if any.
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to locals/remotes to isolate namespace lookups.
-    scope: Option<String>,
+    identity: RelayIdentity,
+    capacity: RelayCapacity,
 }
 
 impl Producer {
+    /// Compatibility constructor with an isolated operator capacity pool.
+    /// Production embedders should use [`Self::new_admitted`] and share one
+    /// [`RelayCapacity`] across every producer and consumer.
     pub fn new(
         publisher: Publisher,
         locals: Locals,
         remotes: RemoteManager,
         scope: Option<String>,
     ) -> Self {
+        Self::new_admitted(
+            publisher,
+            locals,
+            remotes,
+            RelayIdentity::operator(scope),
+            RelayCapacity::default(),
+        )
+    }
+
+    /// Construct a producer with authenticated identity and process-shared capacity.
+    pub fn new_admitted(
+        publisher: Publisher,
+        locals: Locals,
+        remotes: RemoteManager,
+        identity: RelayIdentity,
+        capacity: RelayCapacity,
+    ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
-            scope,
+            identity,
+            capacity,
         }
+    }
+
+    pub fn identity(&self) -> &RelayIdentity {
+        &self.identity
     }
 
     /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
@@ -57,11 +84,27 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_fetch = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
                 Some(subscribed) = publisher_subscribed.subscribed() => {
                     metrics::counter!("moq_relay_subscribers_total").increment(1);
+
+                    let capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::Subscribe,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "subscribe").increment(1);
+                            tracing::warn!(%error, "rejecting SUBSCRIBE at relay capacity");
+                            let _ = subscribed.close(ServeError::Closed(
+                                moq_transport::message::RequestErrorCode::ExcessiveLoad as u64,
+                            ));
+                            continue;
+                        }
+                    };
 
                     let this = self.clone();
 
@@ -73,7 +116,7 @@ impl Producer {
                         tracing::info!(namespace = %namespace, track = %track_name, "serving subscribe: {:?}", info);
 
                         // Serve the subscribe request
-                        if let Err(err) = this.serve_subscribe(subscribed).await {
+                        if let Err(err) = this.serve_subscribe(subscribed, capacity_lease).await {
                             if Self::is_expected_serve_shutdown(&err) {
                                 tracing::debug!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "stopped serving subscribe");
                             } else {
@@ -84,6 +127,23 @@ impl Producer {
                 },
                 // Handle a new track_status request
                 Some(track_status_requested) = publisher_track_status.track_status_requested() => {
+                    let capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::TrackStatus,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "track_status").increment(1);
+                            tracing::warn!(%error, "rejecting TRACK_STATUS at relay capacity");
+                            let mut request = track_status_requested;
+                            request.respond_error_with_retry(
+                                moq_transport::message::RequestErrorCode::ExcessiveLoad as u64,
+                                1_001,
+                                "relay capacity exhausted",
+                            )?;
+                            continue;
+                        }
+                    };
                     let this = self.clone();
 
                     // Spawn a new task to handle the track_status request
@@ -94,8 +154,34 @@ impl Producer {
                         tracing::info!(namespace = %namespace, track = %track_name, "serving track_status: {:?}", info);
 
                         // Serve the track_status request
-                        if let Err(err) = this.serve_track_status(track_status_requested).await {
+                        if let Err(err) = this.serve_track_status(track_status_requested, capacity_lease).await {
                             tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
+                Some(mut fetch_requested) = publisher_fetch.fetch_requested() => {
+                    let capacity_lease = match self.capacity.try_acquire(
+                        &self.identity,
+                        RelayResource::Fetch,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics::counter!("moq_relay_request_overload_total", "resource" => "fetch").increment(1);
+                            tracing::warn!(%error, "rejecting FETCH at relay capacity");
+                            fetch_requested.reject_with_retry(
+                                moq_transport::message::RequestErrorCode::ExcessiveLoad,
+                                1_001,
+                                "relay capacity exhausted",
+                            )?;
+                            continue;
+                        }
+                    };
+                    tasks.push(async move {
+                        let _capacity_lease = capacity_lease;
+                        let request_id = fetch_requested.id();
+                        let joining_request_id = fetch_requested.joining_request_id();
+                        if let Err(error) = fetch_requested.serve().await {
+                            tracing::warn!(request_id, ?joining_request_id, %error, "failed serving FETCH");
                         }
                     }.boxed())
                 },
@@ -106,7 +192,11 @@ impl Producer {
     }
 
     /// Serve a subscribe request.
-    async fn serve_subscribe(self, subscribed: Subscribed) -> Result<(), anyhow::Error> {
+    async fn serve_subscribe(
+        self,
+        subscribed: Subscribed,
+        _capacity_lease: RelayCapacityLease,
+    ) -> Result<(), anyhow::Error> {
         // Track subscribe latency from request to track resolution (records on drop)
         let mut timing_guard =
             TimingGuard::with_label("moq_relay_subscribe_latency_seconds", "source", "not_found");
@@ -122,7 +212,7 @@ impl Producer {
         };
         if let Some(track) = self
             .locals
-            .retrieve_track(self.scope.as_deref(), &full_name)
+            .retrieve_track(self.identity.scope(), &full_name)
         {
             let ns = namespace.to_utf8_path();
             tracing::info!(namespace = %ns, track = %track_name, source = "local_publish", "serving subscribe from exact PUBLISH track");
@@ -132,23 +222,34 @@ impl Producer {
         }
 
         // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
+        if let Some(mut local) = self.locals.retrieve(self.identity.scope(), &namespace) {
             // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                let ns = namespace.to_utf8_path();
-                tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
-                // Update label to indicate local source, timing recorded on drop
-                timing_guard.set_label("source", "local");
-                // Track active tracks - decrements when serve completes
-                let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
-                return Ok(subscribed.serve(track).await?);
+            match local.try_subscribe(namespace.clone(), &track_name) {
+                Ok(track) => {
+                    let ns = namespace.to_utf8_path();
+                    tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
+                    // Update label to indicate local source, timing recorded on drop
+                    timing_guard.set_label("source", "local");
+                    // Track active tracks - decrements when serve completes
+                    let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                    return Ok(subscribed.serve(track).await?);
+                }
+                Err(TrackRequestError::CapacityExhausted) => {
+                    metrics::counter!("moq_relay_request_overload_total", "resource" => "namespace_track_cache").increment(1);
+                    let error = ServeError::Closed(
+                        moq_transport::message::RequestErrorCode::ExcessiveLoad as u64,
+                    );
+                    subscribed.close(error.clone())?;
+                    return Err(error.into());
+                }
+                Err(TrackRequestError::Closed) => {}
             }
         }
 
         // Check remote tracks second, and serve from remote if possible
         match self
             .remotes
-            .subscribe(self.scope.as_deref(), &namespace, &track_name)
+            .subscribe(self.identity.scope(), &namespace, &track_name)
             .await
         {
             Ok(track) => {
@@ -172,10 +273,7 @@ impl Producer {
 
                 // Return an internal error rather than "not found" since we couldn't check
                 // TODO: Consider returning a more specific error to the subscriber
-                let err = ServeError::internal_ctx(format!(
-                    "route error for namespace '{}': {}",
-                    namespace, e
-                ));
+                let err = Self::route_serve_error(&e, &namespace);
                 subscribed.close(err.clone())?;
                 return Err(err.into());
             }
@@ -203,10 +301,25 @@ impl Producer {
         )
     }
 
+    fn route_serve_error(
+        error: &anyhow::Error,
+        namespace: &moq_transport::coding::TrackNamespace,
+    ) -> ServeError {
+        if error.downcast_ref::<RemoteCapacityError>().is_some() {
+            ServeError::Closed(moq_transport::message::RequestErrorCode::ExcessiveLoad as u64)
+        } else {
+            ServeError::internal_ctx(format!(
+                "route error for namespace '{}': {}",
+                namespace, error
+            ))
+        }
+    }
+
     /// Serve a track_status request.
     async fn serve_track_status(
         self,
         mut track_status_requested: TrackStatusRequested,
+        _capacity_lease: RelayCapacityLease,
     ) -> Result<(), anyhow::Error> {
         let full_name = FullTrackName {
             namespace: track_status_requested.request_msg.track_namespace.clone(),
@@ -214,14 +327,14 @@ impl Producer {
         };
         if let Some(track) = self
             .locals
-            .retrieve_track(self.scope.as_deref(), &full_name)
+            .retrieve_track(self.identity.scope(), &full_name)
         {
             return Ok(track_status_requested.respond_ok(&track)?);
         }
 
         // Check local tracks first, and serve from local if possible
         if let Some(mut local_tracks) = self.locals.retrieve(
-            self.scope.as_deref(),
+            self.identity.scope(),
             &track_status_requested.request_msg.track_namespace,
         ) {
             if let Some(track) = local_tracks.get_track_reader(
@@ -271,9 +384,12 @@ impl Producer {
 
 #[cfg(test)]
 mod tests {
-    use moq_transport::{serve::ServeError, session::SessionError};
+    use moq_transport::{
+        coding::TrackNamespace, message::RequestErrorCode, serve::ServeError, session::SessionError,
+    };
 
     use super::Producer;
+    use crate::{RemoteCapacityError, RemoteCapacityResource};
 
     #[test]
     fn expected_serve_shutdown_accepts_wrapped_session_errors() {
@@ -299,5 +415,20 @@ mod tests {
         assert!(!Producer::is_expected_serve_shutdown(&anyhow::Error::new(
             ServeError::NotFound
         )));
+    }
+
+    #[test]
+    fn upstream_capacity_is_a_retryable_request_overload() {
+        let error = anyhow::Error::new(RemoteCapacityError {
+            resource: RemoteCapacityResource::Track,
+            limit: 1,
+        });
+        assert_eq!(
+            Producer::route_serve_error(
+                &error,
+                &TrackNamespace::from_utf8_path("tenant/namespace")
+            ),
+            ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)
+        );
     }
 }

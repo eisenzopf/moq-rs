@@ -6,13 +6,18 @@ use std::collections::HashMap;
 use std::ops;
 use std::sync::{Arc, Mutex};
 
+use bytes::{Bytes, BytesMut};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase, TrackName, TrackNamespace};
 use crate::message::RequestErrorCode;
 use crate::mlog;
-use crate::serve::{ServeError, TrackReaderMode};
+#[cfg(test)]
+use crate::serve::RetentionLimits;
+use crate::serve::{
+    RetainedObject, RetainedObjectMetadata, RetainedTrack, ServeError, TrackReaderMode,
+};
 use crate::watch::State;
 use crate::{data, message, serve};
 
@@ -229,6 +234,10 @@ pub struct Subscribed {
 
     state: State<SubscribedState>,
 
+    /// Bounded history for a Relative Joining FETCH that references this
+    /// exact subscriber-initiated subscription.
+    retained: Option<RetainedTrack>,
+
     /// Tracks if SubscribeOk has been sent yet or not. Used to send
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
@@ -356,10 +365,16 @@ impl Subscribed {
             ..Default::default()
         };
         let (send, recv) = State::new(initial).split();
+        let retained = RetainedTrack::new_with_budget(
+            publisher.retention_track_limits(),
+            publisher.retention_budget(),
+        )
+        .map_err(|error| SessionError::Serve(ServeError::internal_ctx(error.to_string())))?;
         let recv_info = info.clone();
         let send = Self {
             publisher,
             state: send,
+            retained: Some(retained.clone()),
             info,
             ok: false,
             initiator: SubscriptionInitiator::Subscriber,
@@ -371,6 +386,7 @@ impl Subscribed {
         let recv = SubscribedRecv {
             state: recv,
             info: recv_info,
+            retained: Some(retained),
             _request_lease: request_lease,
         };
 
@@ -402,6 +418,7 @@ impl Subscribed {
         let published = Self {
             publisher,
             state: send,
+            retained: None,
             info,
             ok: false,
             initiator: SubscriptionInitiator::Publisher,
@@ -413,6 +430,7 @@ impl Subscribed {
             SubscribedRecv {
                 state: recv,
                 info: recv_info,
+                retained: None,
                 _request_lease: request_lease,
             },
         ))
@@ -636,7 +654,7 @@ impl Drop for Subscribed {
                 message::RequestError {
                     id: self.info.id,
                     error_code: Self::request_error_code(&err),
-                    retry_interval: 0,
+                    retry_interval: Self::request_error_retry_interval(&err),
                     reason: ReasonPhrase(err.to_string()),
                     redirect: None,
                 },
@@ -675,6 +693,16 @@ impl Subscribed {
         }
     }
 
+    fn request_error_retry_interval(err: &ServeError) -> u64 {
+        match err {
+            ServeError::Closed(code) if *code == RequestErrorCode::ExcessiveLoad as u64 => {
+                // Draft-19 encodes the minimum delay in milliseconds plus one.
+                1001
+            }
+            _ => 0,
+        }
+    }
+
     fn is_expected_serve_shutdown(err: &SessionError) -> bool {
         matches!(
             err,
@@ -707,11 +735,12 @@ impl Subscribed {
 
                         let publisher = self.publisher.clone();
                         let state = self.state.clone();
+                        let retained = self.retained.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
+                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, retained, mlog, delivery_filter).await {
                                 if Self::is_expected_serve_shutdown(&err) {
                                     tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
@@ -749,6 +778,7 @@ impl Subscribed {
         subgroup_reader: serve::SubgroupReader,
         publisher: Publisher,
         state: State<SubscribedState>,
+        retained: Option<RetainedTrack>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
@@ -757,6 +787,7 @@ impl Subscribed {
             subgroup_reader,
             SubgroupStreamFactory::Network(Box::new(publisher)),
             state,
+            retained,
             mlog,
             delivery_filter,
         )
@@ -768,6 +799,7 @@ impl Subscribed {
         mut subgroup_reader: serve::SubgroupReader,
         mut stream_factory: SubgroupStreamFactory,
         state: State<SubscribedState>,
+        retained: Option<RetainedTrack>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
@@ -780,6 +812,7 @@ impl Subscribed {
 
         let mut writer: Option<SubgroupStreamOutput> = None;
         let mut object_count = 0;
+        let mut retention_valid = true;
         loop {
             Self::wait_until_forward(&state).await?;
             let Some(mut subgroup_object_reader) = subgroup_reader.next().await? else {
@@ -787,16 +820,17 @@ impl Subscribed {
             };
             // FORWARD may have changed while waiting for the next object.
             Self::wait_until_forward(&state).await?;
-            if !delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
+            let deliver =
+                delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id);
+            if !deliver {
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: filtered object group_id={}, object_id={}",
                     subgroup_reader.group_id,
                     subgroup_object_reader.object_id
                 );
-                continue;
             }
 
-            if writer.is_none() {
+            if deliver && writer.is_none() {
                 let mut new_writer = stream_factory.open(subgroup_reader.priority).await?;
                 tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
@@ -829,7 +863,6 @@ impl Subscribed {
                 writer = Some(new_writer);
             }
 
-            let writer = writer.as_mut().ok_or(SessionError::Internal)?;
             let subgroup_object = data::SubgroupObjectExt {
                 // TODO(itzmanish): compute real delta when the receive side uses object IDs
                 // for ordering. Both sender and receiver must agree on the same prev tracking
@@ -855,7 +888,13 @@ impl Subscribed {
                 subgroup_object.extension_headers
             );
 
-            writer.encode(&subgroup_object).await?;
+            if deliver {
+                writer
+                    .as_mut()
+                    .ok_or(SessionError::Internal)?
+                    .encode(&subgroup_object)
+                    .await?;
+            }
 
             // Log subgroup object created/sent
             if let Some(ref mlog) = mlog {
@@ -874,16 +913,28 @@ impl Subscribed {
                 }
             }
 
-            state
-                .lock_mut()
-                .ok_or(ServeError::Done)?
-                .update_largest_location(
-                    subgroup_reader.group_id,
-                    subgroup_object_reader.object_id,
-                )?;
+            if deliver {
+                state
+                    .lock_mut()
+                    .ok_or(ServeError::Done)?
+                    .update_largest_location(
+                        subgroup_reader.group_id,
+                        subgroup_object_reader.object_id,
+                    )?;
+            }
 
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
+            let retention_object_limit = retained
+                .as_ref()
+                .map(RetainedTrack::limits)
+                .map(|limits| limits.max_object_bytes)
+                .unwrap_or(0);
+            let retain_object = retained.is_some()
+                && subgroup_object_reader.status == data::ObjectStatus::NormalObject
+                && subgroup_object_reader.size <= retention_object_limit;
+            let mut retained_payload =
+                retain_object.then(|| BytesMut::with_capacity(subgroup_object_reader.size));
             while let Some(chunk) = subgroup_object_reader.read().await? {
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
@@ -892,8 +943,49 @@ impl Subscribed {
                     chunk.len()
                 );
                 bytes_sent += chunk.len();
-                writer.write(&chunk).await?;
+                if let Some(payload) = retained_payload.as_mut() {
+                    payload.extend_from_slice(&chunk);
+                }
+                if deliver {
+                    writer
+                        .as_mut()
+                        .ok_or(SessionError::Internal)?
+                        .write(&chunk)
+                        .await?;
+                }
                 chunks_sent += 1;
+            }
+
+            if let Some(payload) = retained_payload {
+                let retained_object = RetainedObject::new(
+                    RetainedObjectMetadata {
+                        location: Location::new(
+                            subgroup_reader.group_id,
+                            subgroup_object_reader.object_id,
+                        ),
+                        subgroup_id: Some(subgroup_reader.subgroup_id),
+                        publisher_priority: subgroup_reader.priority,
+                        properties: subgroup_object_reader.extension_headers.clone(),
+                    },
+                    Bytes::from(payload),
+                );
+                let retained = retained
+                    .as_ref()
+                    .expect("retained payloads require a configured cache");
+                match retained_object.and_then(|object| retained.commit(object)) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        retention_valid = false;
+                        tracing::debug!(
+                            group_id = subgroup_reader.group_id,
+                            object_id = subgroup_object_reader.object_id,
+                            %error,
+                            "Object remains live but is unavailable to Joining FETCH retention"
+                        );
+                    }
+                }
+            } else if retained.is_some() {
+                retention_valid = false;
             }
 
             tracing::trace!(
@@ -914,6 +1006,21 @@ impl Subscribed {
 
         if let Some(mut writer) = writer {
             writer.finish()?;
+        }
+
+        if let Some(retained) = retained {
+            if subgroup_reader.end_of_group && retention_valid {
+                if let Err(error) = retained.complete_group(subgroup_reader.group_id) {
+                    tracing::debug!(
+                        group_id = subgroup_reader.group_id,
+                        %error,
+                        "completed live Group was not promoted into Joining FETCH retention"
+                    );
+                    retained.discard_pending(subgroup_reader.group_id);
+                }
+            } else if !retention_valid {
+                retained.discard_pending(subgroup_reader.group_id);
+            }
         }
 
         Ok(())
@@ -1025,9 +1132,11 @@ impl Subscribed {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct SubscribedRecv {
     state: State<SubscribedState>,
     info: SubscribeInfo,
+    retained: Option<RetainedTrack>,
     _request_lease: Arc<RequestLease>,
 }
 
@@ -1084,27 +1193,58 @@ impl SubscribedRecv {
         &self,
     ) -> Result<JoiningSubscriptionLookup, JoiningSubscriptionLookupError> {
         let state = self.state.lock();
-        match state.phase {
-            SubscriptionPhase::Pending => Ok(JoiningSubscriptionLookup::Pending),
-            SubscriptionPhase::Terminated => {
-                Err(JoiningSubscriptionLookupError::InvalidJoiningRequestId)
-            }
-            SubscriptionPhase::Established if !state.forward => {
-                Err(JoiningSubscriptionLookupError::ForwardDisabled)
-            }
-            SubscriptionPhase::Established => {
-                let joining_location = state
-                    .joining_location
-                    .ok_or(JoiningSubscriptionLookupError::NoJoiningLocation)?;
-                Ok(JoiningSubscriptionLookup::Established(
-                    JoiningSubscription {
-                        request_id: self.info.id,
-                        track_namespace: self.info.track_namespace.clone(),
-                        track_name: self.info.track_name.clone(),
-                        joining_location,
-                    },
-                ))
-            }
+        joining_fetch_state(&state, &self.info)
+    }
+
+    pub(super) async fn wait_for_joining_fetch(
+        &self,
+    ) -> Result<(JoiningSubscription, RetainedTrack), JoiningSubscriptionLookupError> {
+        loop {
+            let notified = {
+                let state = self.state.lock();
+                match joining_fetch_state(&state, &self.info)? {
+                    JoiningSubscriptionLookup::Established(subscription) => {
+                        return Ok((
+                            subscription,
+                            self.retained
+                                .clone()
+                                .ok_or(JoiningSubscriptionLookupError::Internal)?,
+                        ));
+                    }
+                    JoiningSubscriptionLookup::Pending => state
+                        .modified()
+                        .ok_or(JoiningSubscriptionLookupError::InvalidJoiningRequestId)?,
+                }
+            };
+            notified.await;
+        }
+    }
+}
+
+fn joining_fetch_state(
+    state: &SubscribedState,
+    info: &SubscribeInfo,
+) -> Result<JoiningSubscriptionLookup, JoiningSubscriptionLookupError> {
+    match state.phase {
+        SubscriptionPhase::Pending => Ok(JoiningSubscriptionLookup::Pending),
+        SubscriptionPhase::Terminated => {
+            Err(JoiningSubscriptionLookupError::InvalidJoiningRequestId)
+        }
+        SubscriptionPhase::Established if !state.forward => {
+            Err(JoiningSubscriptionLookupError::ForwardDisabled)
+        }
+        SubscriptionPhase::Established => {
+            let joining_location = state
+                .joining_location
+                .ok_or(JoiningSubscriptionLookupError::NoJoiningLocation)?;
+            Ok(JoiningSubscriptionLookup::Established(
+                JoiningSubscription {
+                    request_id: info.id,
+                    track_namespace: info.track_namespace.clone(),
+                    track_name: info.track_name.clone(),
+                    joining_location,
+                },
+            ))
         }
     }
 }
@@ -1144,6 +1284,7 @@ mod tests {
             SubscribedRecv {
                 state: recv,
                 info: subscribe_info(request_id),
+                retained: Some(RetainedTrack::new(RetentionLimits::default()).unwrap()),
                 _request_lease: crate::session::test_request_lease(
                     crate::session::RequestDirection::Inbound,
                     crate::session::RequestClass::Subscribe,
@@ -1265,12 +1406,14 @@ mod tests {
         };
         let recording = RecordingSubgroupStream::default();
         let subscribed_state = State::default();
+        let retained = RetainedTrack::new(RetentionLimits::default()).unwrap();
 
         Subscribed::serve_subgroup_with_factory(
             header,
             subgroup_reader,
             SubgroupStreamFactory::Recording(recording.clone()),
             subscribed_state.clone(),
+            Some(retained.clone()),
             None,
             DeliveryFilter {
                 forward: true,
@@ -1307,6 +1450,16 @@ mod tests {
         let state = subscribed_state.lock();
         assert_eq!(state.stream_count, 1);
         assert_eq!(state.largest_location, Some(Location::new(3, 0)));
+        drop(state);
+        let snapshot = retained
+            .snapshot(
+                crate::serve::RetainedRange::new(Location::new(3, 0), Location::new(3, 1)),
+                message::GroupOrder::Ascending,
+            )
+            .unwrap();
+        let object = snapshot.iter().next().unwrap();
+        assert_eq!(object.subgroup_id(), Some(4));
+        assert_eq!(object.payload().as_ref(), b"opus");
     }
 
     #[test]
@@ -1334,6 +1487,20 @@ mod tests {
     }
 
     #[test]
+    fn excessive_load_subscribe_rejection_is_retryable() {
+        let excessive = ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
+        assert_eq!(
+            Subscribed::request_error_code(&excessive),
+            RequestErrorCode::ExcessiveLoad as u64
+        );
+        assert_eq!(Subscribed::request_error_retry_interval(&excessive), 1001);
+        assert_eq!(
+            Subscribed::request_error_retry_interval(&ServeError::Cancel),
+            0
+        );
+    }
+
+    #[test]
     fn pending_establishes_or_terminates_explicitly() {
         let mut established = SubscribedState::default();
         assert_eq!(established.phase, SubscriptionPhase::Pending);
@@ -1346,6 +1513,23 @@ mod tests {
         let mut rejected = SubscribedState::default();
         rejected.terminate().unwrap();
         assert_eq!(rejected.phase, SubscriptionPhase::Terminated);
+    }
+
+    #[tokio::test]
+    async fn pending_joining_fetch_waiter_resolves_from_frozen_subscription_state() {
+        let (state, recv) = recv_pair(SubscribedState::default(), 7);
+        let waiter = tokio::spawn(async move { recv.wait_for_joining_fetch().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        state
+            .lock_mut()
+            .unwrap()
+            .establish(Some(Location::new(5, 6)))
+            .unwrap();
+        let (joining, _retained) = waiter.await.unwrap().unwrap();
+        assert_eq!(joining.request_id, 7);
+        assert_eq!(joining.joining_location, Location::new(5, 6));
     }
 
     #[test]

@@ -221,7 +221,7 @@ impl Drop for PublishReceived {
             message::RequestError {
                 id: self.request_id,
                 error_code: request_error_code(&err),
-                retry_interval: 0,
+                retry_interval: retry_interval(&err),
                 reason: ReasonPhrase(err.to_string()),
                 redirect: None,
             },
@@ -245,6 +245,13 @@ fn request_error_code(err: &ServeError) -> u64 {
             RequestErrorCode::InternalError as u64
         }
         ServeError::Closed(code) => *code,
+    }
+}
+
+fn retry_interval(err: &ServeError) -> u64 {
+    match err {
+        ServeError::Closed(code) if *code == RequestErrorCode::ExcessiveLoad as u64 => 1_001,
+        _ => 0,
     }
 }
 
@@ -501,6 +508,13 @@ mod tests {
             request_error_code(&ServeError::NotFound),
             RequestErrorCode::DoesNotExist as u64
         );
+        let excessive = ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64);
+        assert_eq!(
+            request_error_code(&excessive),
+            RequestErrorCode::ExcessiveLoad as u64
+        );
+        assert_eq!(retry_interval(&excessive), 1_001);
+        assert_eq!(retry_interval(&ServeError::Internal("fatal".into())), 0);
     }
 
     #[test]

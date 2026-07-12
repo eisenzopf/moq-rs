@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- hierarchical process, authenticated-principal, and resolved-scope capacity for namespace, track, subscription, track-status, and FETCH request lifecycles
+- scoped and bounded upstream relay caches with supervised tasks, aggregate diagnostics, and idle eviction
+- configurable per-namespace track caches plus bounded API/file coordinator retention
+- process-shared transport request capacity with configurable per-session/process retained-byte budgets and metrics
+
+### Changed
+
+- relay overloads now use retryable `EXCESSIVE_LOAD` responses; authenticated identity and resolved scope remain attached to long-lived handlers
+- file coordination uses versioned binary-safe tuple/scope keys and migrates legacy UTF-8 entries on the next write
+
 ## [0.7.18](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.17...moq-relay-ietf-v0.7.18) - 2026-05-20
 
 ### Fixed

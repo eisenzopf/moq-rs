@@ -11,7 +11,8 @@ use url::Url;
 
 use crate::{
     metrics::GaugeGuard, AdmissionDecision, AdmissionRequest, Consumer, Coordinator,
-    ListenerSecurityPolicy, Locals, Producer, RemoteManager, Session, SessionAdmission,
+    ListenerSecurityPolicy, Locals, Producer, RelayCapacity, RelayCapacityLimits, RelayIdentity,
+    RemoteManager, RemoteManagerLimits, Session, SessionAdmission,
 };
 
 // A type alias for boxed future
@@ -72,6 +73,19 @@ pub struct RelayConfig {
     pub max_pending_admissions: usize,
     pub max_active_sessions: usize,
     pub token_revalidation_interval: Duration,
+
+    /// Hierarchical limits for retained namespace, track, subscription, and
+    /// track-status request state.
+    pub capacity_limits: RelayCapacityLimits,
+
+    /// Limits and idle eviction windows for retained upstream relay state.
+    pub remote_limits: RemoteManagerLimits,
+
+    /// Per-published-namespace track cache and pending request limits.
+    pub tracks_limits: moq_transport::serve::TracksLimits,
+
+    /// Process-shared transport request and retained-media limits.
+    pub request_limits: moq_transport::session::RequestLimits,
 }
 
 /// MoQ Relay server.
@@ -91,6 +105,37 @@ pub struct Relay {
     max_active_sessions: usize,
     production: bool,
     token_revalidation_interval: Duration,
+    capacity: RelayCapacity,
+    tracks_limits: moq_transport::serve::TracksLimits,
+    request_capacity: moq_transport::session::RequestCapacity,
+}
+
+/// Cloneable aggregate diagnostics that can be retained while [`Relay::run`] owns the server.
+#[derive(Clone)]
+pub struct RelayDiagnostics {
+    capacity: RelayCapacity,
+    remotes: RemoteManager,
+    request_capacity: moq_transport::session::RequestCapacity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayDiagnosticsSnapshot {
+    pub capacity: crate::RelayCapacitySnapshot,
+    pub remotes: crate::RemoteManagerSnapshot,
+    pub retained_process_bytes: usize,
+    pub max_retained_process_bytes: usize,
+}
+
+impl RelayDiagnostics {
+    pub async fn snapshot(&self) -> RelayDiagnosticsSnapshot {
+        let retention = self.request_capacity.retention_stats();
+        RelayDiagnosticsSnapshot {
+            capacity: self.capacity.snapshot(),
+            remotes: self.remotes.snapshot().await,
+            retained_process_bytes: retention.process_bytes,
+            max_retained_process_bytes: retention.max_process_bytes,
+        }
+    }
 }
 
 fn listener_decision_is_valid(
@@ -172,6 +217,19 @@ fn should_log_admission_warning() -> bool {
     static WARNINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     sequence < 4 || sequence.is_multiple_of(128)
+}
+
+async fn report_retention_metrics(
+    capacity: moq_transport::session::RequestCapacity,
+) -> anyhow::Result<()> {
+    loop {
+        let stats = capacity.retention_stats();
+        metrics::gauge!("moq_relay_retained_bytes", "scope" => "process")
+            .set(stats.process_bytes as f64);
+        metrics::gauge!("moq_relay_retained_bytes_limit", "scope" => "process")
+            .set(stats.max_process_bytes as f64);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn close_and_wait(
@@ -324,13 +382,24 @@ impl Relay {
             "pending admission limit must be positive"
         );
         anyhow::ensure!(
+            config.max_pending_admissions <= tokio::sync::Semaphore::MAX_PERMITS,
+            "pending admission limit exceeds the semaphore maximum"
+        );
+        anyhow::ensure!(
             config.max_active_sessions > 0,
             "active session limit must be positive"
+        );
+        anyhow::ensure!(
+            config.max_active_sessions <= tokio::sync::Semaphore::MAX_PERMITS,
+            "active session limit exceeds the semaphore maximum"
         );
         anyhow::ensure!(
             !config.token_revalidation_interval.is_zero(),
             "token revalidation interval must be positive"
         );
+        let capacity = RelayCapacity::new(config.capacity_limits)?;
+        config.tracks_limits.validate()?;
+        let request_capacity = moq_transport::session::RequestCapacity::new(config.request_limits)?;
 
         if !config.development {
             anyhow::ensure!(
@@ -415,7 +484,12 @@ impl Relay {
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients);
+        let remotes = RemoteManager::with_limits_and_capacity(
+            config.coordinator.clone(),
+            remote_clients,
+            config.remote_limits,
+            request_capacity.clone(),
+        )?;
 
         Ok(Self {
             quic_endpoints: endpoints,
@@ -433,7 +507,28 @@ impl Relay {
             max_active_sessions: config.max_active_sessions,
             production: !config.development,
             token_revalidation_interval: config.token_revalidation_interval,
+            capacity,
+            tracks_limits: config.tracks_limits,
+            request_capacity,
         })
+    }
+
+    /// Return aggregate capacity diagnostics without principal or scope labels.
+    pub fn capacity_snapshot(&self) -> crate::RelayCapacitySnapshot {
+        self.capacity.snapshot()
+    }
+
+    pub async fn remote_snapshot(&self) -> crate::RemoteManagerSnapshot {
+        self.remotes.snapshot().await
+    }
+
+    /// Return a diagnostics handle that remains usable after moving this relay into `run`.
+    pub fn diagnostics(&self) -> RelayDiagnostics {
+        RelayDiagnostics {
+            capacity: self.capacity.clone(),
+            remotes: self.remotes.clone(),
+            request_capacity: self.request_capacity.clone(),
+        }
     }
 
     /// Run the relay server.
@@ -454,10 +549,14 @@ impl Relay {
             max_active_sessions,
             production,
             token_revalidation_interval,
+            capacity,
+            tracks_limits,
+            request_capacity,
         } = self;
 
-        let run_result = async {
+        let run_result: anyhow::Result<()> = async {
             let mut tasks = FuturesUnordered::new();
+            tasks.push(report_retention_metrics(request_capacity.clone()).boxed());
 
             // Use the remote manager for routing to remote relays.
             let remote_manager = remotes.clone();
@@ -479,10 +578,11 @@ impl Relay {
 
                 // Create the MoQ session over the connection
                 let (session, publisher, subscriber) =
-                    moq_transport::session::Session::connect(
+                    moq_transport::session::Session::connect_with_capacity(
                         connection.session,
                         None,
                         connection.negotiated,
+                        &request_capacity,
                     )
                     .await
                     .context("failed to establish forward session")?;
@@ -501,22 +601,26 @@ impl Relay {
                 // Multi-scope forwarding (routing different incoming scopes to different
                 // upstream paths) would require per-scope forward connections.
                 let forward_scope = session.connection_path().map(|s| s.to_string());
+                let forward_identity = RelayIdentity::operator(forward_scope.clone());
 
                 let forward_coordinator = coordinator.clone();
                 let session = Session {
                     session,
-                    producer: Some(Producer::new(
+                    producer: Some(Producer::new_admitted(
                         publisher,
                         locals.clone(),
                         remote_manager.clone(),
-                        forward_scope.clone(),
+                        forward_identity.clone(),
+                        capacity.clone(),
                     )),
-                    consumer: Some(Consumer::new(
+                    consumer: Some(Consumer::new_admitted(
                         subscriber,
                         locals.clone(),
                         forward_coordinator,
                         None,
-                        forward_scope,
+                        forward_identity,
+                        capacity.clone(),
+                        tracks_limits,
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -609,6 +713,8 @@ impl Relay {
                         let coordinator = coordinator.clone();
                         let admission = admission.clone();
                         let active_sessions = active_sessions.clone();
+                        let capacity = capacity.clone();
+                        let request_capacity = request_capacity.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -623,7 +729,12 @@ impl Relay {
                             // Create the MoQ session over the connection (setup handshake etc)
                             let (session, publisher, subscriber) = match tokio::time::timeout(
                                 setup_timeout,
-                                moq_transport::session::Session::accept(conn, mlog_path, negotiated),
+                                moq_transport::session::Session::accept_with_capacity(
+                                    conn,
+                                    mlog_path,
+                                    negotiated,
+                                    &request_capacity,
+                                ),
                             ).await {
                                 Ok(Ok(session)) => session,
                                 Ok(Err(err)) => {
@@ -808,6 +919,7 @@ impl Relay {
                             drop(admission_permit);
 
                             let scope_id = scope_info.as_ref().map(|s| s.scope_id.clone());
+                            let identity = RelayIdentity::admitted(&decision, scope_id.clone());
                             let can_publish = decision.claims.publish
                                 && scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
                             let can_subscribe = decision.claims.subscribe
@@ -832,13 +944,13 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                                (publisher.map(|publisher| Producer::new_admitted(publisher, locals.clone(), remotes, identity.clone(), capacity.clone())), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                                (subscriber.map(|subscriber| Consumer::new_admitted(subscriber, locals, coordinator, forward, identity, capacity, tracks_limits)), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -914,6 +1026,12 @@ impl Relay {
         .await;
 
         remotes.shutdown().await;
+        if let Err(error) = coordinator.shutdown().await {
+            if run_result.is_ok() {
+                return Err(anyhow::Error::new(error).context("coordinator shutdown failed"));
+            }
+            tracing::warn!(%error, "coordinator shutdown failed after relay error");
+        }
         run_result
     }
 }
@@ -1440,6 +1558,10 @@ mod security_tests {
             max_pending_admissions,
             max_active_sessions,
             token_revalidation_interval: Duration::from_millis(50),
+            capacity_limits: RelayCapacityLimits::default(),
+            remote_limits: RemoteManagerLimits::default(),
+            tracks_limits: moq_transport::serve::TracksLimits::default(),
+            request_limits: moq_transport::session::RequestLimits::default(),
         })?;
         Ok(RunningRelay {
             client,
@@ -1541,6 +1663,10 @@ mod security_tests {
             max_pending_admissions: 4,
             max_active_sessions: 8,
             token_revalidation_interval: Duration::from_secs(1),
+            capacity_limits: RelayCapacityLimits::default(),
+            remote_limits: RemoteManagerLimits::default(),
+            tracks_limits: moq_transport::serve::TracksLimits::default(),
+            request_limits: moq_transport::session::RequestLimits::default(),
         })?;
 
         let client_tls = tls::Args {
@@ -1886,6 +2012,10 @@ mod security_tests {
                 max_pending_admissions: 1,
                 max_active_sessions: 1,
                 token_revalidation_interval: Duration::from_secs(1),
+                capacity_limits: RelayCapacityLimits::default(),
+                remote_limits: RemoteManagerLimits::default(),
+                tracks_limits: moq_transport::serve::TracksLimits::default(),
+                request_limits: moq_transport::session::RequestLimits::default(),
             }
         }
 

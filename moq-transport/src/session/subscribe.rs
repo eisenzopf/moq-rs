@@ -2,7 +2,11 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{collections::HashSet, ops, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ops,
+    sync::Arc,
+};
 
 use bytes::BytesMut;
 
@@ -322,6 +326,102 @@ struct SubscribeState {
     closed: Result<(), ServeError>,
 }
 
+const JOIN_BARRIER_MAX_OBJECTS: usize = 1024;
+const JOIN_BARRIER_MAX_BYTES: usize = 4 * 1024 * 1024;
+const JOIN_BARRIER_MAX_SUBGROUPS: usize = 64;
+
+#[derive(Clone, Debug)]
+pub(super) struct BufferedJoinObject {
+    pub location: Location,
+    pub subgroup_id: u64,
+    pub publisher_priority: u8,
+    pub properties: data::ExtensionHeaders,
+    pub payload: bytes::Bytes,
+    pub first_object: bool,
+    pub end_of_group: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinBarrierPhase {
+    AwaitingSubscribeOk,
+    Fetching,
+    Released,
+}
+
+struct JoinBarrier {
+    phase: JoinBarrierPhase,
+    cutoff: Option<Location>,
+    buffered: BTreeMap<Location, BufferedJoinObject>,
+    buffered_bytes: usize,
+}
+
+impl JoinBarrier {
+    fn new() -> Self {
+        Self {
+            phase: JoinBarrierPhase::AwaitingSubscribeOk,
+            cutoff: None,
+            buffered: BTreeMap::new(),
+            buffered_bytes: 0,
+        }
+    }
+
+    fn set_cutoff(&mut self, cutoff: Option<Location>, seen: &mut HashSet<(u64, u64)>) {
+        self.cutoff = cutoff;
+        self.phase = JoinBarrierPhase::Fetching;
+        if let Some(cutoff) = cutoff {
+            let discarded: Vec<_> = self
+                .buffered
+                .range(..=cutoff)
+                .map(|(location, _)| *location)
+                .collect();
+            for location in discarded {
+                if let Some(object) = self.buffered.remove(&location) {
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(object.payload.len());
+                }
+                seen.remove(&(location.group_id, location.object_id));
+            }
+        }
+    }
+
+    fn claims_live(&self, location: Location) -> bool {
+        match self.phase {
+            JoinBarrierPhase::AwaitingSubscribeOk => true,
+            JoinBarrierPhase::Fetching | JoinBarrierPhase::Released => {
+                self.cutoff.is_none_or(|cutoff| location > cutoff)
+            }
+        }
+    }
+
+    fn buffer(&mut self, object: BufferedJoinObject) -> Result<(), ServeError> {
+        if self.phase == JoinBarrierPhase::Released {
+            return Err(ServeError::internal_ctx(
+                "released Joining FETCH barrier cannot buffer live media",
+            ));
+        }
+        if self.buffered.contains_key(&object.location) {
+            return Err(ServeError::Duplicate);
+        }
+        let bytes = self
+            .buffered_bytes
+            .checked_add(object.payload.len())
+            .ok_or_else(|| ServeError::internal_ctx("Joining FETCH buffer byte overflow"))?;
+        if self.buffered.len() >= JOIN_BARRIER_MAX_OBJECTS || bytes > JOIN_BARRIER_MAX_BYTES {
+            return Err(ServeError::Closed(
+                message::RequestErrorCode::ExcessiveLoad as u64,
+            ));
+        }
+        self.buffered_bytes = bytes;
+        self.buffered.insert(object.location, object);
+        Ok(())
+    }
+
+    fn release(&mut self) -> Vec<BufferedJoinObject> {
+        self.phase = JoinBarrierPhase::Released;
+        self.buffered_bytes = 0;
+        std::mem::take(&mut self.buffered).into_values().collect()
+    }
+}
+
 impl Default for SubscribeState {
     fn default() -> Self {
         Self {
@@ -344,6 +444,10 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
+    pub(super) fn subscriber(&self) -> &Subscriber {
+        &self.subscriber
+    }
+
     fn build_info(
         request_id: u64,
         track: &TrackWriter,
@@ -403,6 +507,9 @@ impl Subscribe {
             writer: Some(track.into()),
             info: send.info.clone(),
             delivery_filter: None,
+            joining_location: None,
+            join_barrier: None,
+            joining_writers: HashMap::new(),
             seen_objects: HashSet::new(),
             _request_lease: request_lease,
         };
@@ -477,6 +584,9 @@ pub(super) struct SubscribeRecv {
     writer: Option<TrackWriterMode>,
     info: SubscribeInfo,
     delivery_filter: Option<DeliveryFilter>,
+    joining_location: Option<Location>,
+    join_barrier: Option<JoinBarrier>,
+    joining_writers: HashMap<(u64, u64), serve::SubgroupWriter>,
     seen_objects: HashSet<(u64, u64)>,
     _request_lease: Arc<RequestLease>,
 }
@@ -496,11 +606,15 @@ impl SubscribeRecv {
             state.ok = true;
             state.track_alias = Some(msg.track_alias);
         }
-        self.delivery_filter = Some(self.info.delivery_filter(
-            msg.params.largest_object().map_err(|err| {
-                ServeError::internal_ctx(format!("invalid largest object: {err}"))
-            })?,
-        ));
+        let largest = msg
+            .params
+            .largest_object()
+            .map_err(|err| ServeError::internal_ctx(format!("invalid largest object: {err}")))?;
+        self.joining_location = largest;
+        self.delivery_filter = Some(self.info.delivery_filter(largest));
+        if let Some(barrier) = self.join_barrier.as_mut() {
+            barrier.set_cutoff(largest, &mut self.seen_objects);
+        }
 
         Ok(())
     }
@@ -521,12 +635,180 @@ impl SubscribeRecv {
     /// Claim an Object for this subscription, applying its filter and
     /// suppressing duplicate wire copies caused by shared Track Aliases.
     pub fn claim_object(&mut self, group_id: u64, object_id: u64) -> bool {
-        self.allows(group_id, object_id) && self.seen_objects.insert((group_id, object_id))
+        let location = Location::new(group_id, object_id);
+        if self
+            .join_barrier
+            .as_ref()
+            .is_some_and(|barrier| barrier.phase == JoinBarrierPhase::Released)
+        {
+            let largest_seen_group = self.seen_objects.iter().map(|(group, _)| *group).max();
+            if largest_seen_group.is_some_and(|largest| group_id < largest) {
+                return false;
+            }
+            if largest_seen_group.is_some_and(|largest| group_id > largest) {
+                self.seen_objects.retain(|(group, _)| *group == group_id);
+            }
+        }
+        let barrier_allows = self
+            .join_barrier
+            .as_ref()
+            .is_none_or(|barrier| barrier.claims_live(location));
+        self.allows(group_id, object_id)
+            && barrier_allows
+            && self.seen_objects.insert((group_id, object_id))
     }
 
     pub fn track_alias(&self) -> Option<u64> {
         let state = self.state.lock();
         state.track_alias
+    }
+
+    pub(super) fn joining_location(&self) -> Option<Location> {
+        self.joining_location
+    }
+
+    pub(super) fn begin_joining_fetch(&mut self) -> Result<(), ServeError> {
+        if self.join_barrier.is_some() {
+            return Err(ServeError::Duplicate);
+        }
+        let mut barrier = JoinBarrier::new();
+        if self.joining_location.is_some() {
+            barrier.set_cutoff(self.joining_location, &mut self.seen_objects);
+        }
+        self.join_barrier = Some(barrier);
+        Ok(())
+    }
+
+    pub(super) fn has_joining_barrier(&self) -> bool {
+        self.join_barrier.is_some()
+    }
+
+    pub(super) fn recv_joining_live_object(
+        &mut self,
+        object: BufferedJoinObject,
+    ) -> Result<(), ServeError> {
+        let Some(barrier) = self.join_barrier.as_mut() else {
+            return Err(ServeError::internal_ctx(
+                "Joining FETCH barrier is not active",
+            ));
+        };
+        if barrier.phase == JoinBarrierPhase::Released {
+            self.write_joining_object(object)
+        } else {
+            barrier.buffer(object)
+        }
+    }
+
+    pub(super) fn recv_fetched_object(
+        &mut self,
+        object: BufferedJoinObject,
+    ) -> Result<(), ServeError> {
+        let barrier = self
+            .join_barrier
+            .as_ref()
+            .ok_or_else(|| ServeError::internal_ctx("Joining FETCH barrier is not active"))?;
+        if barrier.phase != JoinBarrierPhase::Fetching {
+            return Err(ServeError::internal_ctx(
+                "fetched Object arrived outside the barrier fetch phase",
+            ));
+        }
+        let cutoff = barrier.cutoff.ok_or_else(|| {
+            ServeError::internal_ctx("Joining FETCH barrier has no frozen cutoff")
+        })?;
+        if object.location > cutoff {
+            return Err(ServeError::internal_ctx(
+                "fetched Object passed the frozen Joining Location",
+            ));
+        }
+        if !self
+            .seen_objects
+            .insert((object.location.group_id, object.location.object_id))
+        {
+            return Ok(());
+        }
+        self.write_joining_object(object)
+    }
+
+    pub(super) fn finish_joining_fetch(&mut self) -> Result<(), ServeError> {
+        let buffered = self
+            .join_barrier
+            .as_mut()
+            .ok_or_else(|| ServeError::internal_ctx("Joining FETCH barrier is not active"))?
+            .release();
+        for object in buffered {
+            self.write_joining_object(object)?;
+        }
+        if let Some(largest_group) = self.seen_objects.iter().map(|(group, _)| *group).max() {
+            self.seen_objects
+                .retain(|(group, _)| *group == largest_group);
+        }
+        Ok(())
+    }
+
+    pub(super) fn abort_joining_fetch(&mut self) -> Result<(), ServeError> {
+        if self.join_barrier.is_none() {
+            return Ok(());
+        }
+        self.finish_joining_fetch()
+    }
+
+    fn write_joining_object(&mut self, object: BufferedJoinObject) -> Result<(), ServeError> {
+        let key = (object.location.group_id, object.subgroup_id);
+        if !self.joining_writers.contains_key(&key) {
+            if let Some(largest_group) = self
+                .joining_writers
+                .keys()
+                .map(|(group_id, _)| *group_id)
+                .max()
+            {
+                if object.location.group_id < largest_group {
+                    return Err(ServeError::internal_ctx(
+                        "Joining FETCH handoff regressed to an older Group",
+                    ));
+                }
+                if object.location.group_id > largest_group {
+                    self.joining_writers
+                        .retain(|(group_id, _), _| *group_id == object.location.group_id);
+                }
+            }
+            if self.joining_writers.len() >= JOIN_BARRIER_MAX_SUBGROUPS {
+                return Err(ServeError::Closed(
+                    message::RequestErrorCode::ExcessiveLoad as u64,
+                ));
+            }
+            let writer = self.writer.take().ok_or(ServeError::Done)?;
+            let mut subgroups = match writer {
+                TrackWriterMode::Track(track) => track.subgroups()?,
+                TrackWriterMode::Subgroups(subgroups) => subgroups,
+                other => {
+                    self.writer = Some(other);
+                    return Err(ServeError::Mode);
+                }
+            };
+            let subgroup = subgroups.create(
+                serve::Subgroup::new(
+                    object.location.group_id,
+                    object.subgroup_id,
+                    object.publisher_priority,
+                )
+                .with_first_object(object.first_object)
+                .with_end_of_group(object.end_of_group),
+            )?;
+            self.writer = Some(subgroups.into());
+            self.joining_writers.insert(key, subgroup);
+        }
+
+        let subgroup = self.joining_writers.get_mut(&key).ok_or(ServeError::Done)?;
+        let next_object_id = u64::try_from(subgroup.len()).map_err(|_| ServeError::Size)?;
+        if next_object_id != object.location.object_id {
+            return Err(ServeError::internal_ctx(format!(
+                "Joining FETCH subgroup expected Object {next_object_id}, received {}",
+                object.location.object_id
+            )));
+        }
+        let mut writer = subgroup.create(object.payload.len(), Some(object.properties))?;
+        writer.write(object.payload)?;
+        Ok(())
     }
 
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
@@ -608,6 +890,41 @@ mod tests {
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test/session"), "audio").produce();
         writer
+    }
+
+    fn buffered(group_id: u64, object_id: u64, payload: &'static [u8]) -> BufferedJoinObject {
+        BufferedJoinObject {
+            location: Location::new(group_id, object_id),
+            subgroup_id: 0,
+            publisher_priority: 7,
+            properties: Default::default(),
+            payload: bytes::Bytes::from_static(payload),
+            first_object: object_id == 0,
+            end_of_group: false,
+        }
+    }
+
+    fn joining_recv() -> (SubscribeRecv, serve::TrackReader) {
+        let (writer, reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/session"), "audio").produce();
+        let state = State::default();
+        (
+            SubscribeRecv {
+                state,
+                writer: Some(writer.into()),
+                info: subscribe_info_with(KeyValuePairs::default()),
+                delivery_filter: None,
+                joining_location: None,
+                join_barrier: None,
+                joining_writers: HashMap::new(),
+                seen_objects: HashSet::new(),
+                _request_lease: crate::session::test_request_lease(
+                    crate::session::RequestDirection::Outbound,
+                    crate::session::RequestClass::Subscribe,
+                ),
+            },
+            reader,
+        )
     }
 
     fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
@@ -847,6 +1164,9 @@ mod tests {
             writer: Some(writer.into()),
             info: subscribe_info_with(KeyValuePairs::default()),
             delivery_filter: None,
+            joining_location: None,
+            join_barrier: None,
+            joining_writers: HashMap::new(),
             seen_objects: HashSet::new(),
             _request_lease: crate::session::test_request_lease(
                 crate::session::RequestDirection::Outbound,
@@ -873,5 +1193,89 @@ mod tests {
 
         assert!(subgroup.first_object);
         assert!(subgroup.end_of_group);
+    }
+
+    #[tokio::test]
+    async fn joining_barrier_emits_fetch_then_buffered_live_without_duplicates() {
+        let (mut recv, reader) = joining_recv();
+        recv.begin_joining_fetch().unwrap();
+
+        // A raced live copy at or before the subsequently frozen cutoff is
+        // discarded so the FETCH stream remains the sole source for it.
+        assert!(recv.claim_object(0, 0));
+        recv.recv_joining_live_object(buffered(0, 0, b"raced"))
+            .unwrap();
+        let mut params = KeyValuePairs::default();
+        params.set_largest_object(Location::new(0, 1)).unwrap();
+        recv.ok(&message::SubscribeOk {
+            id: 0,
+            track_alias: 0,
+            params,
+            track_extensions: Default::default(),
+        })
+        .unwrap();
+        assert!(!recv.claim_object(0, 1));
+
+        assert!(recv.claim_object(0, 2));
+        recv.recv_joining_live_object(buffered(0, 2, b"live"))
+            .unwrap();
+        recv.recv_fetched_object(buffered(0, 0, b"fetch-0"))
+            .unwrap();
+        recv.recv_fetched_object(buffered(0, 1, b"fetch-1"))
+            .unwrap();
+        // Duplicate FETCH copies are ignored by the shared location set.
+        recv.recv_fetched_object(buffered(0, 1, b"duplicate"))
+            .unwrap();
+        recv.finish_joining_fetch().unwrap();
+
+        let serve::TrackReaderMode::Subgroups(mut groups) = reader.mode().await.unwrap() else {
+            panic!("Joining FETCH must preserve subgroup delivery");
+        };
+        let mut subgroup = groups.next().await.unwrap().unwrap();
+        assert_eq!(subgroup.len(), 3);
+        let mut payloads = Vec::new();
+        for _ in 0..3 {
+            payloads.push(
+                subgroup
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .read_all()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            payloads,
+            [
+                bytes::Bytes::from_static(b"fetch-0"),
+                bytes::Bytes::from_static(b"fetch-1"),
+                bytes::Bytes::from_static(b"live"),
+            ]
+        );
+    }
+
+    #[test]
+    fn joining_barrier_is_hard_bounded() {
+        let mut barrier = JoinBarrier::new();
+        for object_id in 0..JOIN_BARRIER_MAX_OBJECTS {
+            barrier.buffer(buffered(1, object_id as u64, b"")).unwrap();
+        }
+        assert!(matches!(
+            barrier.buffer(buffered(1, JOIN_BARRIER_MAX_OBJECTS as u64, b"")),
+            Err(ServeError::Closed(code))
+                if code == message::RequestErrorCode::ExcessiveLoad as u64
+        ));
+        assert_eq!(barrier.buffered.len(), JOIN_BARRIER_MAX_OBJECTS);
+
+        let mut bytes = JoinBarrier::new();
+        assert!(matches!(
+            bytes.buffer(BufferedJoinObject {
+                payload: bytes::Bytes::from(vec![0; JOIN_BARRIER_MAX_BYTES + 1]),
+                ..buffered(1, 0, b"")
+            }),
+            Err(ServeError::Closed(_))
+        ));
     }
 }
