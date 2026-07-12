@@ -1534,6 +1534,15 @@ impl Session {
                                         .to_string(),
                                 ));
                             }
+                            if request_kind == RequestKind::PublishNamespace {
+                                // Draft-19 represents graceful namespace
+                                // completion with FIN on the request stream.
+                                // Completing this handler closes the response
+                                // direction and drops the inbound namespace
+                                // registration, which provides an observable
+                                // peer-acceptance barrier to the origin.
+                                break Ok(());
+                            }
                             requester_open = false;
                         }
                     }

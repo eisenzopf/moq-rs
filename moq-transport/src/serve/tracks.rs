@@ -249,6 +249,21 @@ impl TracksReader {
         Self { state, queue, info }
     }
 
+    /// Wait until all producer-side handles for this namespace are gone.
+    ///
+    /// Track writers may finish before the namespace itself. This barrier is
+    /// used by PUBLISH_NAMESPACE to drain active track-serving tasks before
+    /// sending FIN on the owning request stream.
+    pub async fn closed(&self) {
+        loop {
+            let modified = self.state.lock().modified();
+            let Some(modified) = modified else {
+                return;
+            };
+            modified.await;
+        }
+    }
+
     /// Get a track from the broadcast by full name, if it exists and is still alive.
     /// Returns None if the track doesn't exist or has been closed.
     pub fn get_track_reader(
@@ -390,6 +405,27 @@ impl Deref for TracksReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn namespace_close_barrier_waits_for_both_producer_handles() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let (writer, requests, reader) = Tracks::new(namespace).produce();
+        let barrier = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.closed().await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!barrier.is_finished());
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert!(!barrier.is_finished());
+        drop(requests);
+        tokio::time::timeout(std::time::Duration::from_millis(100), barrier)
+            .await
+            .expect("namespace barrier did not observe producer completion")
+            .unwrap();
+    }
 
     #[test]
     fn explicit_limits_reject_zero() {

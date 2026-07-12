@@ -363,18 +363,28 @@ impl Publisher {
     }
 
     pub(super) async fn serve_publish_namespace(
-        publish_ns: PublishNamespace,
+        publish_ns: &PublishNamespace,
         tracks: TracksReader,
-    ) -> Result<(), SessionError> {
+    ) -> Result<bool, SessionError> {
         let mut publisher_fetch = publish_ns.publisher();
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
         let mut fetch_tasks = FuturesUnordered::new();
         let mut subscribe_done = false;
         let mut status_done = false;
+        let mut tracks_done = false;
 
         loop {
             tokio::select! {
+                () = tracks.closed(), if !tracks_done => {
+                    tracks_done = true;
+                    subscribe_done = true;
+                    status_done = true;
+                },
+                closed = publish_ns.closed(), if !tracks_done => {
+                    closed?;
+                    return Ok(false);
+                },
                 res = publish_ns.subscribed(), if !subscribe_done => {
                     match res? {
                         Some(subscribed) => {
@@ -411,7 +421,7 @@ impl Publisher {
                         None => status_done = true,
                     }
                 },
-                Some(fetch) = publisher_fetch.fetch_requested() => {
+                Some(fetch) = publisher_fetch.fetch_requested(), if !tracks_done => {
                     fetch_tasks.push(async move {
                         let id = fetch.id();
                         if let Err(error) = fetch.serve().await {
@@ -422,7 +432,7 @@ impl Publisher {
                 Some(res) = subscribe_tasks.next() => res,
                 Some(res) = status_tasks.next() => res,
                 Some(()) = fetch_tasks.next() => {},
-                else => return Ok(()),
+                else => return Ok(tracks_done),
             }
         }
     }

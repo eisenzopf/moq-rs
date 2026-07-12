@@ -62,9 +62,9 @@ impl Default for SubgroupsState {
 pub struct SubgroupsWriter {
     pub info: Arc<Track>,
     state: State<SubgroupsState>,
-    next_subgroup_id: u64, // Not in the state to avoid a lock
-    next_group_id: u64,    // Not in the state to avoid a lock
-    last_group_id: u64,    // Not in the state to avoid a lock
+    next_subgroup_id: Option<u64>, // None is an overflow tombstone.
+    next_group_id: Option<u64>,    // None is an overflow tombstone.
+    last_group_id: u64,            // Not in the state to avoid a lock
 }
 
 impl SubgroupsWriter {
@@ -72,8 +72,8 @@ impl SubgroupsWriter {
         Self {
             info: track,
             state,
-            next_subgroup_id: 0,
-            next_group_id: 0,
+            next_subgroup_id: Some(0),
+            next_group_id: Some(0),
             last_group_id: 0,
         }
     }
@@ -100,11 +100,11 @@ impl SubgroupsWriter {
         let start_new_group = true;
 
         if start_new_group {
-            group_id = self.next_group_id;
+            group_id = self.next_group_id.ok_or(ServeError::Done)?;
             subgroup_id = 0;
         } else {
             group_id = self.last_group_id;
-            subgroup_id = self.next_subgroup_id;
+            subgroup_id = self.next_subgroup_id.ok_or(ServeError::Done)?;
         }
 
         self.create(Subgroup::new(group_id, subgroup_id, priority).with_end_of_group(end_of_group))
@@ -141,9 +141,10 @@ impl SubgroupsWriter {
             state.latest_subgroup_reader = Some(reader);
         }
 
-        self.next_subgroup_id = state.latest_subgroup_reader.as_ref().unwrap().subgroup_id + 1;
-        self.next_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id + 1;
-        self.last_group_id = state.latest_subgroup_reader.as_ref().unwrap().group_id;
+        let latest = state.latest_subgroup_reader.as_ref().unwrap();
+        self.next_subgroup_id = latest.subgroup_id.checked_add(1);
+        self.next_group_id = latest.group_id.checked_add(1);
+        self.last_group_id = latest.group_id;
         state.epoch += 1;
 
         Ok(writer)
@@ -813,5 +814,18 @@ mod tests {
             publisher_priority: 3,
         };
         assert!(Subgroup::from_header(&unresolved).is_err());
+    }
+
+    #[test]
+    fn maximum_group_and_subgroup_ids_tombstone_append_cursors_without_panicking() {
+        let (track, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("live"), "audio").produce();
+        let mut groups = track.subgroups().unwrap();
+        let maximum = groups.create(Subgroup::new(u64::MAX, u64::MAX, 0)).unwrap();
+        assert_eq!(maximum.group_id, u64::MAX);
+        assert_eq!(maximum.subgroup_id, u64::MAX);
+        drop(maximum);
+
+        assert!(matches!(groups.append(0), Err(ServeError::Done)));
     }
 }

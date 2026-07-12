@@ -105,13 +105,10 @@ impl StreamWriter {
 
     /// Create a new group with the next sequential group_id for the stream.
     pub fn append(&mut self) -> Result<StreamGroupWriter, ServeError> {
-        let next = self
-            .state
-            .lock()
-            .latest_group_reader
-            .as_ref()
-            .map(|g| g.group_id + 1)
-            .unwrap_or_default();
+        let next = match self.state.lock().latest_group_reader.as_ref() {
+            Some(group) => group.group_id.checked_add(1).ok_or(ServeError::Done)?,
+            None => 0,
+        };
         self.create(next)
     }
 
@@ -545,5 +542,22 @@ impl Deref for StreamObjectReader {
 
     fn deref(&self) -> &Self::Target {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    #[test]
+    fn maximum_group_id_makes_sequential_append_fail_without_panicking() {
+        let (track, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("live"), "legacy").produce();
+        let mut stream = track.stream(0).unwrap();
+        let maximum = stream.create(u64::MAX).unwrap();
+        assert_eq!(maximum.group_id, u64::MAX);
+        drop(maximum);
+        assert!(matches!(stream.append(), Err(ServeError::Done)));
     }
 }

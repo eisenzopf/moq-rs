@@ -266,9 +266,26 @@ impl PublishNamespace {
     }
 
     /// Serve subscriptions and track-status requests for the accepted namespace.
-    pub async fn serve(self, tracks: TracksReader) -> Result<(), SessionError> {
+    pub async fn serve(mut self, tracks: TracksReader) -> Result<(), SessionError> {
         self.accepted().await.map_err(ServeError::from)?;
-        Publisher::serve_publish_namespace(self, tracks).await
+        if Publisher::serve_publish_namespace(&self, tracks).await? {
+            self.finish_request_stream().await?;
+        }
+        Ok(())
+    }
+
+    /// Gracefully finish the request and wait until the peer closes its
+    /// response direction after observing our FIN.
+    async fn finish_request_stream(&mut self) -> Result<(), SessionError> {
+        let mut writer = self.request_writer.take().ok_or(SessionError::Internal)?;
+        writer.finish();
+        tokio::task::yield_now().await;
+        self.closed().await?;
+        // The response task has already exited (it owns the peer-facing state
+        // whose closure woke `closed`), so dropping this sender cannot cancel
+        // a live response direction.
+        self.response_cancel.take();
+        Ok(())
     }
 
     /// Wait until the namespace publish is closed (error or peer disconnect).
