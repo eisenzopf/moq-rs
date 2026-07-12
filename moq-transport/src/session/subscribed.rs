@@ -966,6 +966,7 @@ impl Subscribed {
                         subgroup_id: Some(subgroup_reader.subgroup_id),
                         publisher_priority: subgroup_reader.priority,
                         properties: subgroup_object_reader.extension_headers.clone(),
+                        end_of_group: subgroup_reader.end_of_group,
                     },
                     Bytes::from(payload),
                 );
@@ -1460,6 +1461,7 @@ mod tests {
         let object = snapshot.iter().next().unwrap();
         assert_eq!(object.subgroup_id(), Some(4));
         assert_eq!(object.payload().as_ref(), b"opus");
+        assert!(object.end_of_group());
     }
 
     #[test]

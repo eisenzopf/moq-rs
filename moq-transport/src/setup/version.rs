@@ -16,23 +16,23 @@ impl Version {
     //       handle the old SETUP message type numbers of (0x40 and 0x41)
 
     /// First version we might see in CLIENT_SETUP (0x20) or SERVER_SETUP (0x21)
-    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-11.html
+    /// <https://www.ietf.org/archive/id/draft-ietf-moq-transport-11.html>
     pub const DRAFT_11: Version = Version(0xff00000b);
 
-    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-12.html
+    /// <https://www.ietf.org/archive/id/draft-ietf-moq-transport-12.html>
     pub const DRAFT_12: Version = Version(0xff00000c);
 
-    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-13.html
+    /// <https://www.ietf.org/archive/id/draft-ietf-moq-transport-13.html>
     pub const DRAFT_13: Version = Version(0xff00000d);
 
-    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.html
+    /// <https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.html>
     pub const DRAFT_14: Version = Version(0xff00000e);
 
-    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html
+    /// <https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html>
     pub const DRAFT_16: Version = Version(0xff000010);
     pub const DRAFT_18: Version = Version(0xff000012);
 
-    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.html
+    /// <https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.html>
     pub const DRAFT_19: Version = Version(0xff000013);
 }
 

@@ -69,6 +69,16 @@ pub enum DecodeError {
     #[error("invalid parameter")]
     InvalidParameter,
 
+    /// The structured authorization-token KVP value is malformed.
+    /// Session conversion maps this to KEY_VALUE_FORMATTING_ERROR (0x6).
+    #[error("authorization token formatting error: {0}")]
+    AuthorizationTokenFormatting(String),
+
+    /// A valid alias operation was received where no authorization cache is
+    /// implemented. Reject it rather than interpreting alias bytes as a token.
+    #[error("authorization token alias operation {0} is unsupported")]
+    UnsupportedAuthorizationTokenAlias(u64),
+
     #[error("io error: {0}")]
     Io(sync::Arc<io::Error>),
 

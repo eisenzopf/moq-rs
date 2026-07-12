@@ -44,7 +44,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::coding::{Encode, KeyValuePairs, Value};
+use crate::coding::{AuthorizationToken, Encode, KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
@@ -152,7 +152,7 @@ struct BidiRequestRuntime {
 struct SessionConfig {
     negotiated: NegotiatedTransport,
     target: SessionTarget,
-    setup_authorization: Option<SetupAuthorization>,
+    setup_authorizations: Vec<SetupAuthorization>,
     peer_max_request_updates: u64,
 }
 
@@ -307,17 +307,25 @@ impl NegotiatedTransport {
     }
 }
 
-/// Bounded, opaque authorization material supplied in the peer's SETUP.
+/// Bounded authorization material extracted from a peer's structured SETUP
+/// token. The serialized alias structure is never passed to admission.
 ///
 /// The contents are available to admission policies but intentionally omitted
 /// from `Debug` output so bearer credentials cannot leak into logs.
 #[derive(Clone, Eq, PartialEq)]
-pub struct SetupAuthorization(Bytes);
+pub struct SetupAuthorization {
+    token_type: u64,
+    value: Bytes,
+}
 
 impl SetupAuthorization {
     pub const MAX_BYTES: usize = 4 * 1024;
 
     pub fn new(value: impl AsRef<[u8]>) -> Result<Self, SessionError> {
+        Self::new_typed(0, value)
+    }
+
+    pub fn new_typed(token_type: u64, value: impl AsRef<[u8]>) -> Result<Self, SessionError> {
         let value = value.as_ref();
         if value.is_empty() {
             return Err(SessionError::ProtocolViolation(
@@ -329,19 +337,46 @@ impl SetupAuthorization {
                 "SETUP authorization material exceeds 4096 bytes".into(),
             ));
         }
-        Ok(Self(Bytes::copy_from_slice(value)))
+        Ok(Self {
+            token_type,
+            value: Bytes::copy_from_slice(value),
+        })
+    }
+
+    fn from_parsed(token_type: u64, value: &[u8]) -> Result<Self, SessionError> {
+        if value.len() > Self::MAX_BYTES {
+            return Err(SessionError::KeyValueFormatting(
+                "authorization token value exceeds 4096 bytes".into(),
+            ));
+        }
+        Ok(Self {
+            token_type,
+            value: Bytes::copy_from_slice(value),
+        })
+    }
+
+    fn encode_wire_value(&self) -> Result<Vec<u8>, SessionError> {
+        Ok(AuthorizationToken::UseValue {
+            token_type: self.token_type,
+            value: self.value.clone(),
+        }
+        .encode_bytes()?)
+    }
+
+    pub const fn token_type(&self) -> u64 {
+        self.token_type
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.value
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.value.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.value.is_empty()
     }
 }
 
@@ -349,6 +384,7 @@ impl std::fmt::Debug for SetupAuthorization {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SetupAuthorization")
+            .field("token_type", &self.token_type)
             .field("bytes", &format_args!("<redacted:{}>", self.len()))
             .finish()
     }
@@ -384,7 +420,7 @@ pub struct Session {
     target: SessionTarget,
 
     /// Bounded authorization material received from this session's peer.
-    setup_authorization: Option<SetupAuthorization>,
+    setup_authorizations: Vec<SetupAuthorization>,
 
     /// Receiver for spawned bidi reader task handles.
     /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
@@ -454,24 +490,45 @@ impl Session {
             .transpose()
     }
 
-    fn setup_authorization(
+    fn setup_authorizations(
         params: &KeyValuePairs,
-    ) -> Result<Option<SetupAuthorization>, SessionError> {
+    ) -> Result<Vec<SetupAuthorization>, SessionError> {
         let key = setup::ParameterType::AuthorizationToken.into();
-        if params.0.iter().filter(|pair| pair.key == key).count() > 1 {
-            return Err(SessionError::ProtocolViolation(
-                "SETUP authorization option must not be repeated".into(),
-            ));
+        let authorizations: Vec<_> = params
+            .get_all(key)
+            .map(|pair| {
+                let Value::BytesValue(value) = &pair.value else {
+                    return Err(SessionError::KeyValueFormatting(
+                        "SETUP authorization option must be bytes-encoded".into(),
+                    ));
+                };
+                match AuthorizationToken::decode_bytes(value)? {
+                    AuthorizationToken::UseValue { token_type, value }
+                    | AuthorizationToken::Register {
+                        token_type, value, ..
+                    } => {
+                        // This implementation advertises the default zero-sized
+                        // authorization cache. Draft-19 requires REGISTER to be
+                        // treated as USE_VALUE when the alias cannot be cached.
+                        SetupAuthorization::from_parsed(token_type, &value)
+                    }
+                    AuthorizationToken::Delete { .. } | AuthorizationToken::UseAlias { .. } => {
+                        Err(SessionError::ProtocolViolation(
+                            "SETUP cannot use DELETE or USE_ALIAS authorization tokens".into(),
+                        ))
+                    }
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let mut resolved = std::collections::HashSet::new();
+        for authorization in &authorizations {
+            if !resolved.insert((authorization.token_type, authorization.value.clone())) {
+                return Err(SessionError::ProtocolViolation(
+                    "SETUP authorization type/value combinations must be unique".into(),
+                ));
+            }
         }
-        let Some(pair) = params.get(key) else {
-            return Ok(None);
-        };
-        let Value::BytesValue(value) = &pair.value else {
-            return Err(SessionError::ProtocolViolation(
-                "SETUP authorization option must be bytes-encoded".into(),
-            ));
-        };
-        SetupAuthorization::new(value).map(Some)
+        Ok(authorizations)
     }
 
     fn target_from_client_setup(
@@ -579,12 +636,24 @@ impl Session {
 
     /// Returns redaction-safe, bounded SETUP authorization material from the peer.
     pub fn peer_setup_authorization(&self) -> Option<&SetupAuthorization> {
-        self.setup_authorization.as_ref()
+        match self.setup_authorizations.as_slice() {
+            [authorization] => Some(authorization),
+            _ => None,
+        }
+    }
+
+    /// Returns every parsed SETUP authorization in peer wire order.
+    pub fn peer_setup_authorizations(&self) -> &[SetupAuthorization] {
+        &self.setup_authorizations
+    }
+
+    pub fn peer_setup_authorization_count(&self) -> usize {
+        self.setup_authorizations.len()
     }
 
     /// Remove raw bearer material once admission has produced bounded claims.
     pub fn clear_peer_setup_authorization(&mut self) {
-        self.setup_authorization = None;
+        self.setup_authorizations.clear();
     }
 
     /// Returns the canonical path and query used for routing this session.
@@ -822,7 +891,7 @@ impl Session {
             mlog: mlog_shared,
             negotiated: config.negotiated,
             target: config.target,
-            setup_authorization: config.setup_authorization,
+            setup_authorizations: config.setup_authorizations,
             bidi_task_rx,
             bidi_response_map,
             max_request_updates: Self::DEFAULT_MAX_REQUEST_UPDATES,
@@ -923,7 +992,7 @@ impl Session {
         if let Some(authorization) = authorization {
             params.set_bytesvalue(
                 setup::ParameterType::AuthorizationToken.into(),
-                authorization.as_bytes().to_vec(),
+                authorization.encode_wire_value()?,
             );
         }
 
@@ -958,6 +1027,7 @@ impl Session {
         let mut recver = Reader::new(recv_stream);
         let server: setup::Setup = recver.decode().await?;
         Self::validate_server_setup_options(&server.params)?;
+        let setup_authorizations = Self::setup_authorizations(&server.params)?;
         let peer_max_request_updates = server.max_request_updates()?;
         tracing::debug!(
             target: "moq_transport::control",
@@ -977,7 +1047,7 @@ impl Session {
             SessionConfig {
                 negotiated,
                 target,
-                setup_authorization: None,
+                setup_authorizations,
                 peer_max_request_updates,
             },
             request_capacity.session(),
@@ -1031,7 +1101,7 @@ impl Session {
         );
 
         let target = Self::target_from_client_setup(session.url(), negotiated, &client.params)?;
-        let setup_authorization = Self::setup_authorization(&client.params)?;
+        let setup_authorizations = Self::setup_authorizations(&client.params)?;
 
         if target.routing_path().is_some() {
             tracing::debug!(
@@ -1079,7 +1149,7 @@ impl Session {
             SessionConfig {
                 negotiated,
                 target,
-                setup_authorization,
+                setup_authorizations,
                 peer_max_request_updates,
             },
             request_capacity.session(),
@@ -2535,17 +2605,101 @@ mod tests {
 
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::AuthorizationToken.into(), 1);
-        assert!(Session::setup_authorization(&params).is_err());
+        assert!(Session::setup_authorizations(&params).is_err());
     }
 
     #[test]
-    fn duplicate_setup_authorization_is_rejected() {
+    fn repeated_setup_authorizations_are_extracted_in_order() {
         let key = setup::ParameterType::AuthorizationToken.into();
         let params = KeyValuePairs(vec![
-            crate::coding::KeyValuePair::new_bytes(key, b"first".to_vec()),
-            crate::coding::KeyValuePair::new_bytes(key, b"second".to_vec()),
+            crate::coding::KeyValuePair::new_bytes(
+                key,
+                AuthorizationToken::use_value(0, b"first")
+                    .unwrap()
+                    .encode_bytes()
+                    .unwrap(),
+            ),
+            crate::coding::KeyValuePair::new_bytes(
+                key,
+                AuthorizationToken::use_value(7, b"second")
+                    .unwrap()
+                    .encode_bytes()
+                    .unwrap(),
+            ),
         ]);
-        assert!(Session::setup_authorization(&params).is_err());
+        let authorizations = Session::setup_authorizations(&params).unwrap();
+        assert_eq!(authorizations.len(), 2);
+        assert_eq!(authorizations[0].token_type(), 0);
+        assert_eq!(authorizations[0].as_bytes(), b"first");
+        assert_eq!(authorizations[1].token_type(), 7);
+        assert_eq!(authorizations[1].as_bytes(), b"second");
+    }
+
+    #[test]
+    fn duplicate_resolved_setup_authorization_is_rejected() {
+        let key = setup::ParameterType::AuthorizationToken.into();
+        let token = AuthorizationToken::use_value(0, b"same")
+            .unwrap()
+            .encode_bytes()
+            .unwrap();
+        let params = KeyValuePairs(vec![
+            crate::coding::KeyValuePair::new_bytes(key, token.clone()),
+            crate::coding::KeyValuePair::new_bytes(key, token),
+        ]);
+        let error = Session::setup_authorizations(&params).unwrap_err();
+        assert!(matches!(error, SessionError::ProtocolViolation(_)));
+    }
+
+    #[test]
+    fn setup_register_is_use_value_when_cache_is_zero() {
+        let key = setup::ParameterType::AuthorizationToken.into();
+        let token = AuthorizationToken::register(37, 9, b"secret")
+            .unwrap()
+            .encode_bytes()
+            .unwrap();
+        let params = KeyValuePairs(vec![crate::coding::KeyValuePair::new_bytes(key, token)]);
+        let authorizations = Session::setup_authorizations(&params).unwrap();
+        assert_eq!(authorizations[0].token_type(), 9);
+        assert_eq!(authorizations[0].as_bytes(), b"secret");
+    }
+
+    #[test]
+    fn setup_delete_and_use_alias_are_protocol_violations() {
+        for token in [
+            AuthorizationToken::delete(37),
+            AuthorizationToken::use_alias(37),
+        ] {
+            let key = setup::ParameterType::AuthorizationToken.into();
+            let params = KeyValuePairs(vec![crate::coding::KeyValuePair::new_bytes(
+                key,
+                token.encode_bytes().unwrap(),
+            )]);
+            let error = Session::setup_authorizations(&params).unwrap_err();
+            assert!(matches!(error, SessionError::ProtocolViolation(_)));
+            assert_eq!(error.code(), 0x3);
+        }
+    }
+
+    #[test]
+    fn malformed_setup_authorization_maps_to_key_value_formatting_error() {
+        let key = setup::ParameterType::AuthorizationToken.into();
+        let params = KeyValuePairs(vec![crate::coding::KeyValuePair::new_bytes(
+            key,
+            vec![0x03],
+        )]);
+        let error = Session::setup_authorizations(&params).unwrap_err();
+        assert!(matches!(error, SessionError::KeyValueFormatting(_)));
+        assert_eq!(error.code(), 0x6);
+    }
+
+    #[test]
+    fn outbound_setup_authorization_uses_use_value_structure() {
+        let authorization = SetupAuthorization::new_typed(7, b"secret").unwrap();
+        let wire = authorization.encode_wire_value().unwrap();
+        assert_eq!(
+            AuthorizationToken::decode_bytes(wire).unwrap(),
+            AuthorizationToken::use_value(7, b"secret").unwrap()
+        );
     }
 
     // ========================================================================

@@ -195,6 +195,11 @@ impl KeyValuePairs {
         }
     }
 
+    /// Append a pair without replacing an existing key.
+    pub fn push(&mut self, kvp: KeyValuePair) {
+        self.0.push(kvp);
+    }
+
     pub fn set_intvalue(&mut self, key: u64, value: u64) {
         self.set(KeyValuePair::new_int(key, value));
     }
@@ -209,6 +214,11 @@ impl KeyValuePairs {
 
     pub fn get(&self, key: u64) -> Option<&KeyValuePair> {
         self.0.iter().find(|k| k.key == key)
+    }
+
+    /// Return every value for a key in original wire/insertion order.
+    pub fn get_all(&self, key: u64) -> impl Iterator<Item = &KeyValuePair> {
+        self.0.iter().filter(move |pair| pair.key == key)
     }
 
     /// Return `true` if any key appears more than once.
@@ -233,12 +243,6 @@ impl Decode for KeyValuePairs {
 
         for _ in 0..count {
             let (pair, new_prev) = KeyValuePair::decode_with_prev(r, prev)?;
-            if kvps
-                .last()
-                .is_some_and(|previous: &KeyValuePair| previous.key == pair.key)
-            {
-                return Err(DecodeError::DuplicateParameter(pair.key));
-            }
             prev = new_prev;
             kvps.push(pair);
         }
@@ -492,6 +496,32 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_keys_roundtrip_in_stable_order() {
+        let kvps = KeyValuePairs(vec![
+            KeyValuePair::new_bytes(3, b"first".to_vec()),
+            KeyValuePair::new_bytes(3, b"second".to_vec()),
+            KeyValuePair::new_int(8, 9),
+        ]);
+        let mut encoded = BytesMut::new();
+        kvps.encode(&mut encoded).unwrap();
+        let decoded = KeyValuePairs::decode(&mut encoded).unwrap();
+        assert_eq!(decoded, kvps);
+        assert_eq!(decoded.get_all(3).count(), 2);
+    }
+
+    #[test]
+    fn bounded_duplicate_keys_roundtrip_in_stable_order() {
+        let kvps = KeyValuePairs(vec![
+            KeyValuePair::new_bytes(3, b"first".to_vec()),
+            KeyValuePair::new_bytes(3, b"second".to_vec()),
+        ]);
+        let encoded = kvps.encode_bounded().unwrap();
+        let decoded =
+            KeyValuePairs::decode_bounded(&mut encoded.as_slice(), encoded.len()).unwrap();
+        assert_eq!(decoded, kvps);
+    }
+
+    #[test]
     fn has_duplicate_keys_no_false_positive() {
         let mut kvps = KeyValuePairs::new();
         kvps.set_intvalue(0, 1);
@@ -570,12 +600,6 @@ impl KeyValuePairs {
 
         while payload.has_remaining() {
             let (pair, new_prev) = KeyValuePair::decode_with_prev(&mut payload, prev)?;
-            if kvps
-                .last()
-                .is_some_and(|previous: &KeyValuePair| previous.key == pair.key)
-            {
-                return Err(DecodeError::DuplicateParameter(pair.key));
-            }
             prev = new_prev;
             kvps.push(pair);
         }

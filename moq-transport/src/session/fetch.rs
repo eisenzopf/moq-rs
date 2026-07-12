@@ -52,6 +52,31 @@ impl Default for JoiningFetchProfile {
 }
 
 /// One complete Object received on a FETCH data stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndOfGroupState {
+    /// A live SUBGROUP_HEADER explicitly carried END_OF_GROUP.
+    Signaled,
+    /// A live SUBGROUP_HEADER did not carry END_OF_GROUP.
+    NotSignaled,
+    /// Draft-19 FETCH serialization cannot carry END_OF_GROUP.
+    UnknownFromFetch,
+}
+
+impl EndOfGroupState {
+    pub const fn from_live_header(signaled: bool) -> Self {
+        if signaled {
+            Self::Signaled
+        } else {
+            Self::NotSignaled
+        }
+    }
+
+    pub const fn is_signaled(self) -> bool {
+        matches!(self, Self::Signaled)
+    }
+}
+
+/// One complete Object received on a FETCH data stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchedObject {
     pub location: Location,
@@ -59,6 +84,10 @@ pub struct FetchedObject {
     pub publisher_priority: u8,
     pub properties: crate::data::ExtensionHeaders,
     pub payload: Bytes,
+    /// Always [`EndOfGroupState::UnknownFromFetch`] for standards-compliant
+    /// draft-19 FETCH. This prevents callers from mistaking range completion
+    /// for an END_OF_GROUP assertion.
+    pub group_end: EndOfGroupState,
 }
 
 #[derive(Clone, Debug)]
@@ -572,6 +601,8 @@ async fn write_retained_object(
     retained: &RetainedObject,
     writer: &mut Writer,
 ) -> Result<(), SessionError> {
+    // Draft-19 FETCH has no END_OF_GROUP field. Keep the assertion in the
+    // retention model, but do not fabricate a private wire property here.
     let object = WireFetchObject {
         group_id: retained.group_id(),
         object_id: retained.object_id(),
@@ -687,6 +718,7 @@ mod tests {
             publisher_priority: 7,
             properties: Default::default(),
             payload: Bytes::from_static(b"opus"),
+            group_end: EndOfGroupState::UnknownFromFetch,
         }
     }
 
@@ -701,6 +733,11 @@ mod tests {
             RetainedRange::new(Location::new(7, 0), Location::new(8, 0))
         );
         assert!(relative_joining_range(Location::new(u64::MAX, u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn fetched_objects_expose_group_end_as_unknown() {
+        assert_eq!(fetched(1, 0).group_end, EndOfGroupState::UnknownFromFetch);
     }
 
     #[test]
@@ -753,6 +790,7 @@ mod tests {
                             subgroup_id,
                             publisher_priority: 7,
                             properties: Default::default(),
+                            end_of_group: true,
                         },
                         Bytes::from_static(b"opus"),
                     )

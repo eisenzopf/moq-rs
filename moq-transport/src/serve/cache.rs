@@ -303,6 +303,9 @@ pub struct RetainedObjectMetadata {
     pub subgroup_id: Option<u64>,
     pub publisher_priority: u8,
     pub properties: ExtensionHeaders,
+    /// Whether the original live subgroup header asserted END_OF_GROUP.
+    /// Standard draft-19 FETCH cannot serialize this field.
+    pub end_of_group: bool,
 }
 
 /// A complete immutable object whose payload remains reference-counted.
@@ -372,6 +375,10 @@ impl RetainedObject {
 
     pub fn properties(&self) -> &ExtensionHeaders {
         &self.metadata.properties
+    }
+
+    pub fn end_of_group(&self) -> bool {
+        self.metadata.end_of_group
     }
 
     pub fn payload(&self) -> &Bytes {
@@ -923,6 +930,7 @@ mod tests {
             subgroup_id,
             publisher_priority: 7,
             properties: ExtensionHeaders::new(),
+            end_of_group: false,
         }
     }
 
@@ -937,6 +945,15 @@ mod tests {
             Bytes::from(vec![object_id as u8; size]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn retained_object_preserves_live_end_of_group_metadata() {
+        let mut metadata = metadata(1, 0, Some(0));
+        metadata.end_of_group = true;
+        let object = RetainedObject::new(metadata, Bytes::from_static(b"opus")).unwrap();
+        assert!(object.end_of_group());
+        assert!(object.metadata().end_of_group);
     }
 
     fn range(start: (u64, u64), end: (u64, u64)) -> RetainedRange {

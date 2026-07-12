@@ -95,10 +95,22 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_duplicate_authorization_parameters() {
+    fn decode_accepts_duplicate_structured_authorization_parameters() {
         let params = KeyValuePairs(vec![
-            crate::coding::KeyValuePair::new_bytes(0x03, b"first".to_vec()),
-            crate::coding::KeyValuePair::new_bytes(0x03, b"second".to_vec()),
+            crate::coding::KeyValuePair::new_bytes(
+                0x03,
+                crate::coding::AuthorizationToken::use_value(0, b"first")
+                    .unwrap()
+                    .encode_bytes()
+                    .unwrap(),
+            ),
+            crate::coding::KeyValuePair::new_bytes(
+                0x03,
+                crate::coding::AuthorizationToken::use_value(0, b"second")
+                    .unwrap()
+                    .encode_bytes()
+                    .unwrap(),
+            ),
         ]);
         let message = Subscribe {
             id: 0,
@@ -108,10 +120,8 @@ mod tests {
         };
         let mut encoded = BytesMut::new();
         message.encode(&mut encoded).unwrap();
-        assert!(matches!(
-            Subscribe::decode(&mut encoded),
-            Err(DecodeError::DuplicateParameter(0x03))
-        ));
+        let decoded = Subscribe::decode(&mut encoded).unwrap();
+        assert_eq!(decoded.params.get_all(0x03).count(), 2);
     }
 
     #[test]

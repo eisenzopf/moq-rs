@@ -21,7 +21,7 @@ use crate::{
 use crate::watch::State;
 
 use super::Subscriber;
-use super::{RequestLease, SessionError};
+use super::{EndOfGroupState, RequestLease, SessionError};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -339,7 +339,7 @@ pub(super) struct BufferedJoinObject {
     pub properties: data::ExtensionHeaders,
     pub payload: bytes::Bytes,
     pub first_object: bool,
-    pub end_of_group: bool,
+    pub group_end: EndOfGroupState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -353,6 +353,8 @@ struct JoinBarrier {
     phase: JoinBarrierPhase,
     cutoff: Option<Location>,
     buffered: BTreeMap<Location, BufferedJoinObject>,
+    fetched: BTreeMap<Location, BufferedJoinObject>,
+    signaled_group_ends: HashSet<(u64, u64)>,
     buffered_bytes: usize,
 }
 
@@ -362,6 +364,8 @@ impl JoinBarrier {
             phase: JoinBarrierPhase::AwaitingSubscribeOk,
             cutoff: None,
             buffered: BTreeMap::new(),
+            fetched: BTreeMap::new(),
+            signaled_group_ends: HashSet::new(),
             buffered_bytes: 0,
         }
     }
@@ -377,6 +381,10 @@ impl JoinBarrier {
                 .collect();
             for location in discarded {
                 if let Some(object) = self.buffered.remove(&location) {
+                    if object.group_end.is_signaled() {
+                        self.signaled_group_ends
+                            .insert((object.location.group_id, object.subgroup_id));
+                    }
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(object.payload.len());
                 }
                 seen.remove(&(location.group_id, location.object_id));
@@ -399,27 +407,73 @@ impl JoinBarrier {
                 "released Joining FETCH barrier cannot buffer live media",
             ));
         }
-        if self.buffered.contains_key(&object.location) {
+        if self.buffered.contains_key(&object.location)
+            || self.fetched.contains_key(&object.location)
+        {
             return Err(ServeError::Duplicate);
         }
         let bytes = self
             .buffered_bytes
             .checked_add(object.payload.len())
             .ok_or_else(|| ServeError::internal_ctx("Joining FETCH buffer byte overflow"))?;
-        if self.buffered.len() >= JOIN_BARRIER_MAX_OBJECTS || bytes > JOIN_BARRIER_MAX_BYTES {
+        if self.buffered.len() + self.fetched.len() >= JOIN_BARRIER_MAX_OBJECTS
+            || bytes > JOIN_BARRIER_MAX_BYTES
+        {
             return Err(ServeError::Closed(
                 message::RequestErrorCode::ExcessiveLoad as u64,
             ));
+        }
+        if object.group_end.is_signaled() {
+            self.signaled_group_ends
+                .insert((object.location.group_id, object.subgroup_id));
         }
         self.buffered_bytes = bytes;
         self.buffered.insert(object.location, object);
         Ok(())
     }
 
+    fn buffer_fetched(&mut self, object: BufferedJoinObject) -> Result<(), ServeError> {
+        if self.phase != JoinBarrierPhase::Fetching {
+            return Err(ServeError::internal_ctx(
+                "fetched Object arrived outside the barrier fetch phase",
+            ));
+        }
+        if self.buffered.contains_key(&object.location)
+            || self.fetched.contains_key(&object.location)
+        {
+            return Err(ServeError::Duplicate);
+        }
+        let bytes = self
+            .buffered_bytes
+            .checked_add(object.payload.len())
+            .ok_or_else(|| ServeError::internal_ctx("Joining FETCH buffer byte overflow"))?;
+        if self.buffered.len() + self.fetched.len() >= JOIN_BARRIER_MAX_OBJECTS
+            || bytes > JOIN_BARRIER_MAX_BYTES
+        {
+            return Err(ServeError::Closed(
+                message::RequestErrorCode::ExcessiveLoad as u64,
+            ));
+        }
+        self.buffered_bytes = bytes;
+        self.fetched.insert(object.location, object);
+        Ok(())
+    }
+
     fn release(&mut self) -> Vec<BufferedJoinObject> {
         self.phase = JoinBarrierPhase::Released;
         self.buffered_bytes = 0;
-        std::mem::take(&mut self.buffered).into_values().collect()
+        let mut objects = std::mem::take(&mut self.fetched);
+        objects.append(&mut self.buffered);
+        let signaled_group_ends = std::mem::take(&mut self.signaled_group_ends);
+        objects
+            .into_values()
+            .map(|mut object| {
+                if signaled_group_ends.contains(&(object.location.group_id, object.subgroup_id)) {
+                    object.group_end = EndOfGroupState::Signaled;
+                }
+                object
+            })
+            .collect()
     }
 }
 
@@ -823,7 +877,10 @@ impl SubscribeRecv {
         {
             return Ok(());
         }
-        self.write_joining_object(object)
+        self.join_barrier
+            .as_mut()
+            .ok_or_else(|| ServeError::internal_ctx("Joining FETCH barrier is not active"))?
+            .buffer_fetched(object)
     }
 
     pub(super) fn finish_joining_fetch(&mut self) -> Result<(), ServeError> {
@@ -889,7 +946,7 @@ impl SubscribeRecv {
                     object.publisher_priority,
                 )
                 .with_first_object(object.first_object)
-                .with_end_of_group(object.end_of_group),
+                .with_end_of_group(object.group_end.is_signaled()),
             )?;
             self.writer = Some(subgroups.into());
             self.joining_writers.insert(key, subgroup);
@@ -997,7 +1054,7 @@ mod tests {
             properties: Default::default(),
             payload: bytes::Bytes::from_static(payload),
             first_object: object_id == 0,
-            end_of_group: false,
+            group_end: EndOfGroupState::NotSignaled,
         }
     }
 
@@ -1377,12 +1434,15 @@ mod tests {
         assert!(!recv.claim_object(0, 1));
 
         assert!(recv.claim_object(0, 2));
-        recv.recv_joining_live_object(buffered(0, 2, b"live"))
-            .unwrap();
-        recv.recv_fetched_object(buffered(0, 0, b"fetch-0"))
-            .unwrap();
-        recv.recv_fetched_object(buffered(0, 1, b"fetch-1"))
-            .unwrap();
+        let mut live = buffered(0, 2, b"live");
+        live.group_end = EndOfGroupState::Signaled;
+        recv.recv_joining_live_object(live).unwrap();
+        let mut fetch_zero = buffered(0, 0, b"fetch-0");
+        fetch_zero.group_end = EndOfGroupState::UnknownFromFetch;
+        recv.recv_fetched_object(fetch_zero).unwrap();
+        let mut fetch_one = buffered(0, 1, b"fetch-1");
+        fetch_one.group_end = EndOfGroupState::UnknownFromFetch;
+        recv.recv_fetched_object(fetch_one).unwrap();
         // Duplicate FETCH copies are ignored by the shared location set.
         recv.recv_fetched_object(buffered(0, 1, b"duplicate"))
             .unwrap();
@@ -1393,6 +1453,7 @@ mod tests {
         };
         let mut subgroup = groups.next().await.unwrap().unwrap();
         assert_eq!(subgroup.len(), 3);
+        assert!(subgroup.end_of_group);
         let mut payloads = Vec::new();
         for _ in 0..3 {
             payloads.push(
@@ -1414,6 +1475,34 @@ mod tests {
                 bytes::Bytes::from_static(b"live"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn late_fetch_without_live_evidence_keeps_end_of_group_unknown() {
+        let (mut recv, reader) = joining_recv();
+        recv.begin_joining_fetch().unwrap();
+        let mut params = KeyValuePairs::default();
+        params.set_largest_object(Location::new(0, 1)).unwrap();
+        recv.ok(&message::SubscribeOk {
+            id: 0,
+            track_alias: 0,
+            params,
+            track_extensions: Default::default(),
+        })
+        .unwrap();
+
+        for (object_id, payload) in [(0, b"fetch-0" as &[u8]), (1, b"fetch-1")] {
+            let mut object = buffered(0, object_id, payload);
+            object.group_end = EndOfGroupState::UnknownFromFetch;
+            recv.recv_fetched_object(object).unwrap();
+        }
+        recv.finish_joining_fetch().unwrap();
+
+        let serve::TrackReaderMode::Subgroups(mut groups) = reader.mode().await.unwrap() else {
+            panic!("Joining FETCH must preserve subgroup delivery");
+        };
+        let subgroup = groups.next().await.unwrap().unwrap();
+        assert!(!subgroup.end_of_group);
     }
 
     #[test]

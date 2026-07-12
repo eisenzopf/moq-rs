@@ -4,32 +4,91 @@
 use bytes::Buf as _;
 
 use crate::coding::{
-    Decode, DecodeError, Encode, EncodeError, KeyValuePair, KeyValuePairs, Location, Value,
+    AuthorizationToken, Decode, DecodeError, Encode, EncodeError, KeyValuePair, KeyValuePairs,
+    Location, Value,
 };
 use crate::message::{FilterType, GroupOrder};
 
 /// Decode a count-prefixed request/response parameter block.
 ///
 /// Request parameters are a distinct keyspace from trailing track/object
-/// extensions. Duplicate request keys are rejected before any typed accessor
-/// can interpret a first or last value, while unknown unique parameters remain
-/// available to applications for extension negotiation.
+/// extensions. Known singleton keys are rejected when repeated, while repeated
+/// authorization and unknown extension parameters are preserved in wire order.
 pub(super) fn decode_request_parameters<R: bytes::Buf>(
     r: &mut R,
 ) -> Result<KeyValuePairs, DecodeError> {
     let params = KeyValuePairs::decode(r)?;
-    if let Some(duplicate) = duplicate_parameter_key(&params) {
-        return Err(DecodeError::DuplicateParameter(duplicate));
+    for key in [
+        parameter_type::DELIVERY_TIMEOUT,
+        parameter_type::EXPIRES,
+        parameter_type::LARGEST_OBJECT,
+        parameter_type::FORWARD,
+        parameter_type::SUBSCRIBER_PRIORITY,
+        parameter_type::SUBSCRIPTION_FILTER,
+        parameter_type::GROUP_ORDER,
+        parameter_type::NEW_GROUP_REQUEST,
+    ] {
+        if params.get_all(key).count() > 1 {
+            return Err(DecodeError::DuplicateParameter(key));
+        }
     }
+    request_authorization_tokens(&params)?;
     Ok(params)
 }
 
-fn duplicate_parameter_key(params: &KeyValuePairs) -> Option<u64> {
-    let mut seen = std::collections::HashSet::new();
-    params
-        .0
-        .iter()
-        .find_map(|parameter| (!seen.insert(parameter.key)).then_some(parameter.key))
+/// Parse every request authorization token in wire order.
+///
+/// Request alias caches are not implemented yet. Alias operations therefore
+/// fail closed instead of being exposed as opaque bearer bytes.
+pub fn request_authorization_tokens(
+    params: &KeyValuePairs,
+) -> Result<Vec<AuthorizationToken>, DecodeError> {
+    let tokens: Vec<_> = params
+        .get_all(parameter_type::AUTHORIZATION_TOKEN)
+        .map(|parameter| {
+            let Value::BytesValue(value) = &parameter.value else {
+                return Err(DecodeError::AuthorizationTokenFormatting(
+                    "authorization parameter is not byte-valued".into(),
+                ));
+            };
+            let token = AuthorizationToken::decode_bytes(value)?;
+            if !matches!(token, AuthorizationToken::UseValue { .. }) {
+                return Err(DecodeError::UnsupportedAuthorizationTokenAlias(
+                    token.alias_type() as u64,
+                ));
+            }
+            Ok(token)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut resolved = std::collections::HashSet::new();
+    for token in &tokens {
+        let (Some(token_type), Some(value)) = (token.token_type(), token.value()) else {
+            unreachable!("request aliases were rejected above");
+        };
+        if !resolved.insert((token_type, value)) {
+            return Err(DecodeError::DuplicateParameter(
+                parameter_type::AUTHORIZATION_TOKEN,
+            ));
+        }
+    }
+    Ok(tokens)
+}
+
+pub fn request_authorization_token_count(params: &KeyValuePairs) -> usize {
+    params.get_all(parameter_type::AUTHORIZATION_TOKEN).count()
+}
+
+/// Exact-one compatibility accessor. Repeated tokens are available through
+/// [`request_authorization_tokens`].
+pub fn request_authorization_token(
+    params: &KeyValuePairs,
+) -> Result<Option<AuthorizationToken>, DecodeError> {
+    let mut tokens = request_authorization_tokens(params)?.into_iter();
+    let first = tokens.next();
+    Ok(match (first, tokens.next()) {
+        (Some(token), None) => Some(token),
+        _ => None,
+    })
 }
 
 /// Draft-16 message-parameter type IDs.
@@ -454,9 +513,8 @@ mod tests {
     }
 
     #[test]
-    fn request_parameters_reject_duplicate_security_and_behavior_keys() {
+    fn request_parameters_reject_duplicate_singleton_behavior_keys() {
         for pair in [
-            KeyValuePair::new_bytes(parameter_type::AUTHORIZATION_TOKEN, b"secret".to_vec()),
             KeyValuePair::new_int(parameter_type::FORWARD, 1),
             KeyValuePair::new_bytes(parameter_type::SUBSCRIPTION_FILTER, vec![0x04]),
         ] {
@@ -469,6 +527,86 @@ mod tests {
                 Err(DecodeError::DuplicateParameter(duplicate)) if duplicate == key
             ));
         }
+    }
+
+    #[test]
+    fn request_parameters_preserve_repeated_structured_authorization() {
+        let first = AuthorizationToken::use_value(0, b"first")
+            .unwrap()
+            .encode_bytes()
+            .unwrap();
+        let second = AuthorizationToken::use_value(7, b"second")
+            .unwrap()
+            .encode_bytes()
+            .unwrap();
+        let params = KeyValuePairs(vec![
+            KeyValuePair::new_bytes(parameter_type::AUTHORIZATION_TOKEN, first),
+            KeyValuePair::new_bytes(parameter_type::AUTHORIZATION_TOKEN, second),
+        ]);
+        let mut encoded = BytesMut::new();
+        params.encode(&mut encoded).unwrap();
+
+        let decoded = decode_request_parameters(&mut encoded).unwrap();
+        let tokens = request_authorization_tokens(&decoded).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].token_type(), Some(0));
+        assert_eq!(tokens[0].value(), Some(b"first".as_slice()));
+        assert_eq!(tokens[1].token_type(), Some(7));
+        assert_eq!(tokens[1].value(), Some(b"second".as_slice()));
+        assert_eq!(request_authorization_token_count(&decoded), 2);
+        assert_eq!(request_authorization_token(&decoded).unwrap(), None);
+    }
+
+    #[test]
+    fn request_parameters_reject_duplicate_resolved_authorization() {
+        let token = AuthorizationToken::use_value(0, b"same")
+            .unwrap()
+            .encode_bytes()
+            .unwrap();
+        let params = KeyValuePairs(vec![
+            KeyValuePair::new_bytes(parameter_type::AUTHORIZATION_TOKEN, token.clone()),
+            KeyValuePair::new_bytes(parameter_type::AUTHORIZATION_TOKEN, token),
+        ]);
+        let mut encoded = BytesMut::new();
+        params.encode(&mut encoded).unwrap();
+        assert!(matches!(
+            decode_request_parameters(&mut encoded),
+            Err(DecodeError::DuplicateParameter(
+                parameter_type::AUTHORIZATION_TOKEN
+            ))
+        ));
+    }
+
+    #[test]
+    fn request_authorization_aliases_fail_closed_without_a_cache() {
+        for token in [
+            AuthorizationToken::delete(37),
+            AuthorizationToken::use_alias(37),
+            AuthorizationToken::register(37, 0, b"secret").unwrap(),
+        ] {
+            let params = KeyValuePairs(vec![KeyValuePair::new_bytes(
+                parameter_type::AUTHORIZATION_TOKEN,
+                token.encode_bytes().unwrap(),
+            )]);
+            let mut encoded = BytesMut::new();
+            params.encode(&mut encoded).unwrap();
+            assert!(matches!(
+                decode_request_parameters(&mut encoded),
+                Err(DecodeError::UnsupportedAuthorizationTokenAlias(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn request_parameters_preserve_repeated_unknown_extensions() {
+        let params = KeyValuePairs(vec![
+            KeyValuePair::new_bytes(0x7f, vec![0x01]),
+            KeyValuePair::new_bytes(0x7f, vec![0x02]),
+        ]);
+        let mut encoded = BytesMut::new();
+        params.encode(&mut encoded).unwrap();
+        let decoded = decode_request_parameters(&mut encoded).unwrap();
+        assert_eq!(decoded, params);
     }
 
     #[test]

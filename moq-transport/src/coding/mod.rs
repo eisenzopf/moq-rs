@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod authorization_token;
 mod bounded_string;
 mod decode;
 mod encode;
@@ -14,6 +15,7 @@ mod track_namespace;
 mod tuple;
 mod varint;
 
+pub use authorization_token::*;
 pub use bounded_string::*;
 pub use decode::*;
 pub use encode::*;

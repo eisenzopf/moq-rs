@@ -22,10 +22,11 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    BidiCommand, BidiResponseMap, BufferedJoinObject, Fetch, FetchRecv, FetchedObject,
-    PublishReceived, PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader,
-    RequestClass, RequestDirection, RequestId, RequestLease, Session, SessionError,
-    SessionRequestCapacity, Subscribe, SubscribeOptions, SubscribeRecv, Writer,
+    BidiCommand, BidiResponseMap, BufferedJoinObject, EndOfGroupState, Fetch, FetchRecv,
+    FetchedObject, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    PublishedNamespaceRecv, Reader, RequestClass, RequestDirection, RequestId, RequestLease,
+    Session, SessionError, SessionRequestCapacity, Subscribe, SubscribeOptions, SubscribeRecv,
+    Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -1551,6 +1552,7 @@ impl Subscriber {
                     publisher_priority: object.publisher_priority,
                     properties: object.properties,
                     payload: payload.freeze(),
+                    group_end: EndOfGroupState::UnknownFromFetch,
                 };
                 self.recv_fetch_object(request_id, fetched)?;
             }
@@ -1608,7 +1610,7 @@ impl Subscriber {
                 properties: object.properties.clone(),
                 payload: object.payload.clone(),
                 first_object: object.location.object_id == 0,
-                end_of_group: false,
+                group_end: object.group_end,
             })?;
         Ok(())
     }
@@ -2118,7 +2120,9 @@ impl Subscriber {
                         properties: extension_headers.clone().unwrap_or_default(),
                         payload: payload.clone(),
                         first_object: stream_header_type.is_first_object(),
-                        end_of_group: stream_header_type.contains_end_of_group(),
+                        group_end: EndOfGroupState::from_live_header(
+                            stream_header_type.contains_end_of_group(),
+                        ),
                     };
                     if let Err(error) = self.binding_recv_joining_live_object(binding, object) {
                         failed_bindings.push((binding, error));

@@ -161,7 +161,7 @@ pub struct ObjectDatagramCreated {
 }
 
 /// LogLevel event for flexible logging (qlog loglevel schema)
-/// See: https://www.ietf.org/archive/id/draft-ietf-quic-qlog-main-schema-12.html#name-loglevel-events
+/// See: <https://www.ietf.org/archive/id/draft-ietf-quic-qlog-main-schema-12.html#name-loglevel-events>
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogLevelEvent {

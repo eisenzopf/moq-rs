@@ -14,6 +14,7 @@ pub enum SessionTerminationCode {
     InternalError = 0x1,
     Unauthorized = 0x2,
     ProtocolViolation = 0x3,
+    KeyValueFormattingError = 0x6,
 }
 
 impl SessionTerminationCode {
@@ -31,7 +32,11 @@ pub enum SessionError {
     Encode(#[from] coding::EncodeError),
 
     #[error("decode error: {0}")]
-    Decode(#[from] coding::DecodeError),
+    Decode(coding::DecodeError),
+
+    /// Draft-19 KEY_VALUE_FORMATTING_ERROR (0x6).
+    #[error("key-value formatting error: {0}")]
+    KeyValueFormatting(String),
 
     /// TODO SLG - eventually remove or morph into error for incorrect control message for publisher/subscriber
     /// The role negiotiated in the handshake was violated. For example, a publisher sent a SUBSCRIBE, or a subscriber sent an OBJECT.
@@ -110,6 +115,7 @@ impl SessionError {
             Self::Internal => 0x1,
             // PROTOCOL_VIOLATION (0x3) - Malformed messages
             Self::Decode(_) => 0x3,
+            Self::KeyValueFormatting(_) => 0x6,
             Self::WrongSize => 0x3,
             // Draft-19 setup-option failures.
             Self::InvalidPath(_) => 0x8,
@@ -197,6 +203,17 @@ impl SessionError {
                 web_transport::quinn::WriteError::Stopped(_)
             ))
         )
+    }
+}
+
+impl From<coding::DecodeError> for SessionError {
+    fn from(error: coding::DecodeError) -> Self {
+        match error {
+            coding::DecodeError::AuthorizationTokenFormatting(reason) => {
+                Self::KeyValueFormatting(reason)
+            }
+            error => Self::Decode(error),
+        }
     }
 }
 
