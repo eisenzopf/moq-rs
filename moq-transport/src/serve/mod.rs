@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod cache;
 mod datagram;
 mod error;
 mod object;
@@ -10,6 +11,7 @@ mod subgroup;
 mod track;
 mod tracks;
 
+pub use cache::*;
 pub use datagram::*;
 pub use error::*;
 pub use object::*;
