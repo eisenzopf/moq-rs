@@ -18,6 +18,10 @@ use crate::{
 
 use crate::watch::Queue;
 
+use super::subscribed::{
+    lookup_joining_subscription as lookup_joining_subscription_in, JoiningSubscriptionLookup,
+    JoiningSubscriptionLookupError,
+};
 use super::{
     BidiCommand, BidiResponseMap, PublishNamespace, PublishNamespaceRecv,
     PublishNamespaceRejection, Published, PublishedInfo, RequestId, RequestUpdateCredits, Session,
@@ -125,6 +129,23 @@ impl Publisher {
     ) -> Result<(Session, Publisher), SessionError> {
         let (session, publisher, _) = Session::connect(session, None, negotiated).await?;
         Ok((session, publisher))
+    }
+
+    /// Resolve a Joining FETCH reference only within this MOQT session.
+    ///
+    /// Pending subscriber-initiated subscriptions are returned so the FETCH
+    /// layer can wait for establishment. Unknown, publisher-initiated, and
+    /// terminated subscriptions are rejected by the state helper.
+    #[allow(dead_code)] // Consumed when the request-stream FETCH handler lands.
+    pub(super) fn lookup_joining_subscription(
+        &self,
+        request_id: u64,
+    ) -> Result<JoiningSubscriptionLookup, JoiningSubscriptionLookupError> {
+        let subscriptions = self
+            .subscribeds
+            .lock()
+            .map_err(|_| JoiningSubscriptionLookupError::Internal)?;
+        lookup_joining_subscription_in(&subscriptions, request_id)
     }
 
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided

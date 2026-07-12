@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashMap;
 use std::ops;
 use std::sync::{Arc, Mutex};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase};
+use crate::coding::{Encode, KeyValuePairs, Location, ReasonPhrase, TrackName, TrackNamespace};
 use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
@@ -19,11 +20,42 @@ use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 
 // This file defines Publisher handling of inbound Subscriptions
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SubscriptionPhase {
+    Pending,
+    Established,
+    Terminated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionOperation {
+    Establish,
+    ObserveObject,
+    UpdateForward,
+    Terminate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum SubscriptionStateError {
+    #[error("cannot {operation:?} a subscription in phase {phase:?}")]
+    InvalidTransition {
+        phase: SubscriptionPhase,
+        operation: SubscriptionOperation,
+    },
+}
+
+impl From<SubscriptionStateError> for ServeError {
+    fn from(error: SubscriptionStateError) -> Self {
+        ServeError::internal_ctx(error.to_string())
+    }
+}
+
 #[derive(Debug)]
 struct SubscribedState {
     largest_location: Option<Location>,
+    joining_location: Option<Location>,
     stream_count: u64,
-    accepted: bool,
+    phase: SubscriptionPhase,
     forward: bool,
     peer_rejected: bool,
     closed: Result<(), ServeError>,
@@ -34,13 +66,94 @@ impl SubscribedState {
         self.stream_count = self.stream_count.saturating_add(1);
     }
 
-    fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
-        if let Some(current_largest_location) = self.largest_location {
-            let update_largest_location = Location::new(group_id, object_id);
-            if update_largest_location > current_largest_location {
-                self.largest_location = Some(update_largest_location);
-            }
+    fn ensure_phase(
+        &self,
+        expected: SubscriptionPhase,
+        operation: SubscriptionOperation,
+    ) -> Result<(), SubscriptionStateError> {
+        if self.phase == expected {
+            Ok(())
+        } else {
+            Err(SubscriptionStateError::InvalidTransition {
+                phase: self.phase,
+                operation,
+            })
         }
+    }
+
+    fn establish(
+        &mut self,
+        communicated_largest: Option<Location>,
+    ) -> Result<(), SubscriptionStateError> {
+        self.ensure_phase(SubscriptionPhase::Pending, SubscriptionOperation::Establish)?;
+        if let Some(location) = communicated_largest {
+            self.observe_largest_location(location)?;
+        }
+
+        self.phase = SubscriptionPhase::Established;
+        if self.forward {
+            self.joining_location = self.largest_location;
+        }
+
+        Ok(())
+    }
+
+    fn observe_largest_location(
+        &mut self,
+        location: Location,
+    ) -> Result<(), SubscriptionStateError> {
+        if self.phase == SubscriptionPhase::Terminated {
+            return Err(SubscriptionStateError::InvalidTransition {
+                phase: self.phase,
+                operation: SubscriptionOperation::ObserveObject,
+            });
+        }
+
+        if self
+            .largest_location
+            .is_none_or(|current| location > current)
+        {
+            self.largest_location = Some(location);
+        }
+
+        Ok(())
+    }
+
+    fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
+        self.observe_largest_location(Location::new(group_id, object_id))?;
+
+        Ok(())
+    }
+
+    fn update_forward(
+        &mut self,
+        forward: bool,
+        communicated_largest: Option<Location>,
+    ) -> Result<(), SubscriptionStateError> {
+        self.ensure_phase(
+            SubscriptionPhase::Established,
+            SubscriptionOperation::UpdateForward,
+        )?;
+
+        if let Some(location) = communicated_largest {
+            self.observe_largest_location(location)?;
+        }
+        if !self.forward && forward {
+            self.joining_location = self.largest_location;
+        }
+        self.forward = forward;
+
+        Ok(())
+    }
+
+    fn terminate(&mut self) -> Result<(), SubscriptionStateError> {
+        if self.phase == SubscriptionPhase::Terminated {
+            return Err(SubscriptionStateError::InvalidTransition {
+                phase: self.phase,
+                operation: SubscriptionOperation::Terminate,
+            });
+        }
+        self.phase = SubscriptionPhase::Terminated;
 
         Ok(())
     }
@@ -50,11 +163,52 @@ impl Default for SubscribedState {
     fn default() -> Self {
         Self {
             largest_location: None,
+            joining_location: None,
             stream_count: 0,
-            accepted: false,
+            phase: SubscriptionPhase::Pending,
             forward: true,
             peer_rejected: false,
             closed: Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct JoiningSubscription {
+    pub request_id: u64,
+    pub track_namespace: TrackNamespace,
+    pub track_name: TrackName,
+    pub joining_location: Location,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum JoiningSubscriptionLookup {
+    Pending,
+    Established(JoiningSubscription),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(super) enum JoiningSubscriptionLookupError {
+    #[error("joining request ID does not identify a live subscriber-initiated subscription")]
+    InvalidJoiningRequestId,
+    #[error("joining subscription has Forward disabled")]
+    ForwardDisabled,
+    #[error("joining subscription has no saved Joining Location")]
+    NoJoiningLocation,
+    #[error("joining subscription registry is unavailable")]
+    #[allow(dead_code)] // Constructed by Publisher's next-stage FETCH lookup entry point.
+    Internal,
+}
+
+impl JoiningSubscriptionLookupError {
+    #[allow(dead_code)] // Used by the next-stage FETCH response mapping.
+    pub(super) fn request_error_code(self) -> message::RequestErrorCode {
+        match self {
+            Self::InvalidJoiningRequestId => message::RequestErrorCode::InvalidJoiningRequestId,
+            Self::ForwardDisabled | Self::NoJoiningLocation => {
+                message::RequestErrorCode::InvalidRange
+            }
+            Self::Internal => message::RequestErrorCode::InternalError,
         }
     }
 }
@@ -107,6 +261,7 @@ impl Subscribed {
             ..Default::default()
         };
         let (send, recv) = State::new(initial).split();
+        let recv_info = info.clone();
         let send = Self {
             publisher,
             state: send,
@@ -117,7 +272,10 @@ impl Subscribed {
         };
 
         // Prevents updates after being closed
-        let recv = SubscribedRecv { state: recv };
+        let recv = SubscribedRecv {
+            state: recv,
+            info: recv_info,
+        };
 
         Ok((send, recv))
     }
@@ -137,10 +295,12 @@ impl Subscribed {
         let info = SubscribeInfo::new_from_subscribe(&synthetic)?;
         let forward = msg.params.forward()?.unwrap_or(true);
         let initial = SubscribedState {
+            largest_location: msg.params.largest_object()?,
             forward,
             ..Default::default()
         };
         let (send, recv) = State::new(initial).split();
+        let recv_info = info.clone();
         let published = Self {
             publisher,
             state: send,
@@ -149,7 +309,13 @@ impl Subscribed {
             initiator: SubscriptionInitiator::Publisher,
             mlog,
         };
-        Ok((published, SubscribedRecv { state: recv }))
+        Ok((
+            published,
+            SubscribedRecv {
+                state: recv,
+                info: recv_info,
+            },
+        ))
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
@@ -164,11 +330,6 @@ impl Subscribed {
     async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         // Update largest location before sending SubscribeOk
         let largest_location = track.largest_location();
-        self.state
-            .lock_mut()
-            .ok_or(ServeError::Cancel)?
-            .largest_location = largest_location;
-
         // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
         // we start serving the track.  If a subscriber gets the stream before SubscribeOk
         // then they won't recognize the track_alias in the stream header.
@@ -188,6 +349,11 @@ impl Subscribed {
             })
             .await;
 
+        self.state
+            .lock_mut()
+            .ok_or(ServeError::Cancel)?
+            .establish(largest_location)
+            .map_err(ServeError::from)?;
         self.ok = true; // So we send SubscribeDone on drop
 
         let mut delivery_filter = self.info.delivery_filter(largest_location);
@@ -216,8 +382,10 @@ impl Subscribed {
             {
                 let state = self.state.lock();
                 state.closed.clone()?;
-                if state.accepted {
-                    return Ok(());
+                match state.phase {
+                    SubscriptionPhase::Pending => {}
+                    SubscriptionPhase::Established => return Ok(()),
+                    SubscriptionPhase::Terminated => return Err(ServeError::Done),
                 }
                 match state.modified() {
                     Some(notify) => notify,
@@ -250,7 +418,11 @@ impl Subscribed {
         let largest_location = track.largest_location();
         {
             let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
-            state.largest_location = largest_location;
+            if let Some(location) = largest_location {
+                state
+                    .observe_largest_location(location)
+                    .map_err(ServeError::from)?;
+            }
         }
         let delivery_filter = DeliveryFilter {
             forward: true,
@@ -282,6 +454,7 @@ impl Subscribed {
     pub(super) fn cancel_request_stream(&mut self) {
         if let Some(mut state) = self.state.lock_mut() {
             state.peer_rejected = true;
+            let _ = state.terminate();
             state.closed = Err(ServeError::Cancel);
         }
         self.publisher
@@ -293,6 +466,7 @@ impl Subscribed {
         state.closed.clone()?;
 
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
+        state.terminate()?;
         state.closed = Err(err);
 
         Ok(())
@@ -333,7 +507,9 @@ impl Drop for Subscribed {
             .unwrap_or(ServeError::Done);
         let stream_count = state.stream_count;
         let peer_rejected = state.peer_rejected;
-        drop(state); // Important to avoid a deadlock
+        if let Some(mut state) = state.into_mut() {
+            let _ = state.terminate();
+        }
 
         if self.initiator == SubscriptionInitiator::Publisher {
             if peer_rejected {
@@ -736,6 +912,7 @@ impl Subscribed {
 
 pub(super) struct SubscribedRecv {
     state: State<SubscribedState>,
+    info: SubscribeInfo,
 }
 
 impl SubscribedRecv {
@@ -744,20 +921,22 @@ impl SubscribedRecv {
             .params
             .forward()
             .map_err(|_| ServeError::internal_ctx("invalid FORWARD in PUBLISH_OK"))?;
-        if let Some(mut state) = self.state.lock_mut() {
-            state.accepted = true;
-            if let Some(forward) = forward {
-                state.forward = forward;
-            }
+        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        state.closed.clone()?;
+        state.ensure_phase(SubscriptionPhase::Pending, SubscriptionOperation::Establish)?;
+        if let Some(forward) = forward {
+            state.forward = forward;
         }
+        state.establish(None)?;
         Ok(())
     }
 
     pub fn recv_error(&mut self, err: ServeError) -> Result<(), ServeError> {
-        if let Some(mut state) = self.state.lock_mut() {
-            state.peer_rejected = true;
-            state.closed = Err(err);
-        }
+        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        state.closed.clone()?;
+        state.terminate()?;
+        state.peer_rejected = true;
+        state.closed = Err(err);
         Ok(())
     }
 
@@ -766,6 +945,7 @@ impl SubscribedRecv {
         state.closed.clone()?;
 
         if let Some(mut state) = state.into_mut() {
+            state.terminate()?;
             state.closed = Err(ServeError::Closed(
                 message::PublishDoneCode::UpdateFailed as u64,
             ));
@@ -776,14 +956,76 @@ impl SubscribedRecv {
     pub fn recv_forward_update(&mut self, forward: bool) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
         state.closed.clone()?;
-        state.forward = forward;
+        state.update_forward(forward, None)?;
         Ok(())
     }
+
+    fn joining_fetch_state(
+        &self,
+    ) -> Result<JoiningSubscriptionLookup, JoiningSubscriptionLookupError> {
+        let state = self.state.lock();
+        match state.phase {
+            SubscriptionPhase::Pending => Ok(JoiningSubscriptionLookup::Pending),
+            SubscriptionPhase::Terminated => {
+                Err(JoiningSubscriptionLookupError::InvalidJoiningRequestId)
+            }
+            SubscriptionPhase::Established if !state.forward => {
+                Err(JoiningSubscriptionLookupError::ForwardDisabled)
+            }
+            SubscriptionPhase::Established => {
+                let joining_location = state
+                    .joining_location
+                    .ok_or(JoiningSubscriptionLookupError::NoJoiningLocation)?;
+                Ok(JoiningSubscriptionLookup::Established(
+                    JoiningSubscription {
+                        request_id: self.info.id,
+                        track_namespace: self.info.track_namespace.clone(),
+                        track_name: self.info.track_name.clone(),
+                        joining_location,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+pub(super) fn lookup_joining_subscription(
+    subscriptions: &HashMap<u64, SubscribedRecv>,
+    request_id: u64,
+) -> Result<JoiningSubscriptionLookup, JoiningSubscriptionLookupError> {
+    subscriptions
+        .get(&request_id)
+        .ok_or(JoiningSubscriptionLookupError::InvalidJoiningRequestId)?
+        .joining_fetch_state()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subscribe_info(request_id: u64) -> SubscribeInfo {
+        SubscribeInfo::new_from_subscribe(&message::Subscribe {
+            id: request_id,
+            track_namespace: TrackNamespace::from_utf8_path("test/session"),
+            track_name: "audio".into(),
+            params: KeyValuePairs::default(),
+        })
+        .unwrap()
+    }
+
+    fn recv_pair(
+        initial: SubscribedState,
+        request_id: u64,
+    ) -> (State<SubscribedState>, SubscribedRecv) {
+        let (send, recv) = State::new(initial).split();
+        (
+            send,
+            SubscribedRecv {
+                state: recv,
+                info: subscribe_info(request_id),
+            },
+        )
+    }
 
     #[test]
     fn subscribed_state_counts_opened_streams() {
@@ -799,9 +1041,7 @@ mod tests {
 
     #[test]
     fn publish_ok_updates_forward_and_acceptance() {
-        let state = State::<SubscribedState>::default();
-        let (_send, recv) = state.split();
-        let mut recv = SubscribedRecv { state: recv };
+        let (_send, mut recv) = recv_pair(SubscribedState::default(), 7);
         let mut params = KeyValuePairs::default();
         params.set_forward(false);
         recv.recv_publish_ok(&message::RequestOk {
@@ -810,15 +1050,17 @@ mod tests {
             track_properties: Default::default(),
         })
         .unwrap();
-        assert!(recv.state.lock().accepted);
-        assert!(!recv.state.lock().forward);
+        let state = recv.state.lock();
+        assert_eq!(state.phase, SubscriptionPhase::Established);
+        assert!(!state.forward);
+        assert_eq!(state.joining_location, None);
     }
 
     #[test]
     fn reverse_request_update_changes_live_forward_state() {
-        let state = State::<SubscribedState>::default();
-        let (_send, recv) = state.split();
-        let mut recv = SubscribedRecv { state: recv };
+        let mut initial = SubscribedState::default();
+        initial.establish(Some(Location::new(3, 4))).unwrap();
+        let (_send, mut recv) = recv_pair(initial, 7);
         recv.recv_forward_update(false).unwrap();
         assert!(!recv.state.lock().forward);
         recv.recv_forward_update(true).unwrap();
@@ -829,12 +1071,11 @@ mod tests {
     fn failed_reverse_update_marks_terminal_state_without_snapshotting_early() {
         let mut initial = SubscribedState::default();
         initial.record_stream_opened();
-        let state = State::new(initial);
-        let (_send, recv) = state.split();
-        let mut recv = SubscribedRecv { state: recv };
+        let (_send, mut recv) = recv_pair(initial, 7);
 
         recv.recv_update_failed().unwrap();
         let state = recv.state.lock();
+        assert_eq!(state.phase, SubscriptionPhase::Terminated);
         assert_eq!(state.stream_count, 1);
         assert!(matches!(
             state.closed,
@@ -851,12 +1092,11 @@ mod tests {
 
     #[test]
     fn publish_rejection_is_terminal_before_acceptance() {
-        let state = State::<SubscribedState>::default();
-        let (_send, recv) = state.split();
-        let mut recv = SubscribedRecv { state: recv };
+        let (_send, mut recv) = recv_pair(SubscribedState::default(), 7);
         recv.recv_error(ServeError::Closed(RequestErrorCode::Uninterested as u64))
             .unwrap();
         let state = recv.state.lock();
+        assert_eq!(state.phase, SubscriptionPhase::Terminated);
         assert!(state.peer_rejected);
         assert!(matches!(
             state.closed,
@@ -866,13 +1106,189 @@ mod tests {
 
     #[test]
     fn peer_cancellation_closes_shared_media_state() {
-        let state = State::<SubscribedState>::default();
-        let (_send, recv) = state.split();
-        let mut recv = SubscribedRecv { state: recv };
+        let (_send, mut recv) = recv_pair(SubscribedState::default(), 7);
         recv.recv_error(ServeError::Cancel).unwrap();
         let state = recv.state.lock();
+        assert_eq!(state.phase, SubscriptionPhase::Terminated);
         assert!(state.peer_rejected);
         assert!(matches!(state.closed, Err(ServeError::Cancel)));
+    }
+
+    #[test]
+    fn pending_establishes_or_terminates_explicitly() {
+        let mut established = SubscribedState::default();
+        assert_eq!(established.phase, SubscriptionPhase::Pending);
+        established.establish(Some(Location::new(4, 8))).unwrap();
+        assert_eq!(established.phase, SubscriptionPhase::Established);
+        assert_eq!(established.joining_location, Some(Location::new(4, 8)));
+        established.terminate().unwrap();
+        assert_eq!(established.phase, SubscriptionPhase::Terminated);
+
+        let mut rejected = SubscribedState::default();
+        rejected.terminate().unwrap();
+        assert_eq!(rejected.phase, SubscriptionPhase::Terminated);
+    }
+
+    #[test]
+    fn first_object_initializes_empty_largest_location() {
+        let mut state = SubscribedState::default();
+        state.establish(None).unwrap();
+        assert_eq!(state.largest_location, None);
+
+        state.observe_largest_location(Location::new(0, 0)).unwrap();
+        assert_eq!(state.largest_location, Some(Location::new(0, 0)));
+        // The Joining Location was frozen when the subscription became
+        // established, before the first object existed.
+        assert_eq!(state.joining_location, None);
+    }
+
+    #[test]
+    fn joining_location_is_frozen_while_live_progress_advances() {
+        let mut state = SubscribedState::default();
+        state.establish(Some(Location::new(5, 2))).unwrap();
+
+        state.observe_largest_location(Location::new(5, 9)).unwrap();
+        state
+            .observe_largest_location(Location::new(4, 99))
+            .unwrap();
+
+        assert_eq!(state.largest_location, Some(Location::new(5, 9)));
+        assert_eq!(state.joining_location, Some(Location::new(5, 2)));
+    }
+
+    #[test]
+    fn invalid_phase_transitions_are_deterministic() {
+        let mut pending = SubscribedState::default();
+        assert_eq!(
+            pending.update_forward(false, None),
+            Err(SubscriptionStateError::InvalidTransition {
+                phase: SubscriptionPhase::Pending,
+                operation: SubscriptionOperation::UpdateForward,
+            })
+        );
+
+        pending.establish(None).unwrap();
+        assert_eq!(
+            pending.establish(None),
+            Err(SubscriptionStateError::InvalidTransition {
+                phase: SubscriptionPhase::Established,
+                operation: SubscriptionOperation::Establish,
+            })
+        );
+        pending.terminate().unwrap();
+        assert_eq!(
+            pending.observe_largest_location(Location::new(1, 0)),
+            Err(SubscriptionStateError::InvalidTransition {
+                phase: SubscriptionPhase::Terminated,
+                operation: SubscriptionOperation::ObserveObject,
+            })
+        );
+        assert_eq!(
+            pending.terminate(),
+            Err(SubscriptionStateError::InvalidTransition {
+                phase: SubscriptionPhase::Terminated,
+                operation: SubscriptionOperation::Terminate,
+            })
+        );
+    }
+
+    #[test]
+    fn forward_zero_to_one_captures_a_new_joining_location_once() {
+        let mut state = SubscribedState {
+            forward: false,
+            ..Default::default()
+        };
+        state.establish(Some(Location::new(7, 3))).unwrap();
+        assert_eq!(state.joining_location, None);
+
+        state
+            .update_forward(true, Some(Location::new(7, 8)))
+            .unwrap();
+        assert_eq!(state.joining_location, Some(Location::new(7, 8)));
+        state.observe_largest_location(Location::new(8, 1)).unwrap();
+        state
+            .update_forward(true, Some(Location::new(8, 2)))
+            .unwrap();
+        assert_eq!(state.joining_location, Some(Location::new(7, 8)));
+
+        state.update_forward(false, None).unwrap();
+        state
+            .update_forward(true, Some(Location::new(9, 0)))
+            .unwrap();
+        assert_eq!(state.joining_location, Some(Location::new(9, 0)));
+    }
+
+    #[test]
+    fn joining_lookup_is_session_scoped_and_rejects_terminal_state() {
+        let (state, recv) = recv_pair(SubscribedState::default(), 41);
+        let mut session = HashMap::from([(41, recv)]);
+        let other_session = HashMap::new();
+
+        assert_eq!(
+            lookup_joining_subscription(&session, 41),
+            Ok(JoiningSubscriptionLookup::Pending)
+        );
+        assert_eq!(
+            lookup_joining_subscription(&other_session, 41),
+            Err(JoiningSubscriptionLookupError::InvalidJoiningRequestId)
+        );
+
+        state
+            .lock_mut()
+            .unwrap()
+            .establish(Some(Location::new(2, 6)))
+            .unwrap();
+        assert_eq!(
+            lookup_joining_subscription(&session, 41),
+            Ok(JoiningSubscriptionLookup::Established(
+                JoiningSubscription {
+                    request_id: 41,
+                    track_namespace: TrackNamespace::from_utf8_path("test/session"),
+                    track_name: "audio".into(),
+                    joining_location: Location::new(2, 6),
+                }
+            ))
+        );
+
+        state.lock_mut().unwrap().terminate().unwrap();
+        assert_eq!(
+            lookup_joining_subscription(&session, 41),
+            Err(JoiningSubscriptionLookupError::InvalidJoiningRequestId)
+        );
+        assert_eq!(
+            session.remove(&41).unwrap().joining_fetch_state(),
+            Err(JoiningSubscriptionLookupError::InvalidJoiningRequestId)
+        );
+    }
+
+    #[test]
+    fn joining_lookup_validates_forward_and_saved_location() {
+        let mut no_forward = SubscribedState {
+            forward: false,
+            ..Default::default()
+        };
+        no_forward.establish(Some(Location::new(1, 1))).unwrap();
+        let (_state, recv) = recv_pair(no_forward, 1);
+        assert_eq!(
+            recv.joining_fetch_state(),
+            Err(JoiningSubscriptionLookupError::ForwardDisabled)
+        );
+
+        let mut no_location = SubscribedState::default();
+        no_location.establish(None).unwrap();
+        let (_state, recv) = recv_pair(no_location, 2);
+        assert_eq!(
+            recv.joining_fetch_state(),
+            Err(JoiningSubscriptionLookupError::NoJoiningLocation)
+        );
+        assert_eq!(
+            JoiningSubscriptionLookupError::ForwardDisabled.request_error_code(),
+            RequestErrorCode::InvalidRange
+        );
+        assert_eq!(
+            JoiningSubscriptionLookupError::InvalidJoiningRequestId.request_error_code(),
+            RequestErrorCode::InvalidJoiningRequestId
+        );
     }
 
     #[test]
