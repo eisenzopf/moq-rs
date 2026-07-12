@@ -1032,7 +1032,24 @@ async fn run_admitted_connection(
 }
 
 impl Relay {
+    /// Construct a relay with an isolated local publication registry.
+    ///
+    /// This remains the safe default for one-listener deployments. Embedded
+    /// deployments with role-separated publisher and subscriber listeners can
+    /// use [`Self::new_with_locals`] to route both listeners through the same
+    /// bounded in-process registry.
     pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+        Self::new_with_locals(config, Locals::new())
+    }
+
+    /// Construct a relay using an application-owned local publication
+    /// registry.
+    ///
+    /// Sharing [`Locals`] shares media routing only; it does not share or
+    /// weaken listener admission, TLS policy, capacity accounting, or session
+    /// lifecycles. Callers must still configure each listener with the
+    /// appropriate production security role.
+    pub fn new_with_locals(config: RelayConfig, locals: Locals) -> anyhow::Result<Self> {
         if config.bind.is_some() && !config.endpoints.is_empty() {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
@@ -1194,8 +1211,6 @@ impl Relay {
             }
             tracing::info!("mlog output enabled: {}", mlog_dir.display());
         }
-
-        let locals = Locals::new();
 
         // FIXME(itzmanish): have a generic filter to find endpoints for forward, remote etc.
         let remote_clients = endpoints
