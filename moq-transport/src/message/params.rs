@@ -8,6 +8,30 @@ use crate::coding::{
 };
 use crate::message::{FilterType, GroupOrder};
 
+/// Decode a count-prefixed request/response parameter block.
+///
+/// Request parameters are a distinct keyspace from trailing track/object
+/// extensions. Duplicate request keys are rejected before any typed accessor
+/// can interpret a first or last value, while unknown unique parameters remain
+/// available to applications for extension negotiation.
+pub(super) fn decode_request_parameters<R: bytes::Buf>(
+    r: &mut R,
+) -> Result<KeyValuePairs, DecodeError> {
+    let params = KeyValuePairs::decode(r)?;
+    if let Some(duplicate) = duplicate_parameter_key(&params) {
+        return Err(DecodeError::DuplicateParameter(duplicate));
+    }
+    Ok(params)
+}
+
+fn duplicate_parameter_key(params: &KeyValuePairs) -> Option<u64> {
+    let mut seen = std::collections::HashSet::new();
+    params
+        .0
+        .iter()
+        .find_map(|parameter| (!seen.insert(parameter.key)).then_some(parameter.key))
+}
+
 /// Draft-16 message-parameter type IDs.
 pub mod parameter_type {
     pub const DELIVERY_TIMEOUT: u64 = 0x02;
@@ -367,6 +391,7 @@ impl KeyValuePairs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     #[test]
     fn key_value_pairs_message_parameter_methods_round_trip_typed_values() {
@@ -426,5 +451,74 @@ mod tests {
             extensions.set_default_publisher_group_order(GroupOrder::Publisher),
             Err(EncodeError::InvalidValue)
         ));
+    }
+
+    #[test]
+    fn request_parameters_reject_duplicate_security_and_behavior_keys() {
+        for pair in [
+            KeyValuePair::new_bytes(parameter_type::AUTHORIZATION_TOKEN, b"secret".to_vec()),
+            KeyValuePair::new_int(parameter_type::FORWARD, 1),
+            KeyValuePair::new_bytes(parameter_type::SUBSCRIPTION_FILTER, vec![0x04]),
+        ] {
+            let key = pair.key;
+            let params = KeyValuePairs(vec![pair.clone(), pair]);
+            let mut encoded = BytesMut::new();
+            params.encode(&mut encoded).unwrap();
+            assert!(matches!(
+                decode_request_parameters(&mut encoded),
+                Err(DecodeError::DuplicateParameter(duplicate)) if duplicate == key
+            ));
+        }
+    }
+
+    #[test]
+    fn request_parameters_preserve_unknown_unique_extensions() {
+        let unknown = KeyValuePair::new_bytes(0x7f, vec![0xde, 0xad, 0xbe, 0xef]);
+        let params = KeyValuePairs(vec![unknown.clone()]);
+        let mut encoded = BytesMut::new();
+        params.encode(&mut encoded).unwrap();
+
+        let decoded = decode_request_parameters(&mut encoded).unwrap();
+        assert_eq!(decoded.0, vec![unknown]);
+    }
+
+    #[test]
+    fn track_extension_keyspace_retains_its_existing_duplicate_semantics() {
+        let first = KeyValuePair::new_bytes(0x03, vec![0xaa]);
+        let second = KeyValuePair::new_bytes(0x03, vec![0xbb]);
+        let extensions = TrackProperties(vec![first.clone(), second.clone()]);
+        let mut encoded = BytesMut::new();
+        extensions.encode(&mut encoded).unwrap();
+
+        assert_eq!(
+            TrackExtensions::decode(&mut encoded).unwrap().0,
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn every_message_parameter_block_uses_the_validating_decoder() {
+        for (name, source) in [
+            ("publish_namespace", include_str!("publish_namespace.rs")),
+            ("fetch", include_str!("fetch.rs")),
+            ("request_update", include_str!("request_update.rs")),
+            ("track_status", include_str!("track_status.rs")),
+            ("request_ok", include_str!("request_ok.rs")),
+            ("fetch_ok", include_str!("fetch_ok.rs")),
+            ("subscribe_ok", include_str!("subscribe_ok.rs")),
+            (
+                "subscribe_namespace",
+                include_str!("subscribe_namespace.rs"),
+            ),
+            ("subscribe_tracks", include_str!("subscribe_tracks.rs")),
+            ("publish", include_str!("publish.rs")),
+            ("subscribe", include_str!("subscribe.rs")),
+        ] {
+            assert_eq!(
+                source.matches("decode_request_parameters(r)?").count(),
+                1,
+                "{name} must decode exactly one validated parameter block"
+            );
+        }
     }
 }

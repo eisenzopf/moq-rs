@@ -6,6 +6,7 @@
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackNamespacePrefix,
 };
+use crate::message::params::decode_request_parameters;
 
 /// Requests namespace discovery below a namespace prefix.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,7 +25,7 @@ impl Decode for SubscribeNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_namespace_prefix = TrackNamespacePrefix::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
 
         Ok(Self {
             id,

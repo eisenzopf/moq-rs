@@ -5,6 +5,7 @@ use crate::coding::{
     validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackName,
     TrackNamespace,
 };
+use crate::message::params::decode_request_parameters;
 
 /// A potential subscriber sends a TrackStatus message to obtain information about
 /// the current status of a given track.
@@ -29,7 +30,7 @@ impl Decode for TrackStatus {
         let track_name = TrackName::decode(r)?;
         validate_full_track_name(&track_namespace, track_name.as_bytes())?;
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
 
         Ok(Self {
             id,

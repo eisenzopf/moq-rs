@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
-use crate::message::TrackExtensions;
+use crate::message::{params::decode_request_parameters, TrackExtensions};
 
 /// Sent by the publisher to accept a Subscribe.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,7 +25,7 @@ impl Decode for SubscribeOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_alias = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
         let track_extensions = TrackExtensions::decode(r)?;
 
         Ok(Self {

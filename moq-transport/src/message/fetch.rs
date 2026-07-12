@@ -5,7 +5,7 @@ use crate::coding::{
     validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location,
     TrackName, TrackNamespace,
 };
-use crate::message::FetchType;
+use crate::message::{params::decode_request_parameters, FetchType};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StandaloneFetch {
@@ -109,7 +109,7 @@ impl Decode for Fetch {
             }
         };
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
 
         Ok(Self {
             id,

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location};
-use crate::message::TrackExtensions;
+use crate::message::{params::decode_request_parameters, TrackExtensions};
 
 /// A publisher sends a FETCH_OK control message in response to successful fetches.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,7 +28,7 @@ impl Decode for FetchOk {
         let id = u64::decode(r)?;
         let end_of_track = bool::decode(r)?;
         let end_location = Location::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
         let track_extensions = TrackExtensions::decode(r)?;
 
         Ok(Self {

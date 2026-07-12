@@ -6,6 +6,7 @@
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackNamespacePrefix,
 };
+use crate::message::params::decode_request_parameters;
 
 /// Requests PUBLISH messages for tracks below a namespace prefix.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,7 +26,7 @@ impl Decode for SubscribeTracks {
         Ok(Self {
             id: u64::decode(r)?,
             track_namespace_prefix: TrackNamespacePrefix::decode(r)?,
-            params: KeyValuePairs::decode(r)?,
+            params: decode_request_parameters(r)?,
         })
     }
 }

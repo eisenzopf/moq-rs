@@ -5,7 +5,7 @@ use crate::coding::{
     validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackName,
     TrackNamespace,
 };
-use crate::message::TrackExtensions;
+use crate::message::{params::decode_request_parameters, TrackExtensions};
 
 /// Sent by publisher to initiate a subscription to a track.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,7 +33,7 @@ impl Decode for Publish {
         let track_name = TrackName::decode(r)?;
         validate_full_track_name(&track_namespace, track_name.as_bytes())?;
         let track_alias = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
         let track_extensions = TrackExtensions::decode(r)?;
 
         Ok(Self {

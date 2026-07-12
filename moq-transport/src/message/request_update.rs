@@ -8,6 +8,7 @@
 //! this message identifies the update itself and consumes a new Request ID.
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+use crate::message::params::decode_request_parameters;
 
 /// Sent to modify an existing request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,7 +23,7 @@ pub struct RequestUpdate {
 impl Decode for RequestUpdate {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
         Ok(Self { id, params })
     }
 }

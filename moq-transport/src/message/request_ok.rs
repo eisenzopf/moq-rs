@@ -8,7 +8,7 @@
 //! Request ID; `id` below is retained as the local routing association.
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
-use crate::message::TrackProperties;
+use crate::message::{params::decode_request_parameters, TrackProperties};
 
 /// Sent to acknowledge a successful request update or status query.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,7 +27,7 @@ pub struct RequestOk {
 impl Decode for RequestOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
         let track_properties = TrackProperties::decode(r)?;
         Ok(Self {
             id,

@@ -317,4 +317,19 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn decode_rejects_duplicate_max_request_updates() {
+        let key: u64 = ParameterType::MaxRequestUpdates.into();
+        let params = KeyValuePairs(vec![
+            crate::coding::KeyValuePair::new_int(key, 4),
+            crate::coding::KeyValuePair::new_int(key, 8),
+        ]);
+        let mut encoded = bytes::BytesMut::new();
+        Setup { params }.encode(&mut encoded).unwrap();
+        assert!(matches!(
+            Setup::decode(&mut encoded),
+            Err(DecodeError::DuplicateParameter(duplicate)) if duplicate == key
+        ));
+    }
 }

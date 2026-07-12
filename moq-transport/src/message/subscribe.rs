@@ -6,6 +6,7 @@ use crate::coding::{
     validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackName,
     TrackNamespace,
 };
+use crate::message::params::decode_request_parameters;
 
 /// Sent by the subscriber to request all future objects for the given track.
 ///
@@ -31,7 +32,7 @@ impl Decode for Subscribe {
         let track_name = TrackName::decode(r)?;
         validate_full_track_name(&track_namespace, track_name.as_bytes())?;
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = decode_request_parameters(r)?;
 
         Ok(Self {
             id,
