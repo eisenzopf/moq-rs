@@ -188,8 +188,8 @@ impl Coordinator for FileCoordinator {
         Ok(NamespaceRegistration::new(handle))
     }
 
-    // FIXME(itzmanish): Not being called currently but we need to call this on publish_namespace_done
-    // currently unregister happens on drop of namespace
+    // Explicit request-stream cancellation can call this; ordinary cleanup
+    // currently unregisters when the namespace registration handle is dropped.
     async fn unregister_namespace(
         &self,
         scope: Option<&str>,

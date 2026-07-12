@@ -40,11 +40,13 @@ pub struct SubscriptionFilter {
     pub end_group_id: Option<u64>,
 }
 
-/// Draft-16 Track Extensions are a trailing sequence of KVPs with no count or length prefix.
+/// Track Properties are a trailing sequence of KVPs with no count or length
+/// prefix. Their length is the remaining request-message body after all
+/// preceding fields have been consumed (draft-ietf-moq-transport-19 §2.5).
 #[derive(Default, Clone, Debug, Eq, PartialEq)]
-pub struct TrackExtensions(pub Vec<KeyValuePair>);
+pub struct TrackProperties(pub Vec<KeyValuePair>);
 
-impl TrackExtensions {
+impl TrackProperties {
     pub fn new() -> Self {
         Self::default()
     }
@@ -132,7 +134,7 @@ impl TrackExtensions {
     }
 }
 
-impl Decode for TrackExtensions {
+impl Decode for TrackProperties {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let mut extensions = Vec::new();
         let mut prev = 0u64;
@@ -147,7 +149,7 @@ impl Decode for TrackExtensions {
     }
 }
 
-impl Encode for TrackExtensions {
+impl Encode for TrackProperties {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
         sorted.sort_by_key(|k| k.key);
@@ -160,6 +162,10 @@ impl Encode for TrackExtensions {
         Ok(())
     }
 }
+
+/// Compatibility alias for the draft-16 name. New APIs should use
+/// [`TrackProperties`].
+pub type TrackExtensions = TrackProperties;
 
 impl SubscriptionFilter {
     pub fn largest_object() -> Self {

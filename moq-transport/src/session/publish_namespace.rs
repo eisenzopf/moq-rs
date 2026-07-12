@@ -49,8 +49,8 @@ impl Drop for PublishNamespaceState {
 
 /// Represents an outbound PUBLISH_NAMESPACE sent by a publisher.
 ///
-/// Dropped with PUBLISH_NAMESPACE_DONE unless already closed with an error.
-#[must_use = "send PUBLISH_NAMESPACE_DONE on drop"]
+/// The request remains active for the lifetime of its bidirectional stream.
+#[must_use = "keep the PUBLISH_NAMESPACE request stream alive"]
 pub struct PublishNamespace {
     publisher: Publisher,
     state: State<PublishNamespaceState>,
@@ -60,7 +60,7 @@ pub struct PublishNamespace {
 
 impl PublishNamespace {
     /// Create a PublishNamespace without sending on the control stream.
-    /// The caller sends via a bidi request stream (draft-18).
+    /// The caller sends via a bidi request stream (draft-19).
     pub(super) fn new(
         publisher: Publisher,
         request_id: u64,
@@ -182,15 +182,9 @@ impl PublishNamespace {
 
 impl Drop for PublishNamespace {
     fn drop(&mut self) {
-        if self.state.lock().closed.is_err() {
-            return;
-        }
-
-        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries the Request ID,
-        // not the namespace.
-        self.publisher.send_message(message::PublishNamespaceDone {
-            id: self.info.request_id,
-        });
+        // Draft-19 removed PUBLISH_NAMESPACE_DONE. Completion/cancellation is
+        // represented by closing or resetting the owning request stream.
+        let _ = self.publisher.drop_publish_namespace(self.info.request_id);
     }
 }
 

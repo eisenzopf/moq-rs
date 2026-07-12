@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Unified SETUP message (draft-ietf-moq-transport-18 §10.3).
+//! Unified SETUP message (draft-ietf-moq-transport-19 §10.3).
 //!
-//! In draft-18 both peers send the same SETUP message on their respective
+//! In draft-19 both peers send the same SETUP message on their respective
 //! unidirectional control streams. The message type (`0x2F00`) doubles as
 //! the stream type identifier. Setup Options are length-bounded KVPs
 //! (no count prefix).
@@ -16,12 +16,12 @@
 //! }
 //! ```
 
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Value};
 
 /// The SETUP message type, which also serves as the control stream type.
 pub const SETUP_TYPE: u64 = 0x2F00;
 
-/// Sent by both peers to establish the session (draft-18).
+/// Sent by both peers to establish the session (draft-19).
 ///
 /// Replaces the separate CLIENT_SETUP (0x20) and SERVER_SETUP (0x21)
 /// from earlier drafts. Version negotiation is handled entirely by ALPN;
@@ -33,6 +33,21 @@ pub struct Setup {
 }
 
 impl Setup {
+    /// Maximum number of unacknowledged REQUEST_UPDATE messages this peer is
+    /// willing to receive on one request stream. Zero means unlimited and is
+    /// also the default when the option is absent.
+    pub fn max_request_updates(&self) -> Result<u64, DecodeError> {
+        match self
+            .params
+            .get(crate::setup::ParameterType::MaxRequestUpdates.into())
+            .map(|pair| &pair.value)
+        {
+            Some(Value::IntValue(value)) => Ok(*value),
+            Some(Value::BytesValue(_)) => Err(DecodeError::InvalidParameter),
+            None => Ok(0),
+        }
+    }
+
     /// Decode a SETUP message, assuming the stream type / message type
     /// varint has already been read and matched against `SETUP_TYPE`.
     ///
@@ -181,5 +196,25 @@ mod tests {
 
         assert_eq!(decoded.params.0.len(), 3);
         assert_eq!(decoded.params, setup.params);
+    }
+
+    #[test]
+    fn max_request_updates_draft_19_golden_encoding() {
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(ParameterType::MaxRequestUpdates.into(), 4);
+
+        let mut buf = BytesMut::new();
+        Setup { params }.encode(&mut buf).unwrap();
+
+        // SETUP type, two-byte option block length, then option type 0x08/value 4.
+        assert_eq!(buf.to_vec(), vec![0xAF, 0x00, 0x00, 0x02, 0x08, 0x04]);
+        let decoded = Setup::decode(&mut buf).unwrap();
+        assert_eq!(
+            decoded
+                .params
+                .get(ParameterType::MaxRequestUpdates.into())
+                .map(|pair| &pair.value),
+            Some(&crate::coding::Value::IntValue(4))
+        );
     }
 }

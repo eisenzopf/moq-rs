@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(clippy::items_after_test_module)]
+
 //! Key-Value-Pair (KVP) encoding as defined in draft-ietf-moq-transport-16 §1.4.2.
 //!
 //! KVPs encode a Type value as a **delta from the previous Type** (or from 0 if
@@ -128,8 +130,12 @@ impl KeyValuePair {
     ) -> Result<u64, EncodeError> {
         // Keys must be consistent with their value parity.
         match &self.value {
-            Value::IntValue(_) if self.key % 2 != 0 => return Err(EncodeError::InvalidValue),
-            Value::BytesValue(_) if self.key % 2 == 0 => return Err(EncodeError::InvalidValue),
+            Value::IntValue(_) if !self.key.is_multiple_of(2) => {
+                return Err(EncodeError::InvalidValue)
+            }
+            Value::BytesValue(_) if self.key.is_multiple_of(2) => {
+                return Err(EncodeError::InvalidValue)
+            }
             _ => {}
         }
 

@@ -256,50 +256,6 @@ pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnect
     .context("test timed out")?
 }
 
-/// T0.6: Publish Namespace Done
-///
-/// Send PUBLISH_NAMESPACE, receive REQUEST_OK, then send PUBLISH_NAMESPACE_DONE.
-/// Verifies the relay handles namespace unpublishing correctly.
-pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) =
-            connect(args).await.context("failed to connect to relay")?;
-        let mut cids = TestConnectionIds::default();
-        cids.add(cid);
-
-        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
-            .await
-            .context("SETUP exchange failed")?;
-
-        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
-        let (_, _, reader) = Tracks::new(namespace.clone()).produce();
-
-        tracing::info!("Sending PUBLISH_NAMESPACE: {}", TEST_NAMESPACE);
-
-        let result = tokio::select! {
-            res = publisher.publish_namespace(reader) => res,
-            res = session.run() => {
-                res.context("session error")?;
-                anyhow::bail!("session ended before PUBLISH_NAMESPACE completed");
-            }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                // No error received: REQUEST_OK arrived and we are waiting for subscribers.
-                // Drop publish_namespace here to send PUBLISH_NAMESPACE_DONE.
-                tracing::info!("PUBLISH_NAMESPACE active; sending PUBLISH_NAMESPACE_DONE");
-                Ok(())
-            }
-        };
-
-        result.context("PUBLISH_NAMESPACE failed")?;
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        tracing::info!("PUBLISH_NAMESPACE_DONE sent successfully");
-        Ok(cids)
-    })
-    .await
-    .context("test timed out")?
-}
-
 /// T0.5: Subscribe Before Publish Namespace
 ///
 /// Subscriber subscribes first (will be pending), then publisher sends PUBLISH_NAMESPACE.

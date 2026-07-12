@@ -8,6 +8,7 @@ mod published_namespace;
 mod publisher;
 mod reader;
 mod request_id;
+mod request_updates;
 mod subscribe;
 mod subscribed;
 mod subscriber;
@@ -25,6 +26,7 @@ pub use subscriber::*;
 pub use track_status_requested::*;
 
 use reader::*;
+use request_updates::{RequestKind, RequestUpdateCredits};
 use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -103,12 +105,16 @@ pub struct Session {
     /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
     bidi_task_rx: tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
 
-    /// Maps bidi-request IDs to their response stream writers (draft-18).
+    /// Maps bidi-request IDs to their response stream writers (draft-19).
     bidi_response_map: BidiResponseMap,
+
+    /// Per-request-stream update concurrency advertised to the peer.
+    max_request_updates: u64,
 }
 
 impl Session {
     const MAX_CONNECTION_PATH_LEN: usize = 1024;
+    const DEFAULT_MAX_REQUEST_UPDATES: u64 = 16;
 
     /// Normalize and validate a connection path.
     ///
@@ -232,15 +238,6 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::Unsubscribe(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "UNSUBSCRIBE",
-                    subscribe_id = m.id,
-                    "MoQT control message"
-                );
-            }
             Message::PublishNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
@@ -248,15 +245,6 @@ impl Session {
                     msg_type = "PUBLISH_NAMESPACE",
                     request_id = m.id,
                     namespace = %m.track_namespace,
-                    "MoQT control message"
-                );
-            }
-            Message::PublishNamespaceDone(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_NAMESPACE_DONE",
-                    request_id = m.id,
                     "MoQT control message"
                 );
             }
@@ -278,17 +266,6 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishNamespaceCancel(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_NAMESPACE_CANCEL",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
             Message::TrackStatus(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
@@ -305,6 +282,16 @@ impl Session {
                     target: "moq_transport::control",
                     direction,
                     msg_type = "SUBSCRIBE_NAMESPACE",
+                    request_id = m.id,
+                    namespace_prefix = %m.track_namespace_prefix,
+                    "MoQT control message"
+                );
+            }
+            Message::SubscribeTracks(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "SUBSCRIBE_TRACKS",
                     request_id = m.id,
                     namespace_prefix = %m.track_namespace_prefix,
                     "MoQT control message"
@@ -330,15 +317,6 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::FetchCancel(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "FETCH_CANCEL",
-                    request_id = m.id,
-                    "MoQT control message"
-                );
-            }
             Message::Publish(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
@@ -351,12 +329,13 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishOk(m) => {
+            Message::PublishSkipped(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
-                    msg_type = "PUBLISH_OK",
-                    request_id = m.id,
+                    msg_type = "PUBLISH_SKIPPED",
+                    namespace_suffix = %m.track_namespace_suffix,
+                    track_name = %m.track_name,
                     "MoQT control message"
                 );
             }
@@ -377,6 +356,7 @@ impl Session {
                     direction,
                     msg_type = "GOAWAY",
                     uri = %m.uri.0,
+                    timeout_ms = m.timeout,
                     "MoQT control message"
                 );
             }
@@ -406,7 +386,6 @@ impl Session {
                     direction,
                     msg_type = "REQUEST_UPDATE",
                     request_id = m.id,
-                    existing_request_id = m.existing_request_id,
                     "MoQT control message"
                 );
             }
@@ -458,6 +437,7 @@ impl Session {
             connection_path,
             bidi_task_rx,
             bidi_response_map: Arc::new(Mutex::new(HashMap::new())),
+            max_request_updates: Self::DEFAULT_MAX_REQUEST_UPDATES,
         };
 
         (session, publisher, subscriber)
@@ -491,6 +471,10 @@ impl Session {
         let mut sender = Writer::new(send_stream);
 
         let mut params = KeyValuePairs::default();
+        params.set_intvalue(
+            setup::ParameterType::MaxRequestUpdates.into(),
+            Self::DEFAULT_MAX_REQUEST_UPDATES,
+        );
 
         if transport == Transport::RawQuic {
             // Draft-16 §9.3.1.1: send AUTHORITY for native QUIC.
@@ -534,7 +518,8 @@ impl Session {
         // Accept the peer's unidirectional control stream.
         let recv_stream = session.accept_uni().await?;
         let mut recver = Reader::new(recv_stream);
-        let _server: setup::Setup = recver.decode().await?;
+        let server: setup::Setup = recver.decode().await?;
+        let _peer_max_request_updates = server.max_request_updates()?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
@@ -573,6 +558,7 @@ impl Session {
         let mut recver = Reader::new(recv_stream);
 
         let client: setup::Setup = recver.decode().await?;
+        let _peer_max_request_updates = client.max_request_updates()?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
@@ -605,7 +591,11 @@ impl Session {
             let _ = mlog.add_event(event);
         }
 
-        let params = KeyValuePairs::default();
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(
+            setup::ParameterType::MaxRequestUpdates.into(),
+            Self::DEFAULT_MAX_REQUEST_UPDATES,
+        );
 
         let server = setup::Setup { params };
 
@@ -646,7 +636,7 @@ impl Session {
         let result = tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
-            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone()) => res,
+            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.max_request_updates) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
             // Collect bidi reader task handles and poll them to completion.
@@ -674,7 +664,7 @@ impl Session {
     }
 
     /// Processes the outgoing control message queue. Response messages targeting
-    /// a bidi request stream are redirected there (draft-18); everything else
+    /// a bidi request stream are redirected there (draft-19); everything else
     /// goes to the control stream.
     async fn run_send(
         mut sender: Writer,
@@ -698,9 +688,6 @@ impl Session {
                         }
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_created(time, m.id, m))
-                        }
-                        Message::Unsubscribe(m) => {
-                            Some(mlog::events::unsubscribe_created(time, m.id, m))
                         }
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_created(time, m.id, m))
@@ -742,7 +729,7 @@ impl Session {
         Ok(())
     }
 
-    /// Accept incoming bidirectional request streams (draft-18 §10).
+    /// Accept incoming bidirectional request streams (draft-19 §10).
     /// Each peer-initiated bidi stream carries one request message followed
     /// by responses/follow-ups on the same stream.
     /// Maximum number of bidi request handler tasks running concurrently.
@@ -755,6 +742,7 @@ impl Session {
         subscriber: Option<Subscriber>,
         request_id: RequestId,
         bidi_response_map: BidiResponseMap,
+        max_request_updates: u64,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
 
@@ -768,22 +756,21 @@ impl Session {
                     let map = bidi_response_map.clone();
 
                     tasks.push(async move {
-                        if let Err(e) = Self::handle_bidi_request(
+                        Self::handle_bidi_request(
                             send_stream, recv_stream,
                             &mut pub_clone, &mut sub_clone, &rid, &map,
-                        ).await {
-                            tracing::debug!(error = %e, "bidi request stream ended");
-                        }
+                            max_request_updates,
+                        ).await
                     });
                 }
-                Some(()) = tasks.next() => {}
+                Some(result) = tasks.next() => result?,
             }
         }
     }
 
     /// Handle a single bidi request stream: decode the request, dispatch
     /// to handlers, then wait for responses and write them back on the
-    /// same stream (without Request ID, per draft-18).
+    /// same stream (without Request ID, per draft-19).
     async fn handle_bidi_request(
         send_stream: web_transport::SendStream,
         recv_stream: web_transport::RecvStream,
@@ -791,28 +778,27 @@ impl Session {
         subscriber: &mut Option<Subscriber>,
         request_id: &RequestId,
         bidi_response_map: &BidiResponseMap,
+        max_request_updates: u64,
     ) -> Result<(), SessionError> {
         let mut reader = Reader::new(recv_stream);
         let mut writer = Writer::new(send_stream);
 
         // Read the first (request) message from the bidi stream.
         let msg: Message = reader.decode().await?;
+        let request_kind = RequestKind::from_first_message(&msg)?;
+        let initial_id = msg.sequenced_request_id().ok_or_else(|| {
+            SessionError::ProtocolViolation(
+                "first request-stream message did not consume a Request ID".to_string(),
+            )
+        })?;
 
-        let req_id = msg.sequenced_request_id();
+        request_id.validate_incoming(initial_id)?;
 
-        // Validate request ID sequencing and register a response channel.
-        let mut rx = if let Some(id) = req_id {
-            request_id.validate_incoming(id)?;
-
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-            bidi_response_map
-                .lock()
-                .map_err(|_| SessionError::Internal)?
-                .insert(id, tx);
-            Some(rx)
-        } else {
-            None
-        };
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        bidi_response_map
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(initial_id, response_tx.clone());
 
         // Dispatch to the appropriate role handler (same as run_recv).
         // Capture the result so cleanup runs unconditionally on error.
@@ -843,38 +829,120 @@ impl Session {
             }
             Ok(())
         })();
+        if let Err(error) = dispatch_result {
+            if let Ok(mut map) = bidi_response_map.lock() {
+                map.remove(&initial_id);
+            }
+            return Err(error);
+        }
 
-        // Wait for responses only if dispatch succeeded; otherwise the
-        // handlers didn't register anything to respond to.
-        if dispatch_result.is_ok() {
-            if let Some(ref mut rx) = rx {
-                while let Some(response) = rx.recv().await {
-                    let is_terminal = matches!(
-                        response,
-                        Message::RequestError(_)
-                            | Message::PublishDone(_)
-                            | Message::PublishNamespaceDone(_)
-                            | Message::Unsubscribe(_)
-                    );
-                    if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await {
-                        tracing::warn!(error = %e, "failed to write bidi response");
-                        break;
+        let mut requester_open = true;
+        let mut update_ids = std::collections::HashSet::new();
+        let mut update_credits = RequestUpdateCredits::new(max_request_updates);
+
+        let result = async {
+            loop {
+                tokio::select! {
+                incoming = reader.decode_optional::<Message>(), if requester_open => {
+                    match incoming? {
+                        Some(Message::RequestUpdate(update)) => {
+                            if !request_kind.accepts_request_updates() {
+                                break Err(SessionError::ProtocolViolation(format!(
+                                    "unexpected REQUEST_UPDATE on {:?} request stream",
+                                    request_kind
+                                )));
+                            }
+
+                            request_id.validate_incoming(update.id)?;
+                            update_credits.receive()?;
+
+                            let update_id = update.id;
+                            let previous = bidi_response_map
+                                .lock()
+                                .map_err(|_| SessionError::Internal)?
+                                .insert(update_id, response_tx.clone());
+                            if previous.is_some() || !update_ids.insert(update_id) {
+                                break Err(SessionError::InvalidRequestId);
+                            }
+
+                            let dispatch = if request_kind.is_publisher_message() {
+                                subscriber
+                                    .as_mut()
+                                    .ok_or(SessionError::RoleViolation)?
+                                    .recv_request_update(initial_id, update)
+                            } else {
+                                publisher
+                                    .as_mut()
+                                    .ok_or(SessionError::RoleViolation)?
+                                    .recv_request_update(initial_id, update)
+                            };
+                            if let Err(error) = dispatch {
+                                break Err(error);
+                            }
+                        }
+                        Some(other) => {
+                            break Err(SessionError::ProtocolViolation(format!(
+                                "unexpected {} after first request-stream message",
+                                other.name()
+                            )));
+                        }
+                        None => {
+                            if request_kind == RequestKind::Publish {
+                                break Err(SessionError::ProtocolViolation(
+                                    "PUBLISH requester sent FIN while its request remained established"
+                                        .to_string(),
+                                ));
+                            }
+                            requester_open = false;
+                        }
                     }
-                    if is_terminal {
-                        // Give Quinn's connection driver a scheduling
-                        // opportunity to transmit the STREAM data before
-                        // the Writer is dropped (which sends FIN).
-                        tokio::time::sleep(std::time::Duration::ZERO).await;
-                        break;
+                }
+                response = response_rx.recv() => {
+                    let Some(response) = response else {
+                        break Err(SessionError::Internal);
+                    };
+                    let response_id = response.response_target_id().ok_or_else(|| {
+                        SessionError::ProtocolViolation(format!(
+                            "{} is not valid on a request response stream",
+                            response.name()
+                        ))
+                    })?;
+                    let is_update_response = update_ids.remove(&response_id);
+
+                    Self::validate_response_for_request(
+                        request_kind,
+                        is_update_response,
+                        &response,
+                    )?;
+                    Self::encode_bidi_response(&mut writer, &response).await?;
+
+                    if is_update_response {
+                        if let Ok(mut map) = bidi_response_map.lock() {
+                            map.remove(&response_id);
+                        }
+                        update_credits.respond();
                     }
+
+                    let request_error_is_terminal = matches!(&response, Message::RequestError(_))
+                        && !(is_update_response
+                            && matches!(request_kind, RequestKind::Subscribe | RequestKind::Publish));
+                    let terminal = request_error_is_terminal
+                        || matches!(&response, Message::PublishDone(_))
+                        || (request_kind == RequestKind::TrackStatus
+                            && matches!(&response, Message::RequestOk(_)));
+                    if terminal {
+                        break Ok(());
+                    }
+                }
                 }
             }
         }
+        .await;
 
-        // Always clean up — runs on both success and error paths.
-        if let Some(id) = req_id {
-            if let Ok(mut map) = bidi_response_map.lock() {
-                map.remove(&id);
+        if let Ok(mut map) = bidi_response_map.lock() {
+            map.remove(&initial_id);
+            for update_id in update_ids {
+                map.remove(&update_id);
             }
         }
 
@@ -882,11 +950,42 @@ impl Session {
         writer.finish();
         tokio::task::yield_now().await;
 
-        dispatch_result
+        result
+    }
+
+    fn validate_response_for_request(
+        request_kind: RequestKind,
+        is_update_response: bool,
+        response: &Message,
+    ) -> Result<(), SessionError> {
+        match response {
+            Message::RequestOk(ok) => {
+                let properties_allowed =
+                    !is_update_response && request_kind == RequestKind::TrackStatus;
+                if !properties_allowed && !ok.track_properties.is_empty() {
+                    return Err(SessionError::ProtocolViolation(
+                        "Track Properties are only valid in TRACK_STATUS_OK".to_string(),
+                    ));
+                }
+            }
+            Message::RequestError(error) => {
+                if let Some(redirect) = &error.redirect {
+                    if request_kind.is_namespace_scoped()
+                        && !redirect.track_name.as_bytes().is_empty()
+                    {
+                        return Err(SessionError::ProtocolViolation(
+                            "namespace-scoped redirect contained a Track Name".to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Encode a response message to a bidi stream, omitting the Request ID
-    /// field per draft-18 (the stream identity provides the association).
+    /// field per draft-19 (the stream identity provides the association).
     /// Build the wire frame for a bidi response message (type + length +
     /// payload with Request ID omitted). Separated from the async writer
     /// so tests can verify the encoding without a QUIC stream.
@@ -894,16 +993,34 @@ impl Session {
         use bytes::BufMut;
 
         // Encode the payload (all fields EXCEPT Request ID, which is
-        // implicit from the bidi stream identity in draft-18).
+        // implicit from the bidi stream identity in draft-19).
         let mut payload = bytes::BytesMut::new();
         match msg {
             Message::RequestOk(m) => {
                 m.params.encode(&mut payload)?;
+                m.track_properties.encode(&mut payload)?;
             }
             Message::RequestError(m) => {
                 m.error_code.encode(&mut payload)?;
                 m.retry_interval.encode(&mut payload)?;
                 m.reason.encode(&mut payload)?;
+                match (
+                    m.error_code == message::RequestErrorCode::Redirect as u64,
+                    &m.redirect,
+                ) {
+                    (true, Some(redirect)) => redirect.encode(&mut payload)?,
+                    (true, None) => {
+                        return Err(SessionError::ProtocolViolation(
+                            "REDIRECT REQUEST_ERROR omitted Redirect".to_string(),
+                        ));
+                    }
+                    (false, Some(_)) => {
+                        return Err(SessionError::ProtocolViolation(
+                            "non-REDIRECT REQUEST_ERROR contained Redirect".to_string(),
+                        ));
+                    }
+                    (false, None) => {}
+                }
             }
             Message::SubscribeOk(m) => {
                 m.track_alias.encode(&mut payload)?;
@@ -914,11 +1031,6 @@ impl Session {
                 m.status_code.encode(&mut payload)?;
                 m.stream_count.encode(&mut payload)?;
                 m.reason.encode(&mut payload)?;
-            }
-            // id-only messages: payload is empty (id omitted on bidi).
-            Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {}
-            Message::PublishOk(m) => {
-                m.params.encode(&mut payload)?;
             }
             Message::FetchOk(m) => {
                 m.end_of_track.encode(&mut payload)?;
@@ -953,7 +1065,7 @@ impl Session {
         Ok(())
     }
 
-    /// Decode a response message from a bidi request stream (draft-18).
+    /// Decode a response message from a bidi request stream (draft-19).
     ///
     /// Response messages omit the Request ID field — the stream identity
     /// provides the association. The caller supplies the known `request_id`
@@ -961,8 +1073,10 @@ impl Session {
     pub(super) async fn decode_bidi_response(
         reader: &mut Reader,
         request_id: u64,
+        request_kind: RequestKind,
     ) -> Result<Message, SessionError> {
         use crate::coding::{Decode, DecodeError, ReasonPhrase};
+        use bytes::Buf as _;
 
         let msg_type: u64 = reader.decode().await?;
         let msg_len: u16 = reader.decode().await?;
@@ -980,23 +1094,31 @@ impl Session {
 
         use message::wire_id;
 
-        match msg_type {
+        let message = match msg_type {
             wire_id::RequestError => {
                 let error_code = u64::decode(&mut buf)?;
                 let retry_interval = u64::decode(&mut buf)?;
                 let reason = ReasonPhrase::decode(&mut buf)?;
+                let redirect = if error_code == message::RequestErrorCode::Redirect as u64 {
+                    Some(message::Redirect::decode(&mut buf)?)
+                } else {
+                    None
+                };
                 Ok(Message::RequestError(message::RequestError {
                     id: request_id,
                     error_code,
                     retry_interval,
                     reason,
+                    redirect,
                 }))
             }
             wire_id::RequestOk => {
                 let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let track_properties = message::TrackProperties::decode(&mut buf)?;
                 Ok(Message::RequestOk(message::RequestOk {
                     id: request_id,
                     params,
+                    track_properties,
                 }))
             }
             wire_id::SubscribeOk => {
@@ -1010,9 +1132,6 @@ impl Session {
                     track_extensions,
                 }))
             }
-            wire_id::PublishNamespaceDone => Ok(Message::PublishNamespaceDone(
-                message::PublishNamespaceDone { id: request_id },
-            )),
             wire_id::PublishDone => {
                 let status_code = u64::decode(&mut buf)?;
                 let stream_count = u64::decode(&mut buf)?;
@@ -1022,16 +1141,6 @@ impl Session {
                     status_code,
                     stream_count,
                     reason,
-                }))
-            }
-            wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
-                id: request_id,
-            })),
-            wire_id::PublishOk => {
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
-                Ok(Message::PublishOk(message::PublishOk {
-                    id: request_id,
-                    params,
                 }))
             }
             wire_id::FetchOk => {
@@ -1054,7 +1163,17 @@ impl Session {
                     other
                 )))
             }
+        }?;
+
+        if buf.has_remaining() {
+            return Err(SessionError::ProtocolViolation(format!(
+                "response type 0x{:x} left {} unparsed body bytes",
+                msg_type,
+                buf.remaining()
+            )));
         }
+        Self::validate_response_for_request(request_kind, false, &message)?;
+        Ok(message)
     }
 
     /// Receives inbound messages from the control stream reader/receiver.
@@ -1089,9 +1208,6 @@ impl Session {
                         }
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
-                        }
-                        Message::Unsubscribe(m) => {
-                            Some(mlog::events::unsubscribe_parsed(time, stream_id, m))
                         }
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_parsed(time, stream_id, m))
@@ -1294,6 +1410,7 @@ mod tests {
         let msg = Message::RequestOk(message::RequestOk {
             id: 42, // should NOT appear on the wire
             params: crate::coding::KeyValuePairs::default(),
+            track_properties: Default::default(),
         });
         let bytes = encode_bidi_response_bytes(&msg);
         // type (1 byte) + length 0x0001 (2 bytes) + params_count=0 (1 byte) = 4 bytes
@@ -1309,6 +1426,7 @@ mod tests {
             error_code: 0x10,
             retry_interval: 0,
             reason: crate::coding::ReasonPhrase("nf".to_string()),
+            redirect: None,
         });
         let bytes = encode_bidi_response_bytes(&msg);
         assert_eq!(bytes[0], wire_id::RequestError as u8);
@@ -1325,6 +1443,7 @@ mod tests {
         assert!(Message::RequestOk(message::RequestOk {
             id: 1,
             params: Default::default(),
+            track_properties: Default::default(),
         })
         .response_target_id()
         .is_some());
@@ -1333,6 +1452,7 @@ mod tests {
             error_code: 0,
             retry_interval: 0,
             reason: Default::default(),
+            redirect: None,
         })
         .response_target_id()
         .is_some());
@@ -1348,9 +1468,54 @@ mod tests {
         .is_none());
         assert!(Message::GoAway(message::GoAway {
             uri: crate::coding::SessionUri(String::new()),
+            timeout: 0,
         })
         .response_target_id()
         .is_none());
+    }
+
+    #[test]
+    fn request_ok_properties_are_rejected_outside_track_status() {
+        let mut properties = message::TrackProperties::default();
+        properties.set_int_extension(0x78, 1);
+        let response = Message::RequestOk(message::RequestOk {
+            id: 2,
+            params: Default::default(),
+            track_properties: properties,
+        });
+
+        assert!(matches!(
+            Session::validate_response_for_request(RequestKind::Subscribe, false, &response),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        assert!(
+            Session::validate_response_for_request(RequestKind::TrackStatus, false, &response)
+                .is_ok()
+        );
+        assert!(matches!(
+            Session::validate_response_for_request(RequestKind::TrackStatus, true, &response),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn namespace_redirect_rejects_track_name() {
+        let response = Message::RequestError(message::RequestError {
+            id: 2,
+            error_code: message::RequestErrorCode::Redirect as u64,
+            retry_interval: 0,
+            reason: Default::default(),
+            redirect: Some(message::Redirect {
+                connect_uri: Default::default(),
+                track_namespace: Default::default(),
+                track_name: "audio".into(),
+            }),
+        });
+
+        assert!(matches!(
+            Session::validate_response_for_request(RequestKind::PublishNamespace, false, &response),
+            Err(SessionError::ProtocolViolation(_))
+        ));
     }
 
     #[test]
@@ -1366,21 +1531,6 @@ mod tests {
         assert_eq!(bytes[0], wire_id::PublishDone as u8);
         assert!(
             !bytes.contains(&77),
-            "Request ID must not appear in bidi encoding"
-        );
-    }
-
-    #[test]
-    fn encode_bidi_publish_ok_omits_request_id() {
-        use message::wire_id;
-        let msg = Message::PublishOk(message::PublishOk {
-            id: 55,
-            params: crate::coding::KeyValuePairs::default(),
-        });
-        let bytes = encode_bidi_response_bytes(&msg);
-        assert_eq!(bytes[0], wire_id::PublishOk as u8);
-        assert!(
-            !bytes.contains(&55),
             "Request ID must not appear in bidi encoding"
         );
     }

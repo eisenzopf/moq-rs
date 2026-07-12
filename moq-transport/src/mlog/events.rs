@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // TODO: Unimplemented control message events (not yet needed for basic relay interop testing):
-// - PublishNamespaceDone (parsed/created)
-// - PublishNamespaceCancel (parsed/created)
 // - TrackStatus (parsed/created)
 // - SubscribeNamespace (parsed/created)
 // - RequestUpdate (parsed/created)
-// - Fetch, FetchOk, FetchCancel (parsed/created)
-// - Publish, PublishOk, PublishDone (parsed/created)
+// - Fetch, FetchOk (parsed/created)
+// - Publish, PublishSkipped, PublishDone (parsed/created)
 // Note: MaxRequestId/RequestsBlocked removed in draft-18 (#1471)
 //
 // TODO: Unimplemented data plane events (from draft-pardue-moq-qlog-moq-events):
@@ -331,6 +329,7 @@ fn request_ok_to_json(request_kind: &str, msg: &message::RequestOk) -> JsonValue
         "request_id": msg.id,
         "request_kind": request_kind,
         "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "track_properties": key_value_pairs_to_vec(&msg.track_properties.0),
     })
 }
 
@@ -373,6 +372,11 @@ fn request_error_to_json(request_kind: &str, msg: &message::RequestError) -> Jso
         "error_code": msg.error_code,
         "retry_interval": msg.retry_interval,
         "reason_phrase": &msg.reason.0,
+        "redirect": msg.redirect.as_ref().map(|redirect| json!({
+            "connect_uri": &redirect.connect_uri.0,
+            "track_namespace": redirect.track_namespace.to_utf8_path(),
+            "track_name": redirect.track_name.to_string_lossy(),
+        })),
     })
 }
 
@@ -408,32 +412,6 @@ pub fn request_error_created(
     )
 }
 
-/// Create a control_message_parsed event for UNSUBSCRIBE
-pub fn unsubscribe_parsed(time: f64, stream_id: u64, msg: &message::Unsubscribe) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "unsubscribe",
-        json!({
-            "subscribe_id": msg.id,
-        }),
-    )
-}
-
-/// Create a control_message_created event for UNSUBSCRIBE
-pub fn unsubscribe_created(time: f64, stream_id: u64, msg: &message::Unsubscribe) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "unsubscribe",
-        json!({
-            "subscribe_id": msg.id,
-        }),
-    )
-}
-
 /// Create a control_message_parsed event for GOAWAY
 pub fn go_away_parsed(time: f64, stream_id: u64, msg: &message::GoAway) -> Event {
     create_control_message_event(
@@ -442,7 +420,8 @@ pub fn go_away_parsed(time: f64, stream_id: u64, msg: &message::GoAway) -> Event
         true,
         "goaway",
         json!({
-                    "new_session_uri": &msg.uri.0,
+            "new_session_uri": &msg.uri.0,
+            "timeout": msg.timeout,
         }),
     )
 }
@@ -455,7 +434,8 @@ pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Even
         false,
         "goaway",
         json!({
-                    "new_session_uri": &msg.uri.0,
+            "new_session_uri": &msg.uri.0,
+            "timeout": msg.timeout,
         }),
     )
 }

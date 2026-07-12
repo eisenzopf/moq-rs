@@ -24,6 +24,14 @@ impl Reader {
     }
 
     pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
+        self.decode_optional()
+            .await?
+            .ok_or_else(|| DecodeError::More(1).into())
+    }
+
+    /// Decode the next message, returning `None` only for a clean FIN at a
+    /// message boundary. A FIN with a partial message remains a decode error.
+    pub async fn decode_optional<T: Decode>(&mut self) -> Result<Option<T>, SessionError> {
         tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",
             std::any::type_name::<T>(),
@@ -44,7 +52,7 @@ impl Reader {
                         consumed,
                         self.buffer.len()
                     );
-                    return Ok(msg);
+                    return Ok(Some(msg));
                 }
                 Err(DecodeError::More(required)) => {
                     let total_needed = self.buffer.len() + required;
@@ -78,7 +86,12 @@ impl Reader {
                         self.buffer.len(),
                         required
                     );
-                    return Err(DecodeError::More(required - self.buffer.len()).into());
+                    if self.buffer.is_empty() {
+                        return Ok(None);
+                    }
+                    return Err(
+                        DecodeError::More(required.saturating_sub(self.buffer.len())).into(),
+                    );
                 };
 
                 let read_amount = self.buffer.len() - before_read;

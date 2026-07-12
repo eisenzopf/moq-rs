@@ -8,18 +8,23 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, SessionUri};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoAway {
     pub uri: SessionUri,
+
+    /// Milliseconds the sender intends to wait for graceful closure.
+    pub timeout: u64,
 }
 
 impl Decode for GoAway {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let uri = SessionUri::decode(r)?;
-        Ok(Self { uri })
+        let timeout = u64::decode(r)?;
+        Ok(Self { uri, timeout })
     }
 }
 
 impl Encode for GoAway {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        self.uri.encode(w)
+        self.uri.encode(w)?;
+        self.timeout.encode(w)
     }
 }
 
@@ -34,9 +39,23 @@ mod tests {
 
         let msg = GoAway {
             uri: SessionUri("moq://example.com:1234".to_string()),
+            timeout: 5_000,
         };
         msg.encode(&mut buf).unwrap();
         let decoded = GoAway::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn draft_19_golden_encoding() {
+        let mut buf = BytesMut::new();
+        GoAway {
+            uri: SessionUri(String::new()),
+            timeout: 300,
+        }
+        .encode(&mut buf)
+        .unwrap();
+
+        assert_eq!(buf.to_vec(), vec![0x00, 0x81, 0x2c]);
     }
 }

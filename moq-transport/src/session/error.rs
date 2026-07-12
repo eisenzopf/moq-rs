@@ -48,6 +48,11 @@ pub enum SessionError {
     #[error("too many requests")]
     TooManyRequests,
 
+    /// Draft-19 TOO_MANY_REQUEST_UPDATES (0x1B): the peer exceeded the
+    /// per-request-stream limit advertised in MAX_REQUEST_UPDATES.
+    #[error("too many request updates")]
+    TooManyRequestUpdates,
+
     /// Draft-16 §3.4 PROTOCOL_VIOLATION (0x3): peer violated a MUST rule.
     #[error("protocol violation: {0}")]
     ProtocolViolation(String),
@@ -76,6 +81,8 @@ impl SessionError {
             Self::InvalidRequestId => 0x4,
             // TOO_MANY_REQUESTS (0x7)
             Self::TooManyRequests => 0x7,
+            // TOO_MANY_REQUEST_UPDATES (0x1B)
+            Self::TooManyRequestUpdates => 0x1B,
             // PROTOCOL_VIOLATION (0x3)
             Self::ProtocolViolation(_) => 0x3,
             // Delegate to ServeError for per-request error codes
@@ -201,5 +208,15 @@ fn is_connection_error_graceful(err: &web_transport::quinn::quinn::ConnectionErr
         ConnectionError::LocallyClosed => true,
         // Other errors are not graceful closes
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn too_many_request_updates_uses_draft_19_code() {
+        assert_eq!(SessionError::TooManyRequestUpdates.code(), 0x1B);
     }
 }

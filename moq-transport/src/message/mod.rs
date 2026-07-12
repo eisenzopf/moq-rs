@@ -4,7 +4,7 @@
 
 //! Control messages sent over the bidirectional control stream.
 //!
-//! Wire format per draft-ietf-moq-transport-16 §9:
+//! Wire format per draft-ietf-moq-transport-19 §9:
 //!
 //! ```text
 //! MOQT Control Message {
@@ -19,7 +19,6 @@
 //! MUST also close the session.
 
 mod fetch;
-mod fetch_cancel;
 mod fetch_ok;
 mod fetch_type;
 mod filter_type;
@@ -28,12 +27,10 @@ mod group_order;
 
 mod namespace;
 mod params;
-mod pubilsh_namespace_done;
 mod publish;
 mod publish_done;
 mod publish_namespace;
-mod publish_namespace_cancel;
-mod publish_ok;
+mod publish_skipped;
 mod publisher;
 mod request_error;
 mod request_ok;
@@ -42,12 +39,11 @@ mod request_update;
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_ok;
+mod subscribe_tracks;
 mod subscriber;
 mod track_status;
-mod unsubscribe;
 
 pub use fetch::*;
-pub use fetch_cancel::*;
 pub use fetch_ok::*;
 pub use fetch_type::*;
 pub use filter_type::*;
@@ -56,12 +52,10 @@ pub use group_order::*;
 
 pub use namespace::*;
 pub use params::*;
-pub use pubilsh_namespace_done::*;
 pub use publish::*;
 pub use publish_done::*;
 pub use publish_namespace::*;
-pub use publish_namespace_cancel::*;
-pub use publish_ok::*;
+pub use publish_skipped::*;
 pub use publisher::*;
 pub use request_error::*;
 pub use request_ok::*;
@@ -70,9 +64,9 @@ pub use request_update::*;
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_ok::*;
+pub use subscribe_tracks::*;
 pub use subscriber::*;
 pub use track_status::*;
-pub use unsubscribe::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use bytes::Buf as _;
@@ -81,7 +75,7 @@ use std::fmt;
 // Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
     {$($name:ident = $val:expr,)*} => {
-        /// Wire type IDs for control messages (draft-18 Table 5).
+        /// Wire type IDs for control messages (draft-19 Table 5).
         ///
         /// These are the `u64` values used in the `Message Type` field on
         /// the wire. Use these constants instead of hardcoded hex literals
@@ -172,6 +166,7 @@ macro_rules! message_types {
                     Self::Fetch(m) => Some(m.id),
                     Self::TrackStatus(m) => Some(m.id),
                     Self::SubscribeNamespace(m) => Some(m.id),
+                    Self::SubscribeTracks(m) => Some(m.id),
                     Self::Publish(m) => Some(m.id),
                     Self::PublishNamespace(m) => Some(m.id),
                     _ => None,
@@ -179,7 +174,7 @@ macro_rules! message_types {
             }
 
             /// Return the target request ID for response/follow-up messages sent
-            /// back on a bidi stream (draft-18). Returns `None` for request-initiating
+            /// back on a bidi stream (draft-19). Returns `None` for request-initiating
             /// messages and session-level messages.
             pub fn response_target_id(&self) -> Option<u64> {
                 match self {
@@ -187,9 +182,6 @@ macro_rules! message_types {
                     Self::RequestError(m) => Some(m.id),
                     Self::SubscribeOk(m) => Some(m.id),
                     Self::PublishDone(m) => Some(m.id),
-                    Self::PublishNamespaceDone(m) => Some(m.id),
-                    Self::Unsubscribe(m) => Some(m.id),
-                    Self::PublishOk(m) => Some(m.id),
                     Self::FetchOk(m) => Some(m.id),
                     _ => None,
                 }
@@ -212,7 +204,7 @@ macro_rules! message_types {
     }
 }
 
-// Wire IDs per draft-ietf-moq-transport-16 Table 1.
+// Wire IDs per draft-ietf-moq-transport-19 Table 5.
 message_types! {
     // NOTE: Setup messages live in a separate module (setup::Client/Server).
 
@@ -224,14 +216,11 @@ message_types! {
     // ── SUBSCRIBE family ─────────────────────────────────────────────────────
     Subscribe       = 0x3,
     SubscribeOk     = 0x4,
-    Unsubscribe     = 0xa,
 
     // ── PUBLISH_NAMESPACE family ──────────────────────────────────────────────
     PublishNamespace        = 0x6,
     Namespace               = 0x8,
-    PublishNamespaceDone    = 0x9,
     NamespaceDone           = 0xe,
-    PublishNamespaceCancel  = 0xc,
 
     // ── TRACK_STATUS ──────────────────────────────────────────────────────────
     TrackStatus     = 0xd,
@@ -239,15 +228,16 @@ message_types! {
     // ── PUBLISH family ────────────────────────────────────────────────────────
     Publish         = 0x1d,
     PublishDone     = 0xb,
-    PublishOk       = 0x1e,
+    // 0x1e is reserved (PUBLISH_OK in drafts <= 17). PUBLISH uses REQUEST_OK.
 
     // ── FETCH family ─────────────────────────────────────────────────────────
     Fetch           = 0x16,
-    FetchCancel     = 0x17,
     FetchOk         = 0x18,
 
-    // ── SUBSCRIBE_NAMESPACE (bidi stream; §9.25) ──────────────────────────────
-    SubscribeNamespace = 0x11,
+    // ── Namespace and track discovery ──────────────────────────────────────────────────────────
+    PublishSkipped      = 0xf,
+    SubscribeNamespace = 0x50,
+    SubscribeTracks    = 0x51,
 
     // ── Session management ────────────────────────────────────────────────────
     GoAway          = 0x10,
@@ -287,7 +277,6 @@ mod tests {
         assert_sequenced(
             Message::RequestUpdate(RequestUpdate {
                 id: 2,
-                existing_request_id: 0,
                 params: KeyValuePairs::default(),
             }),
             2,
@@ -323,31 +312,39 @@ mod tests {
             Message::SubscribeNamespace(SubscribeNamespace {
                 id: 8,
                 track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
-                subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             }),
             8,
         );
 
         assert_sequenced(
-            Message::Publish(Publish {
+            Message::SubscribeTracks(SubscribeTracks {
                 id: 10,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
+                params: KeyValuePairs::default(),
+            }),
+            10,
+        );
+
+        assert_sequenced(
+            Message::Publish(Publish {
+                id: 12,
                 track_namespace: namespace(),
                 track_name: "track".into(),
                 track_alias: 1,
                 params: KeyValuePairs::default(),
                 track_extensions: TrackExtensions::default(),
             }),
-            10,
+            12,
         );
 
         assert_sequenced(
             Message::PublishNamespace(PublishNamespace {
-                id: 12,
+                id: 14,
                 track_namespace: namespace(),
                 params: KeyValuePairs::default(),
             }),
-            12,
+            14,
         );
     }
 
@@ -356,6 +353,7 @@ mod tests {
         assert_not_sequenced(Message::RequestOk(RequestOk {
             id: 0,
             params: KeyValuePairs::default(),
+            track_properties: TrackProperties::default(),
         }));
 
         assert_not_sequenced(Message::RequestError(RequestError {
@@ -363,6 +361,7 @@ mod tests {
             error_code: 0,
             retry_interval: 0,
             reason: ReasonPhrase(String::new()),
+            redirect: None,
         }));
 
         assert_not_sequenced(Message::SubscribeOk(SubscribeOk {
@@ -372,21 +371,12 @@ mod tests {
             track_extensions: TrackExtensions::default(),
         }));
 
-        assert_not_sequenced(Message::Unsubscribe(Unsubscribe { id: 0 }));
-
-        assert_not_sequenced(Message::FetchCancel(FetchCancel { id: 0 }));
-
         assert_not_sequenced(Message::FetchOk(FetchOk {
             id: 0,
             end_of_track: false,
             end_location: Location::new(0, 0),
             params: KeyValuePairs::default(),
             track_extensions: TrackExtensions::default(),
-        }));
-
-        assert_not_sequenced(Message::PublishOk(PublishOk {
-            id: 0,
-            params: KeyValuePairs::default(),
         }));
 
         assert_not_sequenced(Message::PublishDone(PublishDone {
@@ -408,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn draft16_wire_layouts_for_changed_control_messages() {
+    fn draft19_wire_layouts_for_changed_control_messages() {
         fn encoded(msg: Message) -> Vec<u8> {
             let mut buf = bytes::BytesMut::new();
             msg.encode(&mut buf).unwrap();
@@ -461,14 +451,6 @@ mod tests {
         );
 
         assert_eq!(
-            encoded(Message::PublishOk(PublishOk {
-                id: 0,
-                params: KeyValuePairs::default(),
-            })),
-            vec![0x1e, 0x00, 0x02, 0x00, 0x00]
-        );
-
-        assert_eq!(
             encoded(Message::Fetch(Fetch {
                 id: 0,
                 fetch_type: FetchType::Standalone,
@@ -501,11 +483,67 @@ mod tests {
         assert_eq!(
             encoded(Message::SubscribeNamespace(SubscribeNamespace {
                 id: 0,
-                track_namespace_prefix: prefix,
-                subscribe_options: SubscribeOptions::Both,
+                track_namespace_prefix: prefix.clone(),
                 params: KeyValuePairs::default(),
             })),
-            vec![0x11, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
+            vec![0x50, 0x00, 0x03, 0x00, 0x00, 0x00]
         );
+
+        assert_eq!(
+            encoded(Message::SubscribeTracks(SubscribeTracks {
+                id: 2,
+                track_namespace_prefix: prefix,
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x51, 0x00, 0x03, 0x02, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::PublishSkipped(PublishSkipped {
+                track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("west"),
+                track_name: "main".into(),
+            })),
+            vec![
+                0x0f, 0x00, 0x0b, 0x01, 0x04, b'w', b'e', b's', b't', 0x04, b'm', b'a', b'i', b'n'
+            ]
+        );
+
+        assert_eq!(
+            encoded(Message::GoAway(GoAway {
+                uri: crate::coding::SessionUri(String::new()),
+                timeout: 300,
+            })),
+            vec![0x10, 0x00, 0x03, 0x00, 0x81, 0x2c]
+        );
+    }
+
+    #[test]
+    fn draft19_rejects_reserved_publish_ok_type() {
+        let mut buf = bytes::BytesMut::from(&[0x1e, 0x00, 0x00][..]);
+        assert!(matches!(
+            Message::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidMessage(0x1e)
+        ));
+    }
+
+    #[test]
+    fn draft19_rejects_removed_cancellation_message_types() {
+        for msg_type in [0x09_u8, 0x0a, 0x0c, 0x17] {
+            let mut buf = bytes::BytesMut::from(&[msg_type, 0x00, 0x00][..]);
+            assert!(matches!(
+                Message::decode(&mut buf).unwrap_err(),
+                DecodeError::InvalidMessage(id) if id == u64::from(msg_type)
+            ));
+        }
+    }
+
+    #[test]
+    fn draft19_rejects_goaway_without_timeout() {
+        // Legacy shape: GOAWAY with only a zero-length URI.
+        let mut buf = bytes::BytesMut::from(&[0x10, 0x00, 0x01, 0x00][..]);
+        assert!(matches!(
+            Message::decode(&mut buf).unwrap_err(),
+            DecodeError::More(1)
+        ));
     }
 }

@@ -57,12 +57,8 @@ subscriber_msgs! {
     RequestOk,
     RequestError,
     // Subscription and fetch control.
-    Unsubscribe,
     Fetch,
-    FetchCancel,
     TrackStatus,
     SubscribeNamespace,
-    // Responses/control for publisher-initiated requests.
-    PublishNamespaceCancel,
-    PublishOk,
+    SubscribeTracks,
 }

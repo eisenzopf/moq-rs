@@ -19,8 +19,8 @@ struct PublishedNamespaceState {
 
 /// Represents an inbound PUBLISH_NAMESPACE received by a subscriber.
 ///
-/// On drop, revokes an accepted namespace with PUBLISH_NAMESPACE_CANCEL, or
-/// rejects an unaccepted namespace with REQUEST_ERROR.
+/// On drop, rejects an unaccepted namespace with REQUEST_ERROR. Draft-19
+/// cancels an accepted namespace by closing/resetting the request stream.
 pub struct PublishedNamespace {
     session: Subscriber,
     state: State<PublishedNamespaceState>,
@@ -71,6 +71,7 @@ impl PublishedNamespace {
             message::RequestOk {
                 id: self.info.request_id,
                 params: Default::default(),
+                track_properties: Default::default(),
             },
         );
 
@@ -79,7 +80,7 @@ impl PublishedNamespace {
         Ok(())
     }
 
-    /// Wait until the peer closes the namespace publish (PUBLISH_NAMESPACE_DONE).
+    /// Wait until the peer closes or cancels the namespace request stream.
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
             let Some(modified) = self.state.lock().modified() else {
@@ -114,13 +115,9 @@ impl Drop for PublishedNamespace {
         }
 
         if self.ok {
-            // Accepted: send PUBLISH_NAMESPACE_CANCEL to revoke acceptance
-            // (draft-16 §9.24).  Carries Request ID, not the namespace.
-            self.session.send_message(message::PublishNamespaceCancel {
-                id: self.info.request_id,
-                error_code: err.code(),
-                reason_phrase: ReasonPhrase(err.to_string()),
-            });
+            if let Some(recv) = self.session.drop_publish_namespace(self.info.request_id) {
+                let _ = recv.recv_done();
+            }
         } else {
             // Never accepted: send REQUEST_ERROR (draft-16 §9.8).
             self.session.send_request_error(
@@ -130,6 +127,7 @@ impl Drop for PublishedNamespace {
                     error_code: RequestErrorCode::Uninterested as u64,
                     retry_interval: 0,
                     reason: ReasonPhrase(err.to_string()),
+                    redirect: None,
                 },
             );
         }
@@ -138,8 +136,8 @@ impl Drop for PublishedNamespace {
 
 pub(super) struct PublishedNamespaceRecv {
     state: State<PublishedNamespaceState>,
-    /// Request ID of the corresponding PUBLISH_NAMESPACE, used for O(1) lookup
-    /// when PUBLISH_NAMESPACE_DONE or PUBLISH_NAMESPACE_CANCEL arrives.
+    /// Request ID of the corresponding PUBLISH_NAMESPACE, used for O(1)
+    /// request-stream lifecycle lookup.
     pub request_id: u64,
 }
 

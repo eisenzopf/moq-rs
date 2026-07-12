@@ -463,9 +463,9 @@ pub trait Coordinator: Send + Sync {
 
     /// Unregister a namespace.
     ///
-    /// Called when a publisher sends PUBLISH_NAMESPACE_DONE.
-    /// This is an explicit unregistration - the registration handle may still exist
-    /// but the namespace should be removed from the registry.
+    /// Called when the owning PUBLISH_NAMESPACE request stream is cancelled or
+    /// closed. The registration handle may still exist, but the namespace
+    /// should be removed from the registry.
     ///
     /// # Arguments
     ///
@@ -571,9 +571,10 @@ pub trait Coordinator: Send + Sync {
         Ok(NamespaceSubscription::default())
     }
 
-    /// Unregister interest in a namespace prefix (UNSUBSCRIBE_NAMESPACE).
+    /// Unregister interest in a namespace prefix.
     ///
-    /// Called when a subscriber sends UNSUBSCRIBE_NAMESPACE or disconnects.
+    /// Called when the owning request stream is cancelled/closed or the
+    /// subscriber disconnects.
     /// This is an explicit unregistration — the subscription handle may still
     /// exist but interest should be removed from the registry.
     ///

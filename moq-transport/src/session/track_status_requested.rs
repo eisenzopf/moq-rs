@@ -33,6 +33,7 @@ impl TrackStatusRequested {
                 error_code,
                 retry_interval: 0,
                 reason: ReasonPhrase(error_message.to_string()),
+                redirect: None,
             },
         );
         Ok(())
@@ -57,6 +58,7 @@ impl TrackStatusRequested {
             RequestOk {
                 id: self.request_msg.id,
                 params,
+                track_properties: Default::default(),
             },
         );
 

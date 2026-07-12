@@ -51,7 +51,7 @@ pub struct Subscriber {
     /// will process the queue and send the message on the control stream.
     outgoing: Queue<Message>,
 
-    /// WebTransport session, used to open bidi streams for requests (draft-18).
+    /// WebTransport session, used to open bidi streams for requests (draft-19).
     webtransport: web_transport::Session,
 
     /// Shared with Publisher so all requests within a session use unique IDs.
@@ -153,7 +153,7 @@ impl Subscriber {
         self.request_id.allocate()
     }
 
-    /// Open a bidirectional request stream (draft-18 §10), send a request
+    /// Open a bidirectional request stream (draft-19 §10), send a request
     /// message, and return a Reader for reading the response on the same stream.
     async fn open_request_stream(&self, msg: &message::Message) -> Result<Reader, SessionError> {
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
@@ -225,12 +225,18 @@ impl Subscriber {
             })?
             .insert(request_id, recv);
 
-        // Spawn a reader task for bidi stream responses (draft-18).
+        // Spawn a reader task for bidi stream responses (draft-19).
         // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
         let mut subscriber_clone = self.clone();
         let handle = tokio::spawn(async move {
             loop {
-                match Session::decode_bidi_response(&mut response_reader, request_id).await {
+                match Session::decode_bidi_response(
+                    &mut response_reader,
+                    request_id,
+                    super::RequestKind::Subscribe,
+                )
+                .await
+                {
                     Ok(msg) => {
                         if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                             if let Err(e) = subscriber_clone.recv_message(pub_msg) {
@@ -256,13 +262,6 @@ impl Subscriber {
     pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 
-        // Remove our entry on terminal state.
-        // Draft-16: PUBLISH_NAMESPACE_CANCEL carries Request ID, so look up
-        // the namespace by iterating the map.
-        if let message::Subscriber::PublishNamespaceCancel(msg) = &msg {
-            let _ = self.drop_publish_namespace(msg.id);
-        }
-
         // TODO report dropped messages?
         let _ = self.outgoing.push(msg.into());
     }
@@ -271,15 +270,28 @@ impl Subscriber {
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
             message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,
-            message::Publisher::PublishNamespaceDone(msg) => {
-                self.recv_publish_namespace_done(msg)?;
-            }
             // PUBLISH (publisher-initiated subscription) not yet implemented.
             // Send REQUEST_ERROR NOT_SUPPORTED so the publisher knows we cannot accept it.
             message::Publisher::Publish(msg) => {
                 self.send_not_supported(msg.id, "publish");
             }
+            message::Publisher::RequestUpdate(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "REQUEST_UPDATE was not associated with a request stream".to_string(),
+                ));
+            }
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
+            // PUBLISH_SKIPPED is scoped to a SUBSCRIBE_TRACKS response stream.
+            // The draft-19 wire shape is supported; request lifecycle routing
+            // lands with SUBSCRIBE_TRACKS session support.
+            message::Publisher::PublishSkipped(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    namespace_suffix = %msg.track_namespace_suffix,
+                    track_name = %msg.track_name,
+                    "received PUBLISH_SKIPPED for unsupported SUBSCRIBE_TRACKS"
+                );
+            }
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
@@ -294,6 +306,21 @@ impl Subscriber {
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn recv_request_update(
+        &mut self,
+        initial_request_id: u64,
+        update: message::RequestUpdate,
+    ) -> Result<(), SessionError> {
+        tracing::debug!(
+            target: "moq_transport::control",
+            initial_request_id,
+            update_request_id = update.id,
+            "rejecting unsupported update of publisher-initiated request"
+        );
+        self.send_not_supported(update.id, "request_update");
         Ok(())
     }
 
@@ -314,6 +341,7 @@ impl Subscriber {
                 error_code: crate::message::RequestErrorCode::NotSupported as u64,
                 retry_interval: 0,
                 reason: crate::coding::ReasonPhrase("not supported".to_string()),
+                redirect: None,
             },
         );
     }
@@ -342,18 +370,6 @@ impl Subscriber {
         }
         entry.insert(recv);
 
-        Ok(())
-    }
-
-    /// Handle reception of PUBLISH_NAMESPACE_DONE from the publisher.
-    fn recv_publish_namespace_done(
-        &mut self,
-        msg: &message::PublishNamespaceDone,
-    ) -> Result<(), SessionError> {
-        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
-        if let Some(recv) = self.drop_publish_namespace(msg.id) {
-            recv.recv_done()?;
-        }
         Ok(())
     }
 
@@ -465,7 +481,7 @@ impl Subscriber {
         }
     }
 
-    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
+    pub(super) fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
         if let Ok(mut ns) = self.published_namespaces.lock() {
             let key = ns
                 .iter()

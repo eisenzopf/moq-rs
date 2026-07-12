@@ -31,6 +31,9 @@ impl Version {
     /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html
     pub const DRAFT_16: Version = Version(0xff000010);
     pub const DRAFT_18: Version = Version(0xff000012);
+
+    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.html
+    pub const DRAFT_19: Version = Version(0xff000013);
 }
 
 impl From<u32> for Version {
@@ -156,5 +159,13 @@ mod tests {
 
         let decoded = Versions::decode(&mut buf).unwrap();
         assert_eq!(decoded, versions);
+    }
+
+    #[test]
+    fn draft_19_golden_encoding() {
+        let mut buf = BytesMut::new();
+        Version::DRAFT_19.encode(&mut buf).unwrap();
+        assert_eq!(buf.to_vec(), vec![0xF0, 0xFF, 0x00, 0x00, 0x13]);
+        assert_eq!(Version::decode(&mut buf).unwrap(), Version::DRAFT_19);
     }
 }

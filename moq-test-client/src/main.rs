@@ -77,8 +77,6 @@ pub enum TestCase {
     PublishNamespaceSubscribe,
     /// T0.5: Subscriber subscribes before publisher sends PUBLISH_NAMESPACE
     SubscribeBeforePublishNamespace,
-    /// T0.6: Send PUBLISH_NAMESPACE, receive REQUEST_OK, send PUBLISH_NAMESPACE_DONE
-    PublishNamespaceDone,
 }
 
 impl TestCase {
@@ -89,7 +87,6 @@ impl TestCase {
             TestCase::SubscribeError,
             TestCase::PublishNamespaceSubscribe,
             TestCase::SubscribeBeforePublishNamespace,
-            TestCase::PublishNamespaceDone,
         ]
     }
 
@@ -100,7 +97,6 @@ impl TestCase {
             TestCase::SubscribeError => "subscribe-error",
             TestCase::PublishNamespaceSubscribe => "publish-namespace-subscribe",
             TestCase::SubscribeBeforePublishNamespace => "subscribe-before-publish-namespace",
-            TestCase::PublishNamespaceDone => "publish-namespace-done",
         }
     }
 }
@@ -151,7 +147,6 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::SubscribeBeforePublishNamespace => {
             scenarios::test_subscribe_before_publish_namespace(args).await
         }
-        TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
     };
 
     let duration = start.elapsed();

@@ -53,10 +53,11 @@ macro_rules! publisher_msgs {
 publisher_msgs! {
     // Namespace advertisement and termination.
     PublishNamespace,
-    PublishNamespaceDone,
     // Publisher-initiated subscriptions.
     Publish,
+    RequestUpdate,
     PublishDone,
+    PublishSkipped,
     // Responses to subscriber-initiated requests.
     SubscribeOk,
     RequestOk,

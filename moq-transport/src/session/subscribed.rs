@@ -23,9 +23,6 @@ use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 struct SubscribedState {
     largest_location: Option<Location>,
     stream_count: u64,
-    /// Set to true when UNSUBSCRIBE is received.  When true, Drop skips sending
-    /// PUBLISH_DONE or REQUEST_ERROR because the subscriber already terminated.
-    unsubscribed: bool,
     closed: Result<(), ServeError>,
 }
 
@@ -51,7 +48,6 @@ impl Default for SubscribedState {
         Self {
             largest_location: None,
             stream_count: 0,
-            unsubscribed: false,
             closed: Ok(()),
         }
     }
@@ -194,13 +190,7 @@ impl Drop for Subscribed {
             .cloned()
             .unwrap_or(ServeError::Done);
         let stream_count = state.stream_count;
-        let unsubscribed = state.unsubscribed;
         drop(state); // Important to avoid a deadlock
-
-        // Subscriber already sent UNSUBSCRIBE — no terminal message needed.
-        if unsubscribed {
-            return;
-        }
 
         if self.ok {
             self.publisher.send_message(message::PublishDone {
@@ -219,6 +209,7 @@ impl Drop for Subscribed {
                     error_code: Self::request_error_code(&err),
                     retry_interval: 0,
                     reason: ReasonPhrase(err.to_string()),
+                    redirect: None,
                 },
             );
             self.publisher.drop_subscribe(self.info.id);
@@ -557,15 +548,15 @@ pub(super) struct SubscribedRecv {
 }
 
 impl SubscribedRecv {
-    pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
+    pub fn recv_update_failed(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
 
         if let Some(mut state) = state.into_mut() {
-            state.unsubscribed = true;
-            state.closed = Err(ServeError::Cancel);
+            state.closed = Err(ServeError::Closed(
+                message::PublishDoneCode::UpdateFailed as u64,
+            ));
         }
-
         Ok(())
     }
 }
@@ -584,21 +575,6 @@ mod tests {
 
         state.record_stream_opened();
         assert_eq!(state.stream_count, 2);
-    }
-
-    #[test]
-    fn recv_unsubscribe_marks_unsubscribed_and_closes() {
-        let state = State::<SubscribedState>::default();
-        let (_send, recv_state) = state.split();
-        let mut recv = SubscribedRecv { state: recv_state };
-
-        assert!(!recv.state.lock().unsubscribed);
-
-        recv.recv_unsubscribe().unwrap();
-
-        let locked = recv.state.lock();
-        assert!(locked.unsubscribed);
-        assert!(matches!(locked.closed, Err(ServeError::Cancel)));
     }
 
     #[test]

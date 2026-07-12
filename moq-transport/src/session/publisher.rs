@@ -143,7 +143,7 @@ impl Publisher {
             if let Ok(mut ns) = self.publish_namespaces.lock() {
                 ns.remove(&tracks.namespace);
             }
-            return Err(e.into());
+            return Err(e);
         }
 
         // Spawn a reader task for responses on this bidi stream.
@@ -154,7 +154,13 @@ impl Publisher {
         let handle = tokio::spawn(async move {
             let mut reader = super::Reader::new(recv_stream);
             loop {
-                match Session::decode_bidi_response(&mut reader, bidi_request_id).await {
+                match Session::decode_bidi_response(
+                    &mut reader,
+                    bidi_request_id,
+                    super::RequestKind::PublishNamespace,
+                )
+                .await
+                {
                     Ok(msg) => {
                         if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
                             if let Err(e) = this.recv_message(sub_msg) {
@@ -312,46 +318,60 @@ impl Publisher {
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg)?,
-            // REQUEST_UPDATE: not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
-            message::Subscriber::RequestUpdate(msg) => {
-                self.send_not_supported(msg.id, "request_update");
+            message::Subscriber::RequestUpdate(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "REQUEST_UPDATE was not associated with a request stream".to_string(),
+                ));
             }
             // Draft-16: REQUEST_OK from subscriber is acceptance of PUBLISH_NAMESPACE.
             message::Subscriber::RequestOk(msg) => self.recv_publish_namespace_ok(msg)?,
             // Draft-16: REQUEST_ERROR from subscriber is rejection of PUBLISH_NAMESPACE.
             message::Subscriber::RequestError(msg) => self.recv_publish_namespace_error(msg)?,
-            message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
             // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::Fetch(msg) => {
                 self.send_not_supported(msg.id, "fetch");
-            }
-            // FETCH_CANCEL references an existing request; log and ignore.
-            message::Subscriber::FetchCancel(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received FETCH_CANCEL for unsupported FETCH — ignoring"
-                );
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
             // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::SubscribeNamespace(msg) => {
                 self.send_not_supported(msg.id, "subscribe_namespace");
             }
-            message::Subscriber::PublishNamespaceCancel(msg) => {
-                self.recv_publish_namespace_cancel(msg)?;
-            }
-            // PUBLISH_OK is for publisher-initiated subscriptions, which are not
-            // yet implemented — log and ignore.
-            message::Subscriber::PublishOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received PUBLISH_OK for unsupported PUBLISH — ignoring"
-                );
+            // SUBSCRIBE_TRACKS is wire-supported in draft-19, but automatic
+            // PUBLISH fanout is a later session-layer tranche.
+            message::Subscriber::SubscribeTracks(msg) => {
+                self.send_not_supported(msg.id, "subscribe_tracks");
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn recv_request_update(
+        &mut self,
+        initial_request_id: u64,
+        update: message::RequestUpdate,
+    ) -> Result<(), SessionError> {
+        let found = {
+            let mut subscribeds = self
+                .subscribeds
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if let Some(subscribed) = subscribeds.get_mut(&initial_request_id) {
+                subscribed.recv_update_failed()?;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !found {
+            return Err(SessionError::ProtocolViolation(format!(
+                "REQUEST_UPDATE targeted inactive request stream {}",
+                initial_request_id
+            )));
+        }
+
+        self.send_not_supported(update.id, "request_update");
         Ok(())
     }
 
@@ -372,6 +392,7 @@ impl Publisher {
                 error_code: RequestErrorCode::NotSupported as u64,
                 retry_interval: 0,
                 reason: crate::coding::ReasonPhrase("not supported".to_string()),
+                redirect: None,
             },
         );
     }
@@ -404,17 +425,6 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_publish_namespace_cancel(
-        &mut self,
-        msg: message::PublishNamespaceCancel,
-    ) -> Result<(), SessionError> {
-        // Draft-16 §9.24: PUBLISH_NAMESPACE_CANCEL now carries Request ID.
-        if let Some(recv) = self.drop_publish_namespace(msg.id) {
-            recv.recv_error(ServeError::Cancel)?;
-        }
-        Ok(())
-    }
-
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
         let full_name = FullTrackName {
@@ -440,6 +450,7 @@ impl Publisher {
                         error_code: RequestErrorCode::DuplicateSubscription as u64,
                         retry_interval: 0,
                         reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
+                        redirect: None,
                     },
                 );
                 return Ok(());
@@ -460,6 +471,7 @@ impl Publisher {
                         error_code: RequestErrorCode::DuplicateSubscription as u64,
                         retry_interval: 0,
                         reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
+                        redirect: None,
                     },
                 );
                 return Ok(());
@@ -519,41 +531,14 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
-        {
-            let mut subscribeds = self
-                .subscribeds
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let subscribed = subscribeds.get_mut(&msg.id).ok_or_else(|| {
-                SessionError::ProtocolViolation(format!(
-                    "UNSUBSCRIBE for unknown subscribe ID {}",
-                    msg.id
-                ))
-            })?;
-
-            subscribed.recv_unsubscribe()?;
-        }
-
-        self.remove_subscribe(msg.id)?;
-
-        Ok(())
-    }
-
     /// Pre-send hook: clean up internal state when terminal publisher messages are enqueued.
     fn act_on_message_to_send<T: Into<message::Publisher>>(
         &mut self,
         msg: T,
     ) -> message::Publisher {
         let msg = msg.into();
-        match &msg {
-            message::Publisher::PublishDone(m) => self.drop_subscribe(m.id),
-            // Draft-16: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
-            // Dropping the recv state signals that the namespace is done.
-            message::Publisher::PublishNamespaceDone(m) => {
-                let _ = self.drop_publish_namespace(m.id);
-            }
-            _ => {}
+        if let message::Publisher::PublishDone(m) = &msg {
+            self.drop_subscribe(m.id);
         }
         msg
     }
@@ -600,7 +585,7 @@ impl Publisher {
         Ok(())
     }
 
-    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
+    pub(super) fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
         if let Ok(mut ns) = self.publish_namespaces.lock() {
             let key = ns
                 .iter()

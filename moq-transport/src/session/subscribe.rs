@@ -202,7 +202,7 @@ impl Subscribe {
     }
 
     /// Create a Subscribe without sending on the control stream.
-    /// The caller sends via a bidi request stream (draft-18).
+    /// The caller sends via a bidi request stream (draft-19).
     pub(super) fn new(
         subscriber: Subscriber,
         request_id: u64,
@@ -280,8 +280,8 @@ impl Subscribe {
 
 impl Drop for Subscribe {
     fn drop(&mut self) {
-        self.subscriber
-            .send_message(message::Unsubscribe { id: self.info.id });
+        // Draft-19 removed UNSUBSCRIBE. The owning request stream is the
+        // cancellation boundary; dropping the handle releases local state.
         self.subscriber.remove_subscribe(self.info.id);
     }
 }
