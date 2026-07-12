@@ -74,7 +74,7 @@ impl RemoteManager {
         {
             Ok(remote) => remote,
             Err(err) => {
-                tracing::error!(remote_url = %url, error = %err, "failed to connect to remote relay: {}", err);
+                tracing::error!(remote_url = %crate::redact_url_for_logging(&url), error = %err, "failed to connect to remote relay");
                 return Err(err);
             }
         };
@@ -82,7 +82,7 @@ impl RemoteManager {
         match remote.subscribe(namespace.clone(), track_name).await {
             Ok(reader) => Ok(reader),
             Err(err) => {
-                tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
+                tracing::warn!(remote_url = %crate::redact_url_for_logging(&url), error = %err, "remote subscribe failed, removing from cache");
                 self.remove_if_same_remote(&cache_key, &remote).await;
 
                 Err(err)
@@ -130,14 +130,14 @@ impl RemoteManager {
                     return Ok(remote.clone());
                 }
 
-                tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
+                tracing::info!(remote_url = %crate::redact_url_for_logging(&cache_key.0), "removing dead connection to remote relay");
             };
 
             if let Some(remote) = cached.take() {
                 remote.shutdown().await;
             }
 
-            tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
+            tracing::info!(remote_url = %crate::redact_url_for_logging(&cache_key.0), "connecting to remote relay");
             let remote = match Remote::connect(
                 cache_key.0.clone(),
                 cache_key.1,
@@ -191,7 +191,7 @@ impl RemoteManager {
         };
 
         for (cache_key, slot) in remotes {
-            tracing::info!(remote_url = %cache_key.0, "shutting down remote connection");
+            tracing::info!(remote_url = %crate::redact_url_for_logging(&cache_key.0), "shutting down remote connection");
             let mut remote = slot.lock().await;
             if let Some(remote) = remote.take() {
                 remote.shutdown().await;
@@ -292,13 +292,13 @@ impl Remote {
             tokio::select! {
                 result = session.run() => {
                     if let Err(err) = result {
-                        tracing::warn!(remote_url = %session_url, error = %err, "remote session closed: {}", err);
+                        tracing::warn!(remote_url = %crate::redact_url_for_logging(&session_url), error = %err, "remote session closed");
                     } else {
-                        tracing::info!(remote_url = %session_url, "remote session closed normally");
+                        tracing::info!(remote_url = %crate::redact_url_for_logging(&session_url), "remote session closed normally");
                     }
                 }
                 _ = session_cancel.cancelled() => {
-                    tracing::info!(remote_url = %session_url, "remote session cancelled");
+                    tracing::info!(remote_url = %crate::redact_url_for_logging(&session_url), "remote session cancelled");
                 }
             }
 
@@ -311,7 +311,7 @@ impl Remote {
                 {
                     cached.take();
                     cleared = true;
-                    tracing::info!(remote_url = %session_url, "cleared closed remote connection from cache");
+                    tracing::info!(remote_url = %crate::redact_url_for_logging(&session_url), "cleared closed remote connection from cache");
                 }
                 drop(cached);
 
@@ -358,7 +358,10 @@ impl Remote {
 
         loop {
             if !self.is_connected() {
-                anyhow::bail!("remote connection to {} is closed", self.url);
+                anyhow::bail!(
+                    "remote connection to {} is closed",
+                    crate::redact_url_for_logging(&self.url)
+                );
             }
 
             let slot = {
@@ -385,7 +388,7 @@ impl Remote {
                     return Ok(Some(reader.clone()));
                 }
 
-                tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "removing closed remote track from cache");
+                tracing::debug!(remote_url = %crate::redact_url_for_logging(&self.url), namespace = %key.0, track = %key.1, "removing closed remote track from cache");
             }
 
             cached.take();
@@ -395,7 +398,7 @@ impl Remote {
             let tracks = Arc::downgrade(&self.tracks);
             let cancel = self.cancel.clone();
 
-            tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
+            tracing::info!(remote_url = %crate::redact_url_for_logging(&url), namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
             let subscribe_result = tokio::select! {
@@ -403,7 +406,7 @@ impl Remote {
                 _ = cancel.cancelled() => {
                     drop(cached);
                     remove_empty_track_slot(&self.tracks, &key, &slot).await;
-                    anyhow::bail!("subscribe cancelled, remote connection to {} is closed", self.url);
+                    anyhow::bail!("subscribe cancelled, remote connection to {} is closed", crate::redact_url_for_logging(&self.url));
                 }
             };
 
@@ -419,7 +422,10 @@ impl Remote {
             if !self.is_connected() {
                 drop(cached);
                 remove_empty_track_slot(&self.tracks, &key, &slot).await;
-                anyhow::bail!("remote connection to {} is closed", self.url);
+                anyhow::bail!(
+                    "remote connection to {} is closed",
+                    crate::redact_url_for_logging(&self.url)
+                );
             }
 
             *cached = Some(reader.clone());
@@ -433,15 +439,15 @@ impl Remote {
                     result = subscribe.closed() => {
                         match result {
                             Ok(()) => {
-                                tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
+                                tracing::debug!(remote_url = %crate::redact_url_for_logging(&url), namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
                             }
                             Err(err) => {
-                                tracing::warn!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error: {}", err);
+                                tracing::warn!(remote_url = %crate::redact_url_for_logging(&url), namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error");
                             }
                         }
                     }
                     _ = cancel.cancelled() => {
-                        tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
+                        tracing::debug!(remote_url = %crate::redact_url_for_logging(&url), namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
                     }
                 }
 
@@ -465,8 +471,36 @@ impl Remote {
 impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Remote")
-            .field("url", &self.url.to_string())
+            .field("url", &crate::redact_url_for_logging(&self.url))
             .field("connected", &self.is_connected())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn remote_diagnostics_never_render_urls_directly() {
+        let source = include_str!("remote.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("remote implementation precedes its tests");
+
+        for line in implementation
+            .lines()
+            .filter(|line| line.contains("remote_url = %"))
+        {
+            assert!(
+                line.contains("redact_url_for_logging"),
+                "raw remote URL diagnostic: {line}"
+            );
+        }
+
+        let raw_debug = [".field(\"url\", &self.url", ".to_string())"].concat();
+        assert!(
+            !implementation.contains(&raw_debug),
+            "Remote Debug must use the bounded URL diagnostic"
+        );
     }
 }
