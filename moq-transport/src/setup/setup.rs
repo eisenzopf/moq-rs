@@ -17,6 +17,7 @@
 //! ```
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Value};
+use crate::setup::ParameterType;
 
 /// The SETUP message type, which also serves as the control stream type.
 pub const SETUP_TYPE: u64 = 0x2F00;
@@ -26,10 +27,54 @@ pub const SETUP_TYPE: u64 = 0x2F00;
 /// Replaces the separate CLIENT_SETUP (0x20) and SERVER_SETUP (0x21)
 /// from earlier drafts. Version negotiation is handled entirely by ALPN;
 /// this message carries only Setup Options (PATH, AUTHORITY, etc.).
-#[derive(Debug)]
 pub struct Setup {
     /// Setup Options encoded as length-bounded KVPs.
     pub params: KeyValuePairs,
+}
+
+impl std::fmt::Debug for Setup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let authorization_key: u64 = ParameterType::AuthorizationToken.into();
+        let path_key: u64 = ParameterType::Path.into();
+        let authority_key: u64 = ParameterType::Authority.into();
+        let params = self
+            .params
+            .0
+            .iter()
+            .map(|pair| {
+                (
+                    pair.key,
+                    if pair.key == authorization_key {
+                        "<redacted>".to_string()
+                    } else if pair.key == authority_key {
+                        "<redacted-authority>".to_string()
+                    } else if pair.key == path_key {
+                        match &pair.value {
+                            Value::BytesValue(bytes) => {
+                                let path = bytes
+                                    .split(|byte| *byte == b'?')
+                                    .next()
+                                    .and_then(|path| std::str::from_utf8(path).ok())
+                                    .unwrap_or("<invalid-path>");
+                                if bytes.contains(&b'?') {
+                                    format!("{path}?<redacted>")
+                                } else {
+                                    path.to_string()
+                                }
+                            }
+                            _ => "<invalid-path>".to_string(),
+                        }
+                    } else {
+                        format!("{:?}", pair.value)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("Setup")
+            .field("params", &params)
+            .finish()
+    }
 }
 
 impl Setup {
@@ -216,5 +261,60 @@ mod tests {
                 .map(|pair| &pair.value),
             Some(&crate::coding::Value::IntValue(4))
         );
+    }
+
+    #[test]
+    fn debug_redacts_authorization_token() {
+        let secret = b"setup-secret";
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(ParameterType::AuthorizationToken.into(), secret.to_vec());
+        params.set_intvalue(ParameterType::MaxRequestUpdates.into(), 4);
+        let debug = format!("{:?}", Setup { params });
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("setup-secret"));
+        assert!(debug.contains("(8, \"4\")"));
+    }
+
+    #[test]
+    fn debug_redacts_path_query() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(
+            ParameterType::Path.into(),
+            b"/tenant/live?token=setup-secret".to_vec(),
+        );
+        let debug = format!("{:?}", Setup { params });
+        assert!(debug.contains("/tenant/live?<redacted>"));
+        assert!(!debug.contains("setup-secret"));
+    }
+
+    #[test]
+    fn debug_never_emits_setup_authority_userinfo() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(
+            ParameterType::Authority.into(),
+            b"user:password@relay.example".to_vec(),
+        );
+        let debug = format!("{:?}", Setup { params });
+        assert!(debug.contains("<redacted-authority>"));
+        assert!(!debug.contains("user"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("75 73 65 72"));
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_path_and_authority_options() {
+        for key in [ParameterType::Path, ParameterType::Authority] {
+            let key: u64 = key.into();
+            let params = KeyValuePairs(vec![
+                crate::coding::KeyValuePair::new_bytes(key, b"/first".to_vec()),
+                crate::coding::KeyValuePair::new_bytes(key, b"/second".to_vec()),
+            ]);
+            let mut encoded = bytes::BytesMut::new();
+            Setup { params }.encode(&mut encoded).unwrap();
+            assert!(matches!(
+                Setup::decode(&mut encoded),
+                Err(DecodeError::DuplicateParameter(duplicate)) if duplicate == key
+            ));
+        }
     }
 }

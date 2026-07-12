@@ -35,6 +35,7 @@ use reader::*;
 use request_updates::{RequestKind, RequestUpdateCredits};
 use writer::*;
 
+use bytes::Bytes;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -81,6 +82,7 @@ struct RequestUpdateLimits {
 struct SessionConfig {
     negotiated: NegotiatedTransport,
     target: SessionTarget,
+    setup_authorization: Option<SetupAuthorization>,
     peer_max_request_updates: u64,
 }
 
@@ -169,6 +171,33 @@ static GLOBAL_DATA_STREAM_TASKS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLoc
     ))
 });
 
+struct BidiRequestTaskLimits {
+    global: Arc<tokio::sync::Semaphore>,
+    per_session: usize,
+}
+
+impl BidiRequestTaskLimits {
+    fn production() -> Self {
+        Self {
+            global: GLOBAL_BIDI_REQUEST_TASKS.clone(),
+            per_session: Session::MAX_CONCURRENT_BIDI_STREAMS,
+        }
+    }
+
+    fn try_admit(&self, active_for_session: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if active_for_session >= self.per_session {
+            return None;
+        }
+        self.global.clone().try_acquire_owned().ok()
+    }
+}
+
+static GLOBAL_BIDI_REQUEST_TASKS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(
+        Session::MAX_CONCURRENT_BIDI_STREAMS_GLOBAL,
+    ))
+});
+
 /// The transport protocol negotiated for this MoQT connection.
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
@@ -206,6 +235,53 @@ impl NegotiatedTransport {
     }
 }
 
+/// Bounded, opaque authorization material supplied in the peer's SETUP.
+///
+/// The contents are available to admission policies but intentionally omitted
+/// from `Debug` output so bearer credentials cannot leak into logs.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SetupAuthorization(Bytes);
+
+impl SetupAuthorization {
+    pub const MAX_BYTES: usize = 4 * 1024;
+
+    pub fn new(value: impl AsRef<[u8]>) -> Result<Self, SessionError> {
+        let value = value.as_ref();
+        if value.is_empty() {
+            return Err(SessionError::ProtocolViolation(
+                "SETUP authorization material must not be empty".into(),
+            ));
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(SessionError::ProtocolViolation(
+                "SETUP authorization material exceeds 4096 bytes".into(),
+            ));
+        }
+        Ok(Self(Bytes::copy_from_slice(value)))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for SetupAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SetupAuthorization")
+            .field("bytes", &format_args!("<redacted:{}>", self.len()))
+            .finish()
+    }
+}
+
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
@@ -234,6 +310,9 @@ pub struct Session {
 
     /// Canonical `moqt://` target reconstructed identically on both substrates.
     target: SessionTarget,
+
+    /// Bounded authorization material received from this session's peer.
+    setup_authorization: Option<SetupAuthorization>,
 
     /// Receiver for spawned bidi reader task handles.
     /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
@@ -296,6 +375,26 @@ impl Session {
                 Value::IntValue(_) => Err(false),
             })
             .transpose()
+    }
+
+    fn setup_authorization(
+        params: &KeyValuePairs,
+    ) -> Result<Option<SetupAuthorization>, SessionError> {
+        let key = setup::ParameterType::AuthorizationToken.into();
+        if params.0.iter().filter(|pair| pair.key == key).count() > 1 {
+            return Err(SessionError::ProtocolViolation(
+                "SETUP authorization option must not be repeated".into(),
+            ));
+        }
+        let Some(pair) = params.get(key) else {
+            return Ok(None);
+        };
+        let Value::BytesValue(value) = &pair.value else {
+            return Err(SessionError::ProtocolViolation(
+                "SETUP authorization option must be bytes-encoded".into(),
+            ));
+        };
+        SetupAuthorization::new(value).map(Some)
     }
 
     fn target_from_client_setup(
@@ -399,6 +498,16 @@ impl Session {
     /// Returns the canonical `moqt://` session target.
     pub fn target(&self) -> &SessionTarget {
         &self.target
+    }
+
+    /// Returns redaction-safe, bounded SETUP authorization material from the peer.
+    pub fn peer_setup_authorization(&self) -> Option<&SetupAuthorization> {
+        self.setup_authorization.as_ref()
+    }
+
+    /// Remove raw bearer material once admission has produced bounded claims.
+    pub fn clear_peer_setup_authorization(&mut self) {
+        self.setup_authorization = None;
     }
 
     /// Returns the canonical path and query used for routing this session.
@@ -632,6 +741,7 @@ impl Session {
             mlog: mlog_shared,
             negotiated: config.negotiated,
             target: config.target,
+            setup_authorization: config.setup_authorization,
             bidi_task_rx,
             bidi_response_map,
             max_request_updates: Self::DEFAULT_MAX_REQUEST_UPDATES,
@@ -653,6 +763,17 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         negotiated: NegotiatedTransport,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_authorization(session, mlog_path, negotiated, None).await
+    }
+
+    /// Create an outbound session and include bounded authorization material
+    /// in the SETUP option block.
+    pub async fn connect_with_authorization(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        negotiated: NegotiatedTransport,
+        authorization: Option<SetupAuthorization>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         Self::validate_negotiated_transport(&session, negotiated)?;
         let url = session.url().clone();
@@ -680,6 +801,12 @@ impl Session {
             setup::ParameterType::MaxRequestUpdates.into(),
             Self::DEFAULT_MAX_REQUEST_UPDATES,
         );
+        if let Some(authorization) = authorization {
+            params.set_bytesvalue(
+                setup::ParameterType::AuthorizationToken.into(),
+                authorization.as_bytes().to_vec(),
+            );
+        }
 
         if negotiated.substrate == Transport::RawQuic {
             // Draft-19 requires both options on every native QUIC session,
@@ -702,7 +829,7 @@ impl Session {
             msg_type = "SETUP",
             transport = ?negotiated.substrate,
             protocol = negotiated.protocol,
-            target = %target,
+            target = %target.redacted_for_logging(),
             "MoQT framed message"
         );
         sender.encode(&client).await?;
@@ -731,6 +858,7 @@ impl Session {
             SessionConfig {
                 negotiated,
                 target,
+                setup_authorization: None,
                 peer_max_request_updates,
             },
         );
@@ -772,9 +900,14 @@ impl Session {
         );
 
         let target = Self::target_from_client_setup(session.url(), negotiated, &client.params)?;
+        let setup_authorization = Self::setup_authorization(&client.params)?;
 
-        if let Some(connection_path) = target.routing_path() {
-            tracing::debug!(connection_path, "Connection path resolved");
+        if target.routing_path().is_some() {
+            tracing::debug!(
+                connection_target = %target.redacted_for_logging(),
+                query_present = target.query().is_some(),
+                "Connection path resolved"
+            );
         }
 
         if let Some(ref mut mlog) = mlog {
@@ -815,6 +948,7 @@ impl Session {
             SessionConfig {
                 negotiated,
                 target,
+                setup_authorization,
                 peer_max_request_updates,
             },
         ))
@@ -981,6 +1115,7 @@ impl Session {
     /// Maximum number of bidi request handler tasks running concurrently.
     /// Provides back-pressure when a peer opens many streams at once.
     const MAX_CONCURRENT_BIDI_STREAMS: usize = 128;
+    const MAX_CONCURRENT_BIDI_STREAMS_GLOBAL: usize = 4096;
 
     async fn run_bidi_requests(
         webtransport: web_transport::Session,
@@ -992,17 +1127,25 @@ impl Session {
         peer_max_request_updates: u64,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
+        let limits = BidiRequestTaskLimits::production();
 
         loop {
             tokio::select! {
                 res = webtransport.accept_bi(), if tasks.len() < Self::MAX_CONCURRENT_BIDI_STREAMS => {
-                    let (send_stream, recv_stream) = res?;
+                    let (mut send_stream, mut recv_stream) = res?;
+                    let Some(permit) = limits.try_admit(tasks.len()) else {
+                        let code = message::RequestErrorCode::ExcessiveLoad as u32;
+                        send_stream.reset(code);
+                        recv_stream.stop(code);
+                        continue;
+                    };
                     let mut pub_clone = publisher.clone();
                     let mut sub_clone = subscriber.clone();
                     let rid = request_id.clone();
                     let map = bidi_response_map.clone();
 
                     tasks.push(async move {
+                        let _permit = permit;
                         Self::handle_bidi_request(
                             send_stream, recv_stream,
                             &mut pub_clone, &mut sub_clone, &rid, &map,
@@ -1945,6 +2088,26 @@ mod tests {
             Session::target_from_client_setup(&url, negotiated, &malformed_authority),
             Err(SessionError::MalformedAuthority(_))
         ));
+
+        let mut userinfo_authority = KeyValuePairs::default();
+        userinfo_authority.set_bytesvalue(setup::ParameterType::Path.into(), b"/live".to_vec());
+        userinfo_authority.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"user:password@relay.example".to_vec(),
+        );
+        let error =
+            Session::target_from_client_setup(&url, negotiated, &userinfo_authority).unwrap_err();
+        assert!(matches!(error, SessionError::MalformedAuthority(_)));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("user"));
+        assert!(!diagnostic.contains("password"));
+    }
+
+    #[test]
+    fn accepted_session_logging_never_emits_raw_authority() {
+        let implementation = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!implementation.contains("authority = target.authority()"));
+        assert!(implementation.contains("target.redacted_for_logging()"));
     }
 
     #[test]
@@ -1963,7 +2126,7 @@ mod tests {
 
         let target = Session::target_from_client_setup(&url, negotiated, &params).unwrap();
         assert_eq!(
-            target.to_string(),
+            target.canonical_url().as_str(),
             "moqt://relay.example:4443/a%2Fb?token=x%2Fy"
         );
 
@@ -1994,6 +2157,31 @@ mod tests {
             Session::validate_server_setup_options(&params),
             Err(SessionError::InvalidAuthority(_))
         ));
+    }
+
+    #[test]
+    fn setup_authorization_is_bounded_redacted_and_type_checked() {
+        let authorization = SetupAuthorization::new(b"super-secret-token").unwrap();
+        assert_eq!(authorization.as_bytes(), b"super-secret-token");
+        let debug = format!("{authorization:?}");
+        assert!(debug.contains("redacted:18"));
+        assert!(!debug.contains("super-secret-token"));
+        assert!(SetupAuthorization::new([]).is_err());
+        assert!(SetupAuthorization::new(vec![0; SetupAuthorization::MAX_BYTES + 1]).is_err());
+
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(setup::ParameterType::AuthorizationToken.into(), 1);
+        assert!(Session::setup_authorization(&params).is_err());
+    }
+
+    #[test]
+    fn duplicate_setup_authorization_is_rejected() {
+        let key = setup::ParameterType::AuthorizationToken.into();
+        let params = KeyValuePairs(vec![
+            crate::coding::KeyValuePair::new_bytes(key, b"first".to_vec()),
+            crate::coding::KeyValuePair::new_bytes(key, b"second".to_vec()),
+        ]);
+        assert!(Session::setup_authorization(&params).is_err());
     }
 
     // ========================================================================
@@ -2027,6 +2215,28 @@ mod tests {
         drop(second);
 
         assert_eq!(Session::DATA_STREAM_EXCESSIVE_LOAD, 0x9);
+    }
+
+    #[test]
+    fn bidi_request_admission_enforces_process_cap_and_releases() {
+        let global = Arc::new(tokio::sync::Semaphore::new(2));
+        let first_session = BidiRequestTaskLimits {
+            global: global.clone(),
+            per_session: 2,
+        };
+        let second_session = BidiRequestTaskLimits {
+            global,
+            per_session: 2,
+        };
+        let first = first_session.try_admit(0).expect("first request admitted");
+        let second = second_session
+            .try_admit(0)
+            .expect("second request admitted");
+        assert!(first_session.try_admit(1).is_none());
+        assert!(first_session.try_admit(2).is_none());
+        drop(first);
+        assert!(first_session.try_admit(1).is_some());
+        drop(second);
     }
 
     #[tokio::test]

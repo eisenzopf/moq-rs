@@ -222,10 +222,8 @@ impl Coordinator for ApiCoordinator {
 
         tracing::info!(
             namespace = %namespace_str,
-            relay_url = %self.config.relay_url,
-            "registering namespace in API: {} -> {}",
-            namespace_str,
-            self.config.relay_url
+            relay_url = %moq_relay_ietf::redact_url_for_logging(&self.config.relay_url),
+            "registering namespace in API"
         );
 
         // Register the namespace with the API
@@ -291,7 +289,7 @@ impl Coordinator for ApiCoordinator {
 
         match result {
             Some(origin) => {
-                tracing::debug!(namespace = %namespace_str, origin_url = %origin.url, "found namespace {} at {}", namespace_str, origin.url);
+                tracing::debug!(namespace = %namespace_str, origin_url = %moq_relay_ietf::redact_url_for_logging(&origin.url), "found namespace");
                 Ok((
                     NamespaceOrigin::new(namespace.clone(), origin.url, None),
                     None,

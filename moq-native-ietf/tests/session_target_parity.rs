@@ -23,6 +23,7 @@ fn test_tls() -> anyhow::Result<tls::Config> {
         key: vec![fixture("localhost-key.pem")],
         root: Vec::new(),
         disable_verify: true,
+        ..Default::default()
     }
     .load()
 }

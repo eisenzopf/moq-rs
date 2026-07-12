@@ -175,6 +175,59 @@ fn key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)
         .collect()
 }
 
+// SETUP may carry bearer credentials. Keep the option's presence useful for
+// diagnostics without ever serializing its value into mlog output.
+fn setup_key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)> {
+    let authorization_key: u64 = setup::ParameterType::AuthorizationToken.into();
+    let path_key: u64 = setup::ParameterType::Path.into();
+    let authority_key: u64 = setup::ParameterType::Authority.into();
+    kvps.iter()
+        .map(|kvp| {
+            let value = if kvp.key == authorization_key {
+                "<redacted>".to_string()
+            } else if kvp.key == authority_key {
+                "<redacted-authority>".to_string()
+            } else if kvp.key == path_key {
+                match &kvp.value {
+                    coding::Value::BytesValue(bytes) => {
+                        let path = bytes
+                            .split(|byte| *byte == b'?')
+                            .next()
+                            .and_then(|path| std::str::from_utf8(path).ok())
+                            .unwrap_or("<invalid-path>");
+                        if bytes.contains(&b'?') {
+                            format!("{path}?<redacted>")
+                        } else {
+                            path.to_string()
+                        }
+                    }
+                    _ => "<invalid-path>".to_string(),
+                }
+            } else {
+                format!("{:?}", kvp.value)
+            };
+            (kvp.key.to_string(), value)
+        })
+        .collect()
+}
+
+// Request parameter type 0x03 is AUTHORIZATION_TOKEN. Keep this serializer
+// separate from track/object extension serializers, where the same numeric
+// key belongs to a different extension key space.
+fn request_parameters_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)> {
+    const AUTHORIZATION_TOKEN: u64 = 0x03;
+    kvps.iter()
+        .map(|kvp| {
+            let value = if kvp.key == AUTHORIZATION_TOKEN {
+                "<redacted>".to_string()
+            } else {
+                format!("{:?}", kvp.value)
+            };
+            (kvp.key.to_string(), value)
+        })
+        .collect()
+}
+
 fn create_control_message_event(
     time: f64,
     stream_id: u64,
@@ -214,7 +267,7 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Setup) -> Eve
         true,
         "client_setup",
         json!({
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "parameters": setup_key_value_pairs_to_vec(&msg.params.0),
         }),
     )
 }
@@ -228,7 +281,7 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Setup) -> Ev
         false,
         "server_setup",
         json!({
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "parameters": setup_key_value_pairs_to_vec(&msg.params.0),
         }),
     )
 }
@@ -239,7 +292,7 @@ fn subscribe_to_json(msg: &message::Subscribe) -> JsonValue {
         "subscribe_id": msg.id,
         "track_namespace": msg.track_namespace.to_string(),
         "track_name": msg.track_name.to_string(),
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": request_parameters_to_vec(&msg.params.0),
     })
 }
 
@@ -258,7 +311,7 @@ fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
     json!({
         "subscribe_id": msg.id,
         "track_alias": msg.track_alias,
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": request_parameters_to_vec(&msg.params.0),
         "track_extensions": key_value_pairs_to_vec(&msg.track_extensions.0),
     })
 }
@@ -290,7 +343,7 @@ fn publish_namespace_to_json(msg: &message::PublishNamespace) -> JsonValue {
     json!({
         "request_id": msg.id,
         "track_namespace": msg.track_namespace.to_string(),
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": request_parameters_to_vec(&msg.params.0),
     })
 }
 
@@ -328,7 +381,7 @@ fn request_ok_to_json(request_kind: &str, msg: &message::RequestOk) -> JsonValue
     json!({
         "request_id": msg.id,
         "request_kind": request_kind,
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": request_parameters_to_vec(&msg.params.0),
         "track_properties": key_value_pairs_to_vec(&msg.track_properties.0),
     })
 }
@@ -696,5 +749,78 @@ pub fn loglevel_event(time: f64, level: LogLevel, message: String) -> Event {
         time,
         name: format!("loglevel:{}", level.as_str()),
         data: EventData::LogLevel(LogLevelEvent { message }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_mlog_redacts_authorization_material() {
+        let secret = "bearer-secret-that-must-not-leak";
+        let mut params = coding::KeyValuePairs::default();
+        params.set_bytesvalue(
+            setup::ParameterType::AuthorizationToken.into(),
+            secret.as_bytes().to_vec(),
+        );
+        params.set_bytesvalue(
+            setup::ParameterType::Authority.into(),
+            b"user:password@relay.example".to_vec(),
+        );
+        params.set_intvalue(setup::ParameterType::MaxRequestUpdates.into(), 4);
+        let setup = setup::Setup { params };
+
+        for event in [
+            client_setup_parsed(1.0, 0, &setup),
+            server_setup_created(1.0, 0, &setup),
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert!(!json.contains(secret));
+            assert!(json.contains("<redacted>"));
+            assert!(json.contains("<redacted-authority>"));
+            assert!(!json.contains("75 73 65 72"));
+            assert!(json.contains("[\"8\",\"4\"]"));
+        }
+    }
+
+    #[test]
+    fn setup_mlog_redacts_query_material_but_retains_path() {
+        let mut params = coding::KeyValuePairs::default();
+        params.set_bytesvalue(
+            setup::ParameterType::Path.into(),
+            b"/tenant/live?token=very-secret".to_vec(),
+        );
+        let event = client_setup_parsed(1.0, 0, &setup::Setup { params });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("/tenant/live?<redacted>"));
+        assert!(!json.contains("very-secret"));
+        assert!(!json.contains("76 65 72 79"));
+    }
+
+    #[test]
+    fn request_mlog_redacts_authorization_without_redacting_extension_keyspace() {
+        let mut params = coding::KeyValuePairs::default();
+        params.set_bytesvalue(0x03, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let subscribe = message::Subscribe {
+            id: 1,
+            track_namespace: coding::TrackNamespace::from_utf8_path("tenant/live"),
+            track_name: "audio".into(),
+            params: params.clone(),
+        };
+        let publish = message::PublishNamespace {
+            id: 2,
+            track_namespace: coding::TrackNamespace::from_utf8_path("tenant/live"),
+            params,
+        };
+
+        for event in [
+            subscribe_parsed(1.0, 0, &subscribe),
+            publish_namespace_created(1.0, 0, &publish),
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert!(json.contains("<redacted>"));
+            assert!(!json.contains("DE AD BE EF"));
+        }
     }
 }

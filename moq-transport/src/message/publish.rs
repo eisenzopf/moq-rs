@@ -86,4 +86,24 @@ mod tests {
         let decoded = Publish::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
     }
+
+    #[test]
+    fn debug_redacts_request_auth_but_not_track_extension_keyspace() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(0x03, vec![0xDE, 0xAD]);
+        let mut track_extensions = TrackExtensions::default();
+        track_extensions.set_bytes_extension(0x03, vec![0xBE, 0xEF]);
+        let message = Publish {
+            id: 1,
+            track_namespace: TrackNamespace::from_utf8_path("tenant/live"),
+            track_name: "audio".into(),
+            track_alias: 1,
+            params,
+            track_extensions,
+        };
+        let debug = format!("{message:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("DE AD"));
+        assert!(debug.contains("BE EF"));
+    }
 }

@@ -4,6 +4,22 @@
 
 use crate::{coding, serve};
 
+/// Draft-19 Session Termination error codes used by transport/application
+/// boundaries that must close before a full [`SessionError`] exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SessionTerminationCode {
+    InternalError = 0x1,
+    Unauthorized = 0x2,
+    ProtocolViolation = 0x3,
+}
+
+impl SessionTerminationCode {
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum SessionError {
     #[error("webtransport error: {0}")]

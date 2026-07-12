@@ -233,6 +233,12 @@ impl Decode for KeyValuePairs {
 
         for _ in 0..count {
             let (pair, new_prev) = KeyValuePair::decode_with_prev(r, prev)?;
+            if kvps
+                .last()
+                .is_some_and(|previous: &KeyValuePair| previous.key == pair.key)
+            {
+                return Err(DecodeError::DuplicateParameter(pair.key));
+            }
             prev = new_prev;
             kvps.push(pair);
         }
@@ -266,7 +272,11 @@ impl fmt::Debug for KeyValuePairs {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{:?}", kv)?;
+            if kv.key == 0x03 {
+                write!(f, "{{3: <redacted>}}")?;
+            } else {
+                write!(f, "{:?}", kv)?;
+            }
         }
         write!(f, " }}")
     }
@@ -560,6 +570,12 @@ impl KeyValuePairs {
 
         while payload.has_remaining() {
             let (pair, new_prev) = KeyValuePair::decode_with_prev(&mut payload, prev)?;
+            if kvps
+                .last()
+                .is_some_and(|previous: &KeyValuePair| previous.key == pair.key)
+            {
+                return Err(DecodeError::DuplicateParameter(pair.key));
+            }
             prev = new_prev;
             kvps.push(pair);
         }

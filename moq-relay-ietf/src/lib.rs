@@ -31,9 +31,11 @@
 //! relay.run().await?;
 //! ```
 
+mod admission;
 mod api;
 mod consumer;
 mod coordinator;
+mod diagnostics;
 mod local;
 pub mod metrics;
 mod producer;
@@ -42,9 +44,11 @@ mod remote;
 mod session;
 mod web;
 
+pub use admission::*;
 pub use api::*;
 pub use consumer::*;
 pub use coordinator::*;
+pub use diagnostics::*;
 pub use local::*;
 pub use producer::*;
 pub use relay::*;

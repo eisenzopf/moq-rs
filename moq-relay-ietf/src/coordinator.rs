@@ -8,6 +8,8 @@ use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
 use url::Url;
 
+use crate::AdmissionDecision;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
     #[error("namespace not found")]
@@ -395,6 +397,18 @@ impl TrackSubscription {
 /// [`resolve_scope()`]: Coordinator::resolve_scope
 #[async_trait]
 pub trait Coordinator: Send + Sync {
+    /// Resolve scope with the authenticated principal and typed admission
+    /// claims available to the coordinator. Existing coordinators retain
+    /// their path-based behavior through the default implementation.
+    async fn resolve_admitted_scope(
+        &self,
+        admission: &AdmissionDecision,
+        connection_path: Option<&str>,
+    ) -> CoordinatorResult<Option<ScopeInfo>> {
+        let scope = admission.claims.scope.as_deref().or(connection_path);
+        self.resolve_scope(scope).await
+    }
+
     /// Resolve a connection path to scope information.
     ///
     /// Called once per accepted session, before any register/lookup calls.

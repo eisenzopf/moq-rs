@@ -94,6 +94,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_duplicate_authorization_parameters() {
+        let params = KeyValuePairs(vec![
+            crate::coding::KeyValuePair::new_bytes(0x03, b"first".to_vec()),
+            crate::coding::KeyValuePair::new_bytes(0x03, b"second".to_vec()),
+        ]);
+        let message = Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("tenant/live"),
+            track_name: "audio".into(),
+            params,
+        };
+        let mut encoded = BytesMut::new();
+        message.encode(&mut encoded).unwrap();
+        assert!(matches!(
+            Subscribe::decode(&mut encoded),
+            Err(DecodeError::DuplicateParameter(0x03))
+        ));
+    }
+
+    #[test]
     fn decode_rejects_full_track_name_over_limit() {
         let mut buf = BytesMut::new();
         let msg = Subscribe {

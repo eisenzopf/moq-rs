@@ -44,6 +44,7 @@ hyper-serve = { version = "0.6", features = [
 ] } # fork of axum-server
 tower-http = { version = "0.5", features = ["cors"] }
 hex = "0.4"
+ring = "0.17"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -73,3 +74,8 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 [features]
 default = []
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+
+[dev-dependencies]
+rcgen = { version = "0.13", features = ["pem"] }
+tempfile = "3"
+time = "0.3"

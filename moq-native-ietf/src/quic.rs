@@ -55,12 +55,53 @@ pub struct SessionConnection {
     pub session: web_transport::Session,
     pub connection_id: String,
     pub negotiated: NegotiatedTransport,
+    pub peer_identity: tls::PeerIdentity,
 }
 
 impl SessionConnection {
+    /// Split a connection into the historical transport tuple.
+    ///
+    /// New callers that need authenticated peer metadata should retain the
+    /// [`SessionConnection`] or call [`Self::into_parts_with_identity`].
     pub fn into_parts(self) -> (web_transport::Session, String, NegotiatedTransport) {
         (self.session, self.connection_id, self.negotiated)
     }
+
+    /// Split a connection while retaining authenticated peer metadata.
+    pub fn into_parts_with_identity(
+        self,
+    ) -> (
+        web_transport::Session,
+        String,
+        NegotiatedTransport,
+        tls::PeerIdentity,
+    ) {
+        (
+            self.session,
+            self.connection_id,
+            self.negotiated,
+            self.peer_identity,
+        )
+    }
+}
+
+fn peer_identity(
+    connection: &quinn::Connection,
+    verified_by_tls: bool,
+) -> anyhow::Result<tls::PeerIdentity> {
+    let Some(identity) = connection.peer_identity() else {
+        return Ok(tls::PeerIdentity::Anonymous);
+    };
+    let chain = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| anyhow::anyhow!("unexpected TLS peer identity metadata type"))?;
+    Ok(
+        match tls::CertificateIdentity::from_verified_chain(&chain)? {
+            Some(identity) if verified_by_tls => tls::PeerIdentity::Certificate(identity),
+            Some(identity) => tls::PeerIdentity::UnverifiedCertificate(identity),
+            None => tls::PeerIdentity::Anonymous,
+        },
+    )
 }
 
 /// Translate the historical scheme-selected input into a canonical target and
@@ -73,14 +114,12 @@ pub fn compatibility_target(url: &Url) -> anyhow::Result<(SessionTarget, Substra
             SubstratePolicy::RawQuic,
         )),
         "https" => {
+            let target = SessionTarget::from_webtransport_url(url)?;
             tracing::warn!(
-                url = %url,
+                target = %target.redacted_for_logging(),
                 "https:// MOQT inputs are deprecated; use a canonical moqt:// target with an explicit WebTransport policy"
             );
-            Ok((
-                SessionTarget::from_webtransport_url(url)?,
-                SubstratePolicy::WebTransport,
-            ))
+            Ok((target, SubstratePolicy::WebTransport))
         }
         scheme => {
             anyhow::bail!("unsupported MOQT URL scheme {scheme:?}; canonical targets use 'moqt'")
@@ -133,6 +172,12 @@ fn selected_webtransport_protocol(protocol: Option<&str>) -> anyhow::Result<&'st
         .copied()
         .find(|supported| *supported == protocol)
         .with_context(|| format!("WebTransport selected unsupported MOQT protocol {protocol:?}"))
+}
+
+fn webtransport_authority_matches_tls(tls_host: &str, request_url: &Url) -> bool {
+    request_url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(tls_host))
 }
 
 impl fmt::Display for AddressFamily {
@@ -235,6 +280,15 @@ pub struct Args {
 
     #[command(flatten)]
     pub tls: tls::Args,
+
+    /// Explicit development override: accept an unvalidated source address
+    /// without first sending a QUIC Retry packet.
+    #[arg(long)]
+    pub disable_stateless_retry: bool,
+
+    /// Explicit development diagnostics: honor SSLKEYLOGFILE for TLS secrets.
+    #[arg(long)]
+    pub tls_key_log: bool,
 }
 
 impl Default for Args {
@@ -243,6 +297,8 @@ impl Default for Args {
             bind: Self::DEFAULT_BIND.parse().unwrap(),
             qlog_dir: None,
             tls: Default::default(),
+            disable_stateless_retry: false,
+            tls_key_log: false,
         }
     }
 }
@@ -254,7 +310,11 @@ impl Args {
     pub fn load(&self) -> anyhow::Result<Config> {
         let tls = self.tls.load()?;
 
-        match Config::new(self.bind, self.qlog_dir.clone(), tls.clone()) {
+        match Config::new(self.bind, self.qlog_dir.clone(), tls.clone()).map(|config| {
+            config
+                .with_stateless_retry(!self.disable_stateless_retry)
+                .with_tls_key_log(self.tls_key_log)
+        }) {
             Ok(config) => Ok(config),
             Err(e) if self.bind.to_string() == Self::DEFAULT_BIND => {
                 // IPv6 default bind failed -- try falling back to IPv4.
@@ -271,9 +331,15 @@ impl Args {
                     error = %e,
                     "IPv6 bind failed, falling back to IPv4"
                 );
-                Config::new(fallback, self.qlog_dir.clone(), tls).with_context(|| {
-                    format!("IPv4 fallback also failed (original IPv6 error: {})", e)
-                })
+                Config::new(fallback, self.qlog_dir.clone(), tls)
+                    .map(|config| {
+                        config
+                            .with_stateless_retry(!self.disable_stateless_retry)
+                            .with_tls_key_log(self.tls_key_log)
+                    })
+                    .with_context(|| {
+                        format!("IPv4 fallback also failed (original IPv6 error: {})", e)
+                    })
             }
             Err(e) => Err(e),
         }
@@ -287,9 +353,16 @@ pub struct Config {
     pub qlog_dir: Option<PathBuf>,
     pub tls: tls::Config,
     pub tags: HashSet<String>,
+    max_pending_handshakes: usize,
+    handshake_timeout: time::Duration,
+    stateless_retry: bool,
+    tls_key_log: bool,
 }
 
 impl Config {
+    pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 128;
+    pub const DEFAULT_HANDSHAKE_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+
     pub fn new(
         bind: net::SocketAddr,
         qlog_dir: Option<PathBuf>,
@@ -303,6 +376,10 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            max_pending_handshakes: Self::DEFAULT_MAX_PENDING_HANDSHAKES,
+            handshake_timeout: Self::DEFAULT_HANDSHAKE_TIMEOUT,
+            stateless_retry: true,
+            tls_key_log: false,
         })
     }
 
@@ -326,6 +403,10 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            max_pending_handshakes: Self::DEFAULT_MAX_PENDING_HANDSHAKES,
+            handshake_timeout: Self::DEFAULT_HANDSHAKE_TIMEOUT,
+            stateless_retry: true,
+            tls_key_log: false,
         }
     }
 
@@ -333,11 +414,48 @@ impl Config {
         self.tags.insert(tag);
         self
     }
+
+    pub fn with_accept_limits(
+        mut self,
+        max_pending_handshakes: usize,
+        handshake_timeout: time::Duration,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            max_pending_handshakes > 0,
+            "pending handshake limit must be positive"
+        );
+        anyhow::ensure!(
+            !handshake_timeout.is_zero(),
+            "handshake timeout must be positive"
+        );
+        self.max_pending_handshakes = max_pending_handshakes;
+        self.handshake_timeout = handshake_timeout;
+        Ok(self)
+    }
+
+    /// Require source-address validation with a QUIC Retry packet before
+    /// allocating handshake state. Enabled by default; disabling it is an
+    /// explicit local-development compatibility override.
+    pub fn with_stateless_retry(mut self, enabled: bool) -> Self {
+        self.stateless_retry = enabled;
+        self
+    }
+
+    /// Explicitly enable TLS secret logging through rustls KeyLogFile.
+    /// Disabled by default because key logs can decrypt auth and media.
+    pub fn with_tls_key_log(mut self, enabled: bool) -> Self {
+        self.tls_key_log = enabled;
+        self
+    }
 }
 
 pub struct Endpoint {
     pub client: Client,
     pub server: Option<Server>,
+    client_auth: tls::ClientAuthMode,
+    writes_per_connection_diagnostics: bool,
+    stateless_retry: bool,
+    tls_key_log: bool,
     /// Tags associated with this endpoint
     /// These are used to filter endpoints for different purposes, for eg-
     /// "server" tag is used to filter endpoints for relay server
@@ -347,7 +465,32 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    pub fn client_auth_mode(&self) -> tls::ClientAuthMode {
+        self.client_auth
+    }
+
+    pub fn verifies_server_certificates(&self) -> bool {
+        self.client.verifies_server_certificates()
+    }
+
+    /// Whether accepting a connection can create a per-session qlog file.
+    /// Production embeddings should reject this mode unless they supply a
+    /// bounded retention implementation outside this crate.
+    pub fn writes_per_connection_diagnostics(&self) -> bool {
+        self.writes_per_connection_diagnostics
+    }
+
+    pub fn uses_stateless_retry(&self) -> bool {
+        self.stateless_retry
+    }
+
+    pub fn tls_key_logging_enabled(&self) -> bool {
+        self.tls_key_log
+    }
+
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        let writes_per_connection_diagnostics = config.qlog_dir.is_some();
+        let tls_key_log = config.tls_key_log;
         // Validate qlog directory if provided
 
         if let Some(qlog_dir) = &config.qlog_dir {
@@ -364,14 +507,19 @@ impl Endpoint {
         let transport = Arc::new(build_transport_config());
 
         let mut server_config = None;
+        let tls = config.tls.into_quic_parts();
+        let client_auth = tls.client_auth;
+        let verifies_server_certificates = tls.verifies_server_certificates;
 
-        if let Some(mut config) = config.tls.server {
+        if let Some(mut config) = tls.server {
             // Offer WebTransport ALPN plus all supported MoQT versions for raw QUIC.
             config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
             for alpn in moq_transport::setup::SUPPORTED_ALPNS {
                 config.alpn_protocols.push(alpn.as_bytes().to_vec());
             }
-            config.key_log = Arc::new(rustls::KeyLogFile::new());
+            if tls_key_log {
+                config.key_log = Arc::new(rustls::KeyLogFile::new());
+            }
 
             let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
             let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
@@ -394,18 +542,29 @@ impl Endpoint {
             accept: Default::default(),
             qlog_dir: config.qlog_dir.map(Arc::new),
             base_server_config: Arc::new(base_server_config),
+            verifies_client_certificates: client_auth != tls::ClientAuthMode::Disabled,
+            max_pending_handshakes: config.max_pending_handshakes,
+            handshake_timeout: config.handshake_timeout,
+            stateless_retry: config.stateless_retry,
+            stateless_retries_sent: 0,
         });
 
         let client = Client {
             quic,
-            config: config.tls.client,
+            config: tls.client,
             transport,
             is_dual_stack: config.is_dual_stack,
+            verifies_server_certificates,
+            tls_key_log,
         };
 
         Ok(Self {
             client,
             server,
+            client_auth,
+            writes_per_connection_diagnostics,
+            stateless_retry: config.stateless_retry,
+            tls_key_log,
             tags: config.tags,
         })
     }
@@ -416,6 +575,11 @@ pub struct Server {
     accept: FuturesUnordered<BoxFuture<'static, anyhow::Result<SessionConnection>>>,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
+    verifies_client_certificates: bool,
+    max_pending_handshakes: usize,
+    handshake_timeout: time::Duration,
+    stateless_retry: bool,
+    stateless_retries_sent: u64,
 }
 
 impl Server {
@@ -423,11 +587,36 @@ impl Server {
     pub async fn accept_connection(&mut self) -> Option<SessionConnection> {
         loop {
             tokio::select! {
-                res = self.quic.accept() => {
+                res = self.quic.accept(), if self.accept.len() < self.max_pending_handshakes => {
                     let conn = res?;
+                    if self.stateless_retry && !conn.remote_address_validated() {
+                        match conn.retry() {
+                            Ok(()) => {
+                                self.stateless_retries_sent = self.stateless_retries_sent.saturating_add(1);
+                            }
+                            Err(error) => {
+                                tracing::warn!(error = %error, "failed to send QUIC stateless retry");
+                            }
+                        }
+                        continue;
+                    }
                     let qlog_dir = self.qlog_dir.clone();
                     let base_server_config = self.base_server_config.clone();
-                    self.accept.push(Self::accept_session(conn, qlog_dir, base_server_config).boxed());
+                    let verifies_client_certificates = self.verifies_client_certificates;
+                    let handshake_timeout = self.handshake_timeout;
+                    self.accept.push(async move {
+                        tokio::time::timeout(
+                            handshake_timeout,
+                            Self::accept_session(
+                                conn,
+                                qlog_dir,
+                                base_server_config,
+                                verifies_client_certificates,
+                            ),
+                        )
+                        .await
+                        .context("QUIC/WebTransport handshake timed out")?
+                    }.boxed());
                 },
                 res = self.accept.next(), if !self.accept.is_empty() => {
                     match res? {
@@ -442,7 +631,8 @@ impl Server {
         }
     }
 
-    /// Tuple convenience wrapper retaining the actual negotiated protocol.
+    /// Compatibility tuple wrapper retaining the historical three-part API.
+    /// Use [`Self::accept_connection`] when peer identity is required.
     pub async fn accept(
         &mut self,
     ) -> Option<(web_transport::Session, String, NegotiatedTransport)> {
@@ -455,6 +645,7 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
+        verifies_client_certificates: bool,
     ) -> anyhow::Result<SessionConnection> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
@@ -514,6 +705,14 @@ impl Server {
 
         // Wait for the QUIC connection to be established.
         let conn = conn.await.context("failed to establish QUIC connection")?;
+        let peer_identity = peer_identity(&conn, verifies_client_certificates)?;
+        let tls_host = if server_name.is_empty() {
+            conn.local_ip()
+                .map(|ip| ip.to_string())
+                .context("TLS handshake has neither SNI nor a local IP")?
+        } else {
+            server_name.clone()
+        };
 
         tracing::debug!(
             "established QUIC connection: cid={} stable_id={} ip={} alpn={} server={}",
@@ -530,6 +729,20 @@ impl Server {
             let request = web_transport_quinn::Request::accept(conn)
                 .await
                 .context("failed to receive WebTransport request")?;
+
+            // Bind the HTTP/3 CONNECT authority to the TLS virtual host. A
+            // client must not authenticate one SNI name and then select a
+            // different tenant/virtual host in :authority.
+            if !webtransport_authority_matches_tls(&tls_host, &request.url) {
+                let request_host = request.url.host_str().unwrap_or("<missing>").to_string();
+                request
+                    .reject(http::StatusCode::MISDIRECTED_REQUEST)
+                    .await
+                    .context("failed to reject mismatched WebTransport authority")?;
+                anyhow::bail!(
+                    "WebTransport CONNECT authority host {request_host:?} does not match the TLS virtual host"
+                );
+            }
 
             // Negotiate the MoQT version from the clients offered protocols.
             // Reject if no mutually-supported version exists.
@@ -578,6 +791,7 @@ impl Server {
             session: session.into(),
             connection_id: connection_id_hex,
             negotiated,
+            peer_identity,
         })
     }
 
@@ -585,6 +799,10 @@ impl Server {
         self.quic
             .local_addr()
             .context("failed to get local address")
+    }
+
+    pub fn stateless_retries_sent(&self) -> u64 {
+        self.stateless_retries_sent
     }
 }
 
@@ -594,9 +812,14 @@ pub struct Client {
     config: rustls::ClientConfig,
     transport: Arc<quinn::TransportConfig>,
     is_dual_stack: bool,
+    verifies_server_certificates: bool,
+    tls_key_log: bool,
 }
 
 impl Client {
+    pub fn verifies_server_certificates(&self) -> bool {
+        self.verifies_server_certificates
+    }
     /// Returns the local address of the QUIC socket.
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
         self.quic
@@ -635,7 +858,9 @@ impl Client {
 
         config.alpn_protocols = alpn_protocols(policy);
 
-        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        if self.tls_key_log {
+            config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
 
         let config: quinn::crypto::rustls::QuicClientConfig = config.try_into()?;
         let mut config = quinn::ClientConfig::new(Arc::new(config));
@@ -673,6 +898,7 @@ impl Client {
         };
 
         let connection = self.quic.connect_with(config, addr, &host)?.await?;
+        let peer_identity = peer_identity(&connection, self.verifies_server_certificates)?;
 
         let handshake = connection
             .handshake_data()
@@ -735,6 +961,7 @@ impl Client {
             session: session.into(),
             connection_id: connection_id_hex,
             negotiated,
+            peer_identity,
         })
     }
 
@@ -875,7 +1102,24 @@ mod tests {
     fn legacy_https_alias_derives_a_canonical_target() {
         let url = Url::parse("https://Relay.Example/live?q=1").unwrap();
         let (target, policy) = compatibility_target(&url).unwrap();
-        assert_eq!(target.to_string(), "moqt://relay.example/live?q=1");
+        assert_eq!(
+            target.canonical_url().as_str(),
+            "moqt://relay.example/live?q=1"
+        );
         assert_eq!(policy, SubstratePolicy::WebTransport);
+    }
+
+    #[test]
+    fn webtransport_authority_is_bound_to_tls_virtual_host() {
+        let matching = Url::parse("https://relay.example/live?token=secret").unwrap();
+        let confused = Url::parse("https://other-tenant.example/live").unwrap();
+        assert!(webtransport_authority_matches_tls(
+            "Relay.Example",
+            &matching
+        ));
+        assert!(!webtransport_authority_matches_tls(
+            "relay.example",
+            &confused
+        ));
     }
 }

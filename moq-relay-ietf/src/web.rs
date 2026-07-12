@@ -40,12 +40,15 @@ impl Web {
         // TODO serve all of them so we can support multiple signature algorithms.
         let fingerprint = config
             .tls
-            .fingerprints
+            .fingerprints()
             .first()
             .expect("missing certificate")
             .clone();
 
-        let mut tls = config.tls.server.expect("missing server configuration");
+        let mut tls = config
+            .tls
+            .into_https_server_config()
+            .expect("missing server configuration");
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let tls = hyper_serve::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
 

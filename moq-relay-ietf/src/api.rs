@@ -60,9 +60,9 @@ impl Refresh {
     /// Update the origin registration in moq-api.
     async fn update(&self) -> Result<(), moq_api::ApiError> {
         tracing::debug!(
-            "registering origin: namespace={} url={}",
-            self.namespace,
-            self.origin.url
+            namespace = %self.namespace,
+            origin_url = %crate::redact_url_for_logging(&self.origin.url),
+            "registering origin"
         );
         // Register the origin in moq-api.
         self.client

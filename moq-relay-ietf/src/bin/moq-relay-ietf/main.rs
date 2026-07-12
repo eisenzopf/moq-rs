@@ -12,7 +12,11 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
+use moq_relay_ietf::{
+    CertificateFingerprintAdmission, Coordinator, DevelopmentAllowAllAdmission,
+    ListenerSecurityPolicy, Relay, RelayConfig, SessionAdmission, SetupTokenAdmission, Web,
+    WebConfig,
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -47,10 +51,48 @@ pub struct Cli {
     #[arg(long)]
     pub node: Option<Url>,
 
-    /// Enable development mode.
-    /// This hosts a HTTPS web server via TCP to serve the fingerprint of the certificate.
-    #[arg(long)]
+    /// Enable insecure local-only development mode.
+    ///
+    /// This weakens production security posture and also serves certificate
+    /// fingerprints/diagnostics over HTTPS. Never enable it on a public relay.
+    #[arg(long = "insecure-development", visible_alias = "dev")]
     pub dev: bool,
+
+    /// Bind an mTLS leaf fingerprint to one publisher scope as SHA256=/path.
+    /// Repeat for additional principals or scopes.
+    #[arg(long = "admit-publisher")]
+    pub admitted_publishers: Vec<String>,
+
+    /// Maximum active sessions for each admitted publisher fingerprint.
+    #[arg(long, default_value_t = 100)]
+    pub publisher_session_cap: usize,
+
+    /// SHA-256 digest of a SETUP bearer token admitted for subscribe-only listeners.
+    #[arg(long = "admit-subscribe-token-sha256")]
+    pub admitted_subscribe_token_sha256: Vec<String>,
+
+    /// Security role for this relay process's inbound listener.
+    #[arg(long, value_enum)]
+    pub listener_security: Option<ListenerSecurityPolicy>,
+
+    #[arg(long, default_value_t = 5_000)]
+    pub setup_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 2_000)]
+    pub admission_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 1_000)]
+    pub pre_admission_cleanup_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 128)]
+    pub max_pending_admissions: usize,
+
+    /// Maximum concurrently admitted sessions per listener.
+    #[arg(long, default_value_t = 10_000)]
+    pub max_active_sessions: usize,
+
+    #[arg(long, default_value_t = 30_000)]
+    pub token_revalidation_interval_ms: u64,
 
     /// Serve qlog files over HTTPS at /qlog/:cid
     /// Requires --dev to enable the web server. Only serves files by exact CID - no index.
@@ -142,9 +184,47 @@ async fn main() -> anyhow::Result<()> {
 
     let tls = cli.tls.load()?;
 
-    if tls.server.is_none() {
+    if !tls.has_server() {
         anyhow::bail!("missing TLS certificates");
     }
+
+    let listener_security = cli.listener_security.unwrap_or(if cli.dev {
+        ListenerSecurityPolicy::Development
+    } else {
+        ListenerSecurityPolicy::MutualTlsPublisher
+    });
+    let admission: Arc<dyn SessionAdmission> = match listener_security {
+        ListenerSecurityPolicy::MutualTlsPublisher => {
+            anyhow::ensure!(
+                cli.admitted_subscribe_token_sha256.is_empty(),
+                "subscribe token digests are only valid for token-subscriber listeners"
+            );
+            CertificateFingerprintAdmission::new_bindings_with_limit(
+                cli.admitted_publishers.clone(),
+                cli.publisher_session_cap,
+            )?
+        }
+        ListenerSecurityPolicy::TokenSubscriber => {
+            anyhow::ensure!(
+                cli.dev,
+                "the built-in static token allowlist is non-production; embed Relay with an external replay- and lease-aware SessionAdmission policy"
+            );
+            anyhow::ensure!(
+                cli.admitted_publishers.is_empty(),
+                "mTLS publisher bindings are only valid for mTLS publisher listeners"
+            );
+            SetupTokenAdmission::new(cli.admitted_subscribe_token_sha256.clone())?
+        }
+        ListenerSecurityPolicy::Development => {
+            anyhow::ensure!(cli.dev, "development listener policy requires --dev");
+            anyhow::ensure!(
+                cli.admitted_publishers.is_empty()
+                    && cli.admitted_subscribe_token_sha256.is_empty(),
+                "development allow-all cannot be combined with production identity allowlists"
+            );
+            DevelopmentAllowAllAdmission::explicitly_enabled()
+        }
+    };
 
     // Determine qlog directory for both relay and web server
     let qlog_dir_for_relay = cli.qlog_dir.clone();
@@ -173,7 +253,10 @@ async fn main() -> anyhow::Result<()> {
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
         let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
         let api_coordinator = ApiCoordinator::new(config);
-        tracing::info!("using API coordinator: {}", api_url);
+        tracing::info!(
+            api_url = %moq_relay_ietf::redact_url_for_logging(api_url),
+            "using API coordinator"
+        );
         Arc::new(api_coordinator)
     } else {
         tracing::info!("using file coordinator: {}", cli.coordinator_file.display());
@@ -190,6 +273,17 @@ async fn main() -> anyhow::Result<()> {
         node: cli.node,
         announce: cli.announce,
         coordinator,
+        admission,
+        development: cli.dev,
+        listener_security,
+        setup_timeout: std::time::Duration::from_millis(cli.setup_timeout_ms),
+        admission_timeout: std::time::Duration::from_millis(cli.admission_timeout_ms),
+        cleanup_timeout: std::time::Duration::from_millis(cli.pre_admission_cleanup_timeout_ms),
+        max_pending_admissions: cli.max_pending_admissions,
+        max_active_sessions: cli.max_active_sessions,
+        token_revalidation_interval: std::time::Duration::from_millis(
+            cli.token_revalidation_interval_ms,
+        ),
     })?;
 
     if cli.dev {
@@ -208,4 +302,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     relay.run().await
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn insecure_development_is_explicit_in_cli_help() {
+        let cli = Cli::try_parse_from(["moq-relay-ietf", "--insecure-development"]).unwrap();
+        assert!(cli.dev);
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--insecure-development"));
+        assert!(help.contains("Never enable it on a public relay"));
+    }
 }

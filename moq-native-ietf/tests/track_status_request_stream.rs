@@ -29,6 +29,7 @@ async fn track_status_round_trips_on_independent_request_streams() -> anyhow::Re
         key: vec![fixture("localhost-key.pem")],
         root: Vec::new(),
         disable_verify: true,
+        ..Default::default()
     }
     .load()?;
     let endpoint = quic::Endpoint::new(quic::Config::new("127.0.0.1:0".parse()?, None, tls)?)?;

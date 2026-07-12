@@ -148,7 +148,7 @@ impl Coordinator for FileCoordinator {
     ) -> CoordinatorResult<NamespaceRegistration> {
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
-        let relay_url = self.relay_url.to_string();
+        let relay_url = self.relay_url.clone();
         let file_path = self.file_path.clone();
 
         // Run blocking file I/O in a separate thread
@@ -165,12 +165,12 @@ impl Coordinator for FileCoordinator {
             file.lock_exclusive()?;
 
             let mut data = read_data(&file)?;
-            tracing::info!(namespace = %key_clone, scope = %scope_clone, relay_url = %relay_url, "registering namespace: {} -> {}", key_clone, relay_url);
+            tracing::info!(namespace = %key_clone, scope = %scope_clone, relay_url = %moq_relay_ietf::redact_url_for_logging(&relay_url), "registering namespace");
             data
                 .namespaces
                 .entry(scope_clone)
                 .or_default()
-                .insert(key_clone, relay_url);
+                .insert(key_clone, relay_url.to_string());
 
             write_data(&file, &data)?;
             file.unlock()?;

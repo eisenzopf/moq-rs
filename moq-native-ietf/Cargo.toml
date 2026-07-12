@@ -28,6 +28,7 @@ webpki = "0.22"
 
 hex = "0.4"
 url = "2"
+http = "1"
 rand = "0.8"
 
 tokio = { version = "1", features = ["full"] }
@@ -37,3 +38,8 @@ socket2 = "0.5"
 anyhow = { version = "1", features = ["backtrace"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rcgen = { version = "0.13", features = ["pem"] }
+tempfile = "3"
+time = "0.3"

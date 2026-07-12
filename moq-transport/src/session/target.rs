@@ -10,7 +10,7 @@ use url::{Position, Url};
 /// Draft-19 identifies a session with a `moqt://` URI regardless of whether
 /// the connection ultimately uses raw QUIC or WebTransport. WebTransport
 /// derives its HTTPS request URL by replacing only the scheme.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct SessionTarget {
     canonical: Url,
     authority: String,
@@ -31,6 +31,9 @@ impl SessionTarget {
             return Err(SessionTargetError::Malformed(
                 "MOQT session URIs must use RFC 3986 ASCII encoding".into(),
             ));
+        }
+        if raw_uri_authority_contains_userinfo(value) {
+            return Err(SessionTargetError::MalformedAuthority);
         }
         let url =
             Url::parse(value).map_err(|error| SessionTargetError::Malformed(error.to_string()))?;
@@ -142,6 +145,29 @@ impl SessionTarget {
         }
     }
 
+    /// Bounded URI identity suitable for logs and diagnostics. The query is
+    /// intentionally never returned because it may contain application
+    /// credentials; trusted routing continues to use [`Self::routing_path`].
+    pub fn redacted_for_logging(&self) -> String {
+        const MAX_DIAGNOSTIC_BYTES: usize = 256;
+        let query = if self.query().is_some() {
+            "?<redacted>"
+        } else {
+            ""
+        };
+        let mut value = format!("moqt://{}{}", self.authority(), self.path());
+        if value.len() + query.len() > MAX_DIAGNOSTIC_BYTES {
+            let original_len = value.len() + self.query().map_or(0, |query| query.len() + 1);
+            let suffix = format!("…<truncated;uri_bytes={original_len}>{query}");
+            let keep = MAX_DIAGNOSTIC_BYTES.saturating_sub(suffix.len());
+            value.truncate(keep);
+            value.push_str(&suffix);
+        } else {
+            value.push_str(query);
+        }
+        value
+    }
+
     /// Whether this target's host is the host used for the accepted transport.
     /// Ports are deliberately not compared because a relay may be reached
     /// through a public port mapped to a different local listener port.
@@ -160,6 +186,12 @@ impl SessionTarget {
             return Err(SessionTargetError::UnsupportedScheme(
                 url.scheme().to_string(),
             ));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url[Position::BeforeUsername..Position::AfterPort].contains('@')
+        {
+            return Err(SessionTargetError::MalformedAuthority);
         }
         if url.host_str().is_none_or(str::is_empty) {
             return Err(SessionTargetError::MissingAuthority);
@@ -187,6 +219,15 @@ impl Deref for SessionTarget {
 impl std::fmt::Display for SessionTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.canonical.fmt(formatter)
+    }
+}
+
+impl std::fmt::Debug for SessionTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SessionTarget")
+            .field(&self.redacted_for_logging())
+            .finish()
     }
 }
 
@@ -226,22 +267,37 @@ fn validate_authority_text(authority: &str) -> Result<(), SessionTargetError> {
     if authority.is_empty()
         || !authority.is_ascii()
         || authority.bytes().any(|byte| byte.is_ascii_whitespace())
-        || authority.contains(['/', '?', '#'])
+        || authority.contains(['/', '?', '#', '@'])
     {
         return Err(SessionTargetError::MalformedAuthority);
     }
 
     validate_component(authority, |byte| {
-        is_unreserved(byte) || is_sub_delim(byte) || matches!(byte, b':' | b'@' | b'[' | b']')
+        is_unreserved(byte) || is_sub_delim(byte) || matches!(byte, b':' | b'[' | b']')
     })
     .map_err(|_| SessionTargetError::MalformedAuthority)?;
 
     let probe = Url::parse(&format!("https://{authority}/"))
         .map_err(|_| SessionTargetError::MalformedAuthority)?;
-    if probe.host_str().is_none_or(str::is_empty) {
+    if !probe.username().is_empty()
+        || probe.password().is_some()
+        || probe.host_str().is_none_or(str::is_empty)
+    {
         return Err(SessionTargetError::MalformedAuthority);
     }
     Ok(())
+}
+
+fn raw_uri_authority_contains_userinfo(value: &str) -> bool {
+    value
+        .split_once("://")
+        .map(|(_, remainder)| {
+            remainder
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        .unwrap_or(false)
 }
 
 fn validate_path_and_query(value: &str) -> Result<(), SessionTargetError> {
@@ -364,6 +420,28 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_target_redacts_query_credentials() {
+        let target = SessionTarget::parse("moqt://relay.example/live?token=very-secret").unwrap();
+        let diagnostic = target.redacted_for_logging();
+        assert_eq!(diagnostic, "moqt://relay.example/live?<redacted>");
+        assert!(!diagnostic.contains("very-secret"));
+        assert_eq!(target.routing_path(), Some("/live?token=very-secret"));
+        assert!(!format!("{target:?}").contains("very-secret"));
+        assert!(format!("{target}").contains("very-secret"));
+        assert!(target.canonical_url().as_str().contains("very-secret"));
+
+        let long = SessionTarget::parse(format!(
+            "moqt://relay.example/{}?token=secret",
+            "a".repeat(1_000)
+        ))
+        .unwrap();
+        let diagnostic = long.redacted_for_logging();
+        assert!(diagnostic.len() <= 256);
+        assert!(diagnostic.contains("truncated;uri_bytes="));
+        assert!(!diagnostic.contains("secret"));
+    }
+
+    #[test]
     fn canonical_constructor_rejects_https_while_wt_conversion_accepts_it() {
         let https = Url::parse("https://relay.example/live?q=1").unwrap();
         assert!(matches!(
@@ -373,7 +451,8 @@ mod tests {
         assert_eq!(
             SessionTarget::from_webtransport_url(&https)
                 .unwrap()
-                .to_string(),
+                .canonical_url()
+                .as_str(),
             "moqt://relay.example/live?q=1"
         );
     }
@@ -395,6 +474,27 @@ mod tests {
     }
 
     #[test]
+    fn canonical_targets_reject_userinfo_without_diagnostic_leakage() {
+        for value in [
+            "moqt://user@relay.example/live",
+            "moqt://user:password@relay.example/live",
+            "moqt://@relay.example/live",
+        ] {
+            let error = SessionTarget::parse(value).unwrap_err();
+            assert_eq!(error, SessionTargetError::MalformedAuthority);
+            let diagnostic = format!("{error:?} {error}");
+            assert!(!diagnostic.contains("user"));
+            assert!(!diagnostic.contains("password"));
+        }
+
+        let webtransport = Url::parse("https://user:password@relay.example/live").unwrap();
+        assert_eq!(
+            SessionTarget::from_webtransport_url(&webtransport),
+            Err(SessionTargetError::MalformedAuthority)
+        );
+    }
+
+    #[test]
     fn canonicalization_matches_https_transport_semantics() {
         let root = SessionTarget::parse("moqt://EXAMPLE.com:443").unwrap();
         assert_eq!(root.to_string(), "moqt://example.com/");
@@ -409,8 +509,10 @@ mod tests {
 
     #[test]
     fn rfc3986_components_and_fragment_type_are_validated() {
-        let credentials = SessionTarget::parse("moqt://user:pass@example.com/live").unwrap();
-        assert_eq!(credentials.authority(), "user:pass@example.com");
+        assert_eq!(
+            SessionTarget::parse("moqt://user:pass@example.com/live"),
+            Err(SessionTargetError::MalformedAuthority)
+        );
 
         assert!(matches!(
             SessionTarget::from_setup_parts("relay.example", "/bad%XX"),
