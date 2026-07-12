@@ -3,6 +3,21 @@
 A server that connects publishing clients to subscribing clients.
 All subscriptions are deduplicated and cached, so that a single publisher can serve many subscribers.
 
+## Cargo features
+
+The default `runtime` feature preserves the complete relay library and binary.
+Applications that only implement relay admission can omit the HTTP, relay, and
+metrics runtime:
+
+```toml
+moq-relay-ietf = { path = "../moq-rs/moq-relay-ietf", default-features = false }
+```
+
+This admission-only surface exports `SessionAdmission`, `AdmissionLease`,
+`AdmissionSessionId`, and their supporting request, decision, and lifecycle
+types. The `moq-relay-ietf` binary requires `runtime`. Enabling
+`metrics-prometheus` also enables `runtime`.
+
 ## Usage
 
 The publisher must choose a unique name for their broadcast, sent as the WebTransport path when connecting to the server.

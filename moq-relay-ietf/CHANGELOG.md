@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- an admission-only library surface available with `default-features = false`; the existing relay runtime and binary remain enabled by default
 - hierarchical process, authenticated-principal, and resolved-scope capacity for namespace, track, subscription, track-status, and FETCH request lifecycles
 - scoped and bounded upstream relay caches with supervised tasks, aggregate diagnostics, and idle eviction
 - configurable per-namespace track caches plus bounded API/file coordinator retention

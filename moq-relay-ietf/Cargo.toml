@@ -21,59 +21,77 @@ path = "src/lib.rs"
 [[bin]]
 name = "moq-relay-ietf"
 path = "src/bin/moq-relay-ietf/main.rs"
+required-features = ["runtime"]
 
 [dependencies]
 moq-transport = { path = "../moq-transport", version = "0.14" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
-moq-api = { path = "../moq-api", version = "0.2" }
-web-transport = { workspace = true }
+moq-api = { path = "../moq-api", version = "0.2", optional = true }
+web-transport = { workspace = true, optional = true }
 
 # QUIC
-url = "2"
+url = { version = "2", optional = true }
 
 # Async stuff
-tokio = { version = "1", features = ["full", "test-util"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-futures = "0.3"
+tokio = { version = "1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+futures = { version = "0.3", optional = true }
 async-trait = "0.1"
 
 # Web server to serve the fingerprint
-axum = { version = "0.7", features = ["tokio"] }
-hyper-serve = { version = "0.6", features = [
-    "tls-rustls",
-] } # fork of axum-server
-tower-http = { version = "0.5", features = ["cors"] }
+axum = { version = "0.7", features = ["tokio"], optional = true }
+# fork of axum-server
+hyper-serve = { version = "0.6", features = ["tls-rustls"], optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
 hex = "0.4"
 ring = "0.17"
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # File locking
-fs2 = "0.4"
+fs2 = { version = "0.4", optional = true }
 
 # Error handling
 anyhow = { version = "1", features = ["backtrace"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
-
+clap = { version = "4", features = ["derive"], optional = true }
 
 # Logging
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 thiserror = "2.0.17"
 
-# Metrics — always compiled in; the metrics crate is effectively zero-cost
-# when no recorder is installed (similar to how the log crate works).
-# The metrics-prometheus feature adds the optional Prometheus exporter.
-metrics = "0.24"
+# Runtime metrics use the zero-cost facade when no recorder is installed.
+# The metrics-prometheus feature adds the optional Prometheus exporter and
+# therefore also enables the relay runtime.
+metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 [features]
-default = []
-metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+default = ["runtime"]
+runtime = [
+    "dep:moq-api",
+    "dep:web-transport",
+    "dep:url",
+    "tokio/full",
+    "tokio/test-util",
+    "dep:tokio-util",
+    "dep:futures",
+    "dep:axum",
+    "dep:hyper-serve",
+    "dep:tower-http",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:fs2",
+    "dep:clap",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:metrics",
+]
+metrics-prometheus = ["runtime", "dep:metrics-exporter-prometheus"]
 
 [dev-dependencies]
 rcgen = { version = "0.13", features = ["pem"] }

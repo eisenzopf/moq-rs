@@ -10,6 +10,10 @@
 //! - Routing media between local and remote endpoints
 //! - Coordinating namespace/track registration across relay clusters
 //!
+//! The default `runtime` feature provides the complete relay and its binary.
+//! Disable default features to depend only on the admission contract, including
+//! [`SessionAdmission`], [`AdmissionLease`], and [`AdmissionSessionId`].
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -32,31 +36,54 @@
 //! ```
 
 mod admission;
+#[cfg(feature = "runtime")]
 mod api;
+#[cfg(feature = "runtime")]
 mod capacity;
+#[cfg(feature = "runtime")]
 mod consumer;
+#[cfg(feature = "runtime")]
 mod coordinator;
+#[cfg(feature = "runtime")]
 mod diagnostics;
+#[cfg(feature = "runtime")]
 mod local;
+#[cfg(feature = "runtime")]
 pub mod metrics;
+#[cfg(feature = "runtime")]
 mod producer;
+#[cfg(feature = "runtime")]
 mod relay;
+#[cfg(feature = "runtime")]
 mod remote;
+#[cfg(feature = "runtime")]
 mod session;
+#[cfg(feature = "runtime")]
 mod web;
 
 pub use admission::*;
+#[cfg(feature = "runtime")]
 pub use api::*;
+#[cfg(feature = "runtime")]
 pub use capacity::*;
+#[cfg(feature = "runtime")]
 pub use consumer::*;
+#[cfg(feature = "runtime")]
 pub use coordinator::*;
+#[cfg(feature = "runtime")]
 pub use diagnostics::*;
+#[cfg(feature = "runtime")]
 pub use local::*;
+#[cfg(feature = "runtime")]
 pub use producer::*;
+#[cfg(feature = "runtime")]
 pub use relay::*;
+#[cfg(feature = "runtime")]
 pub use remote::{
     RemoteCapacityError, RemoteCapacityResource, RemoteManager, RemoteManagerLimits,
     RemoteManagerLimitsError, RemoteManagerSnapshot,
 };
+#[cfg(feature = "runtime")]
 pub use session::*;
+#[cfg(feature = "runtime")]
 pub use web::*;

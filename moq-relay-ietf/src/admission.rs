@@ -11,7 +11,8 @@ use moq_native_ietf::tls::PeerIdentity;
 use moq_transport::session::{SessionTarget, SetupAuthorization, Transport};
 use ring::rand::SecureRandom;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "runtime", derive(clap::ValueEnum))]
 pub enum ListenerSecurityPolicy {
     /// Relay/origin ingress: verified client certificate and publish claim.
     MutualTlsPublisher,

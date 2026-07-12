@@ -32,6 +32,18 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Keep the dependency-light admission API independently buildable.
+      - run: cargo check -p moq-relay-ietf --no-default-features
+      - run: cargo test -p moq-relay-ietf --no-default-features
+      - name: Reject relay HTTP runtime dependencies from admission-only builds
+        run: |
+          if cargo tree -p moq-relay-ietf --no-default-features -e normal | grep -Eq '(^| )((axum|hyper-serve|hyper-util) v)'; then
+            echo "admission-only build unexpectedly contains the relay HTTP runtime"
+            exit 1
+          fi
+      - run: cargo check -p moq-relay-ietf --all-features
+      - run: cargo test -p moq-relay-ietf --all-features
+
       # Make sure u guys don't write bad code
       - run: cargo test --verbose
       - run: cargo clippy --no-deps
