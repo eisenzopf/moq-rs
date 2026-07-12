@@ -3,7 +3,7 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 
-/// Object status values per draft-ietf-moq-transport-16 §10.2.1.1.
+/// Object status values per draft-ietf-moq-transport-19.
 ///
 /// Note: value 0x1 (`ObjectDoesNotExist`) was present in earlier drafts but
 /// was removed in draft-16.  Any received value other than 0x0, 0x3, or 0x4
@@ -18,6 +18,18 @@ pub enum ObjectStatus {
     EndOfGroup = 0x3,
     /// 0x4 — End of Track.  No objects at or beyond this location exist.
     EndOfTrack = 0x4,
+}
+
+impl ObjectStatus {
+    /// Whether this status permits an Object Payload.
+    pub const fn allows_payload(self) -> bool {
+        matches!(self, Self::NormalObject)
+    }
+
+    /// Whether this status permits Object Properties.
+    pub const fn allows_properties(self) -> bool {
+        matches!(self, Self::NormalObject)
+    }
 }
 
 impl Decode for ObjectStatus {
@@ -94,5 +106,15 @@ mod tests {
     #[test]
     fn end_of_track_wire_value_is_four() {
         assert_eq!(ObjectStatus::EndOfTrack as u64, 0x4);
+    }
+
+    #[test]
+    fn only_normal_status_allows_payload_and_properties() {
+        assert!(ObjectStatus::NormalObject.allows_payload());
+        assert!(ObjectStatus::NormalObject.allows_properties());
+        assert!(!ObjectStatus::EndOfGroup.allows_payload());
+        assert!(!ObjectStatus::EndOfGroup.allows_properties());
+        assert!(!ObjectStatus::EndOfTrack.allows_payload());
+        assert!(!ObjectStatus::EndOfTrack.allows_properties());
     }
 }

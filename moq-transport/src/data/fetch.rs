@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
-use crate::data::{ObjectStatus, StreamHeaderType};
+use crate::data::{decode_payload_length, encode_payload_length, ObjectStatus, StreamHeaderType};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FetchHeader {
@@ -67,7 +67,7 @@ impl Decode for FetchObject {
         let object_id = u64::decode(r)?;
         let publisher_priority = u8::decode(r)?;
         let extension_headers = KeyValuePairs::decode(r)?;
-        let payload_length = usize::decode(r)?;
+        let payload_length = decode_payload_length(r)?;
         let status = match payload_length {
             0 => Some(ObjectStatus::decode(r)?),
             _ => None,
@@ -96,7 +96,7 @@ impl Encode for FetchObject {
         self.object_id.encode(w)?;
         self.publisher_priority.encode(w)?;
         self.extension_headers.encode(w)?;
-        self.payload_length.encode(w)?;
+        encode_payload_length(self.payload_length, w)?;
         if self.payload_length == 0 {
             if let Some(status) = self.status {
                 status.encode(w)?;

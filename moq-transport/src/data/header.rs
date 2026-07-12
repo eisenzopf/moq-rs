@@ -6,72 +6,164 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use crate::data::{FetchHeader, SubgroupHeader};
 use std::fmt;
 
-/// Stream Header Types
-#[repr(u64)]
+const SUBGROUP_PROPERTIES: u64 = 0x01;
+const SUBGROUP_ID_MODE: u64 = 0x06;
+const SUBGROUP_END_OF_GROUP: u64 = 0x08;
+const SUBGROUP_MARKER: u64 = 0x10;
+const SUBGROUP_DEFAULT_PRIORITY: u64 = 0x20;
+const SUBGROUP_FIRST_OBJECT: u64 = 0x40;
+const SUBGROUP_TYPE_MASK: u64 = 0x7f;
+
+/// The encoding selected for the Subgroup ID in a `SUBGROUP_HEADER`.
 #[derive(Copy, Debug, Clone, Eq, PartialEq)]
-pub enum StreamHeaderType {
-    SubgroupZeroId = 0x10,
-    SubgroupZeroIdExt = 0x11,
-    SubgroupFirstObjectId = 0x12,
-    SubgroupFirstObjectIdExt = 0x13,
-    SubgroupId = 0x14,
-    SubgroupIdExt = 0x15,
-    SubgroupZeroIdEndOfGroup = 0x18,
-    SubgroupZeroIdExtEndOfGroup = 0x19,
-    SubgroupFirstObjectIdEndOfGroup = 0x1a,
-    SubgroupFirstObjectIdExtEndOfGroup = 0x1b,
-    SubgroupIdEndOfGroup = 0x1c,
-    SubgroupIdExtEndOfGroup = 0x1d,
-    Fetch = 0x5,
+pub enum SubgroupIdMode {
+    /// The field is omitted and the Subgroup ID is zero.
+    Zero,
+    /// The field is omitted and the first Object ID is the Subgroup ID.
+    FirstObject,
+    /// The field is present in the header.
+    Explicit,
 }
 
+impl SubgroupIdMode {
+    const fn bits(self) -> u64 {
+        match self {
+            Self::Zero => 0x00,
+            Self::FirstObject => 0x02,
+            Self::Explicit => 0x04,
+        }
+    }
+
+    const fn from_type(value: u64) -> Option<Self> {
+        match value & SUBGROUP_ID_MODE {
+            0x00 => Some(Self::Zero),
+            0x02 => Some(Self::FirstObject),
+            0x04 => Some(Self::Explicit),
+            _ => None,
+        }
+    }
+}
+
+/// A validated draft-19 unidirectional stream header type.
+///
+/// `SUBGROUP_HEADER` uses six independent/type fields and therefore has 48
+/// valid wire values. Keeping the validated value avoids an error-prone enum of
+/// every permutation while the legacy associated names below preserve existing
+/// callers.
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct StreamHeaderType(u64);
+
+#[allow(non_upper_case_globals)]
 impl StreamHeaderType {
-    pub fn is_subgroup(&self) -> bool {
-        let header_type = *self as u64;
-        (0x10..=0x1d).contains(&header_type)
+    pub const Fetch: Self = Self(0x05);
+
+    pub const SubgroupZeroId: Self = Self(0x10);
+    pub const SubgroupZeroIdExt: Self = Self(0x11);
+    pub const SubgroupFirstObjectId: Self = Self(0x12);
+    pub const SubgroupFirstObjectIdExt: Self = Self(0x13);
+    pub const SubgroupId: Self = Self(0x14);
+    pub const SubgroupIdExt: Self = Self(0x15);
+    pub const SubgroupZeroIdEndOfGroup: Self = Self(0x18);
+    pub const SubgroupZeroIdExtEndOfGroup: Self = Self(0x19);
+    pub const SubgroupFirstObjectIdEndOfGroup: Self = Self(0x1a);
+    pub const SubgroupFirstObjectIdExtEndOfGroup: Self = Self(0x1b);
+    pub const SubgroupIdEndOfGroup: Self = Self(0x1c);
+    pub const SubgroupIdExtEndOfGroup: Self = Self(0x1d);
+
+    /// Construct any valid draft-19 `SUBGROUP_HEADER` bitfield combination.
+    pub const fn subgroup(
+        properties: bool,
+        id_mode: SubgroupIdMode,
+        end_of_group: bool,
+        default_priority: bool,
+        first_object: bool,
+    ) -> Self {
+        let mut value = SUBGROUP_MARKER | id_mode.bits();
+        if properties {
+            value |= SUBGROUP_PROPERTIES;
+        }
+        if end_of_group {
+            value |= SUBGROUP_END_OF_GROUP;
+        }
+        if default_priority {
+            value |= SUBGROUP_DEFAULT_PRIORITY;
+        }
+        if first_object {
+            value |= SUBGROUP_FIRST_OBJECT;
+        }
+        Self(value)
     }
 
-    pub fn is_fetch(&self) -> bool {
-        *self == StreamHeaderType::Fetch
+    /// Return the validated wire value.
+    pub const fn value(self) -> u64 {
+        self.0
     }
 
-    pub fn has_extension_headers(&self) -> bool {
-        matches!(
-            *self,
-            StreamHeaderType::SubgroupZeroIdExt
-                | StreamHeaderType::SubgroupFirstObjectIdExt
-                | StreamHeaderType::SubgroupIdExt
-                | StreamHeaderType::SubgroupZeroIdExtEndOfGroup
-                | StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroup
-                | StreamHeaderType::SubgroupIdExtEndOfGroup
-                | StreamHeaderType::Fetch
-        )
+    /// Validate and construct a draft-19 stream header type.
+    pub const fn from_value(value: u64) -> Option<Self> {
+        if value == Self::Fetch.0 || Self::is_valid_subgroup_value(value) {
+            Some(Self(value))
+        } else {
+            None
+        }
     }
 
-    pub fn has_subgroup_id(&self) -> bool {
-        matches!(
-            *self,
-            StreamHeaderType::SubgroupId
-                | StreamHeaderType::SubgroupIdExt
-                | StreamHeaderType::SubgroupIdEndOfGroup
-                | StreamHeaderType::SubgroupIdExtEndOfGroup
-        )
+    const fn is_valid_subgroup_value(value: u64) -> bool {
+        value & !SUBGROUP_TYPE_MASK == 0
+            && value & SUBGROUP_MARKER != 0
+            && SubgroupIdMode::from_type(value).is_some()
     }
 
-    pub fn uses_first_object_id_as_subgroup_id(&self) -> bool {
-        matches!(
-            *self,
-            StreamHeaderType::SubgroupFirstObjectId
-                | StreamHeaderType::SubgroupFirstObjectIdExt
-                | StreamHeaderType::SubgroupFirstObjectIdEndOfGroup
-                | StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroup
-        )
+    pub const fn is_subgroup(self) -> bool {
+        Self::is_valid_subgroup_value(self.0)
+    }
+
+    pub const fn is_fetch(self) -> bool {
+        self.0 == Self::Fetch.0
+    }
+
+    /// Whether each object on this subgroup stream carries Object Properties.
+    pub const fn has_properties(self) -> bool {
+        self.is_subgroup() && self.0 & SUBGROUP_PROPERTIES != 0
+    }
+
+    /// Legacy name retained for the existing subgroup/fetch decoder.
+    pub const fn has_extension_headers(self) -> bool {
+        self.is_fetch() || self.has_properties()
+    }
+
+    pub const fn subgroup_id_mode(self) -> Option<SubgroupIdMode> {
+        if self.is_subgroup() {
+            SubgroupIdMode::from_type(self.0)
+        } else {
+            None
+        }
+    }
+
+    pub const fn has_subgroup_id(self) -> bool {
+        matches!(self.subgroup_id_mode(), Some(SubgroupIdMode::Explicit))
+    }
+
+    pub const fn uses_first_object_id_as_subgroup_id(self) -> bool {
+        matches!(self.subgroup_id_mode(), Some(SubgroupIdMode::FirstObject))
+    }
+
+    pub const fn contains_end_of_group(self) -> bool {
+        self.is_subgroup() && self.0 & SUBGROUP_END_OF_GROUP != 0
+    }
+
+    pub const fn uses_default_priority(self) -> bool {
+        self.is_subgroup() && self.0 & SUBGROUP_DEFAULT_PRIORITY != 0
+    }
+
+    pub const fn is_first_object(self) -> bool {
+        self.is_subgroup() && self.0 & SUBGROUP_FIRST_OBJECT != 0
     }
 }
 
 impl Encode for StreamHeaderType {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        let val = *self as u64;
+        let val = self.value();
         tracing::trace!(
             "[ENCODE] StreamHeaderType: encoding {:?} as {:#x}",
             self,
@@ -96,21 +188,9 @@ impl Decode for StreamHeaderType {
             type_value
         );
 
-        let header_type = match type_value {
-            0x10_u64 => Ok(Self::SubgroupZeroId),
-            0x11_u64 => Ok(Self::SubgroupZeroIdExt),
-            0x12_u64 => Ok(Self::SubgroupFirstObjectId),
-            0x13_u64 => Ok(Self::SubgroupFirstObjectIdExt),
-            0x14_u64 => Ok(Self::SubgroupId),
-            0x15_u64 => Ok(Self::SubgroupIdExt),
-            0x18_u64 => Ok(Self::SubgroupZeroIdEndOfGroup),
-            0x19_u64 => Ok(Self::SubgroupZeroIdExtEndOfGroup),
-            0x1a_u64 => Ok(Self::SubgroupFirstObjectIdEndOfGroup),
-            0x1b_u64 => Ok(Self::SubgroupFirstObjectIdExtEndOfGroup),
-            0x1c_u64 => Ok(Self::SubgroupIdEndOfGroup),
-            0x1d_u64 => Ok(Self::SubgroupIdExtEndOfGroup),
-            0x05_u64 => Ok(Self::Fetch),
-            _ => {
+        let header_type = match Self::from_value(type_value) {
+            Some(header_type) => Ok(header_type),
+            None => {
                 tracing::error!(
                     "[DECODE] StreamHeaderType: INVALID type value={:#x}",
                     type_value
@@ -134,7 +214,17 @@ impl Decode for StreamHeaderType {
 
 impl fmt::Display for StreamHeaderType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?} ({:#x})", self, *self as u64)
+        if self.is_fetch() {
+            write!(f, "Fetch ({:#x})", self.value())
+        } else {
+            write!(f, "Subgroup ({:#x})", self.value())
+        }
+    }
+}
+
+impl fmt::Debug for StreamHeaderType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -215,6 +305,9 @@ impl Encode for StreamHeader {
         //self.header_type.encode(w)?;
         if self.header_type.is_subgroup() {
             if let Some(subgroup_header) = &self.subgroup_header {
+                if subgroup_header.header_type != self.header_type || self.fetch_header.is_some() {
+                    return Err(EncodeError::InvalidValue);
+                }
                 tracing::trace!("[ENCODE] StreamHeader: encoding subgroup header");
                 subgroup_header.encode(w)?;
             } else {
@@ -225,6 +318,9 @@ impl Encode for StreamHeader {
                 return Err(EncodeError::MissingField("SubgroupHeader".to_string()));
             }
         } else if let Some(fetch_header) = &self.fetch_header {
+            if fetch_header.header_type != self.header_type || self.subgroup_header.is_some() {
+                return Err(EncodeError::InvalidValue);
+            }
             tracing::trace!("[ENCODE] StreamHeader: encoding fetch header");
             fetch_header.encode(w)?;
         } else {
@@ -282,6 +378,106 @@ mod tests {
         let mut buf: Bytes = data.into();
         let result = StreamHeaderType::decode(&mut buf);
         assert!(matches!(result, Err(DecodeError::InvalidHeaderType)));
+    }
+
+    #[test]
+    fn draft19_accepts_all_48_subgroup_bitfields() {
+        let mut valid = Vec::new();
+        for first_object in [false, true] {
+            for default_priority in [false, true] {
+                for end_of_group in [false, true] {
+                    for id_mode in [
+                        SubgroupIdMode::Zero,
+                        SubgroupIdMode::FirstObject,
+                        SubgroupIdMode::Explicit,
+                    ] {
+                        for properties in [false, true] {
+                            valid.push(StreamHeaderType::subgroup(
+                                properties,
+                                id_mode,
+                                end_of_group,
+                                default_priority,
+                                first_object,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        valid.sort_by_key(|header_type| header_type.value());
+        valid.dedup();
+        assert_eq!(valid.len(), 48);
+
+        for header_type in valid {
+            let mut wire = BytesMut::new();
+            header_type.encode(&mut wire).unwrap();
+            assert_eq!(StreamHeaderType::decode(&mut wire).unwrap(), header_type);
+            assert!(wire.is_empty());
+        }
+    }
+
+    #[test]
+    fn draft19_rejects_reserved_subgroup_id_modes_and_non_header_values() {
+        for value in [
+            0x00_u64, 0x0f, 0x16, 0x17, 0x1e, 0x1f, 0x36, 0x3f, 0x56, 0x5f, 0x76, 0x7f, 0x80,
+        ] {
+            let mut wire = BytesMut::new();
+            value.encode(&mut wire).unwrap();
+            assert!(matches!(
+                StreamHeaderType::decode(&mut wire),
+                Err(DecodeError::InvalidHeaderType)
+            ));
+        }
+    }
+
+    #[test]
+    fn draft19_full_subgroup_header_golden_vector() {
+        let header_type =
+            StreamHeaderType::subgroup(true, SubgroupIdMode::Explicit, true, true, true);
+        assert_eq!(header_type.value(), 0x7d);
+        assert!(header_type.has_properties());
+        assert!(header_type.contains_end_of_group());
+        assert!(header_type.uses_default_priority());
+        assert!(header_type.is_first_object());
+
+        let header = StreamHeader {
+            header_type,
+            subgroup_header: Some(SubgroupHeader {
+                header_type,
+                track_alias: 2,
+                group_id: 3,
+                subgroup_id: Some(4),
+                publisher_priority: crate::data::DEFAULT_PUBLISHER_PRIORITY,
+            }),
+            fetch_header: None,
+        };
+        let mut wire = BytesMut::new();
+        header.encode(&mut wire).unwrap();
+        assert_eq!(wire.as_ref(), &[0x7d, 0x02, 0x03, 0x04]);
+
+        let decoded = StreamHeader::decode(&mut wire).unwrap();
+        assert_eq!(decoded, header);
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn stream_header_rejects_disagreeing_nested_type() {
+        let header = StreamHeader {
+            header_type: StreamHeaderType::SubgroupId,
+            subgroup_header: Some(SubgroupHeader {
+                header_type: StreamHeaderType::SubgroupZeroId,
+                track_alias: 1,
+                group_id: 2,
+                subgroup_id: None,
+                publisher_priority: 3,
+            }),
+            fetch_header: None,
+        };
+        assert!(matches!(
+            header.encode(&mut BytesMut::new()),
+            Err(EncodeError::InvalidValue)
+        ));
     }
 
     #[test]
