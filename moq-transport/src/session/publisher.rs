@@ -10,7 +10,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-    coding::{KeyValuePairs, TrackNamespace},
+    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
     mlog,
     serve::{ServeError, TrackReader, TracksReader},
@@ -35,6 +35,57 @@ enum PublishRequestStreamEvent {
     Response(Result<Option<Message>, SessionError>),
     Command(Option<BidiCommand>),
     SendStopped(Result<Option<u8>, SessionError>),
+}
+
+struct SubscribedNamespaceRegistry<T> {
+    active: HashMap<u64, (TrackNamespacePrefix, T)>,
+}
+
+impl<T> Default for SubscribedNamespaceRegistry<T> {
+    fn default() -> Self {
+        Self {
+            active: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscribedNamespaceInsertError {
+    DuplicateRequestId,
+    PrefixOverlap,
+}
+
+impl<T> SubscribedNamespaceRegistry<T> {
+    fn try_insert(
+        &mut self,
+        request_id: u64,
+        prefix: TrackNamespacePrefix,
+        value: T,
+    ) -> Result<(), SubscribedNamespaceInsertError> {
+        if self.active.contains_key(&request_id) {
+            return Err(SubscribedNamespaceInsertError::DuplicateRequestId);
+        }
+        if self
+            .active
+            .values()
+            .any(|(active, _)| namespace_prefixes_overlap(active, &prefix))
+        {
+            return Err(SubscribedNamespaceInsertError::PrefixOverlap);
+        }
+        self.active.insert(request_id, (prefix, value));
+        Ok(())
+    }
+
+    fn remove(&mut self, request_id: u64) -> Option<T> {
+        self.active.remove(&request_id).map(|(_, value)| value)
+    }
+}
+
+fn namespace_prefixes_overlap(left: &TrackNamespacePrefix, right: &TrackNamespacePrefix) -> bool {
+    left.fields
+        .iter()
+        .zip(&right.fields)
+        .all(|(left, right)| left == right)
 }
 
 struct PublishNamespaceResponseGuard {
@@ -84,7 +135,7 @@ pub struct Publisher {
     unknown_subscribed: Queue<Subscribed>,
 
     /// Active inbound SUBSCRIBE_NAMESPACE requests, keyed by request ID.
-    subscribed_namespaces: Arc<Mutex<HashMap<u64, SubscribedNamespaceRecv>>>,
+    subscribed_namespaces: Arc<Mutex<SubscribedNamespaceRegistry<SubscribedNamespaceRecv>>>,
 
     /// Inbound SUBSCRIBE_NAMESPACE requests surfaced to the application.
     unknown_subscribed_namespace: Queue<SubscribedNamespace>,
@@ -1093,16 +1144,24 @@ impl Publisher {
         request_lease: Arc<RequestLease>,
     ) -> Result<(), SessionError> {
         let id = msg.id;
+        let prefix = msg.track_namespace_prefix.clone();
         let (request, recv) = SubscribedNamespace::new(self.clone(), msg, request_lease);
         {
             let mut requests = self
                 .subscribed_namespaces
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
-            if requests.contains_key(&id) {
-                return Err(SessionError::InvalidRequestId);
+            match requests.try_insert(id, prefix, recv) {
+                Ok(()) => {}
+                Err(SubscribedNamespaceInsertError::DuplicateRequestId) => {
+                    return Err(SessionError::InvalidRequestId);
+                }
+                Err(SubscribedNamespaceInsertError::PrefixOverlap) => {
+                    drop(requests);
+                    request.close(ServeError::Closed(RequestErrorCode::PrefixOverlap as u64));
+                    return Ok(());
+                }
             }
-            requests.insert(id, recv);
         }
 
         if let Err(request) = self.unknown_subscribed_namespace.push(request) {
@@ -1276,7 +1335,7 @@ impl Publisher {
             .subscribed_namespaces
             .lock()
             .ok()
-            .and_then(|mut requests| requests.remove(&id))
+            .and_then(|mut requests| requests.remove(id))
         {
             recv.recv_closed();
         }
@@ -1329,5 +1388,64 @@ impl Publisher {
 
     pub(super) async fn send_datagram(&mut self, data: bytes::Bytes) -> Result<(), SessionError> {
         Ok(self.webtransport.send_datagram(data).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::coding::TrackNamespacePrefix;
+
+    use super::{SubscribedNamespaceInsertError, SubscribedNamespaceRegistry};
+
+    fn prefix(value: &str) -> TrackNamespacePrefix {
+        TrackNamespacePrefix::from_utf8_path(value)
+    }
+
+    #[test]
+    fn namespace_registry_rejects_overlapping_active_prefixes() {
+        let mut requests = SubscribedNamespaceRegistry::default();
+        requests.try_insert(1, prefix("tenant/live"), ()).unwrap();
+
+        for (request_id, candidate) in [
+            (3, "tenant"),
+            (5, "tenant/live"),
+            (7, "tenant/live/audio"),
+            (9, ""),
+        ] {
+            assert_eq!(
+                requests.try_insert(request_id, prefix(candidate), ()),
+                Err(SubscribedNamespaceInsertError::PrefixOverlap)
+            );
+        }
+
+        requests
+            .try_insert(11, prefix("tenant/archive"), ())
+            .unwrap();
+        requests.try_insert(13, prefix("other/live"), ()).unwrap();
+    }
+
+    #[test]
+    fn namespace_registry_releases_prefix_for_reuse_after_close() {
+        let mut requests = SubscribedNamespaceRegistry::default();
+        requests.try_insert(1, prefix("tenant/live"), ()).unwrap();
+        assert_eq!(
+            requests.try_insert(3, prefix("tenant/live/audio"), ()),
+            Err(SubscribedNamespaceInsertError::PrefixOverlap)
+        );
+
+        assert_eq!(requests.remove(1), Some(()));
+        requests
+            .try_insert(3, prefix("tenant/live/audio"), ())
+            .unwrap();
+    }
+
+    #[test]
+    fn namespace_registry_rejects_duplicate_request_ids() {
+        let mut requests = SubscribedNamespaceRegistry::default();
+        requests.try_insert(1, prefix("tenant/live"), ()).unwrap();
+        assert_eq!(
+            requests.try_insert(1, prefix("other/live"), ()),
+            Err(SubscribedNamespaceInsertError::DuplicateRequestId)
+        );
     }
 }
