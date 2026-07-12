@@ -899,6 +899,30 @@ impl SubscribeRecv {
         Ok(())
     }
 
+    /// Release a Joining barrier when SUBSCRIBE_OK reported no Largest
+    /// Object, so there is no valid Relative Joining FETCH range.
+    ///
+    /// When no live Object raced the response, remove the barrier entirely
+    /// and resume the ordinary zero-copy receive path. If an Object did race,
+    /// preserve the released barrier long enough to flush its bounded payload
+    /// before continuing through the joining writer path.
+    pub(super) fn fall_back_to_live_without_fetch(&mut self) -> Result<(), ServeError> {
+        let barrier = self
+            .join_barrier
+            .as_ref()
+            .ok_or_else(|| ServeError::internal_ctx("Joining FETCH barrier is not active"))?;
+        if barrier.cutoff.is_some() {
+            return Err(ServeError::internal_ctx(
+                "cannot skip Joining FETCH with a frozen cutoff",
+            ));
+        }
+        if barrier.buffered.is_empty() && barrier.fetched.is_empty() {
+            self.join_barrier.take();
+            return Ok(());
+        }
+        self.finish_joining_fetch()
+    }
+
     pub(super) fn abort_joining_fetch(&mut self) -> Result<(), ServeError> {
         if self.join_barrier.is_none() {
             return Ok(());
@@ -1503,6 +1527,57 @@ mod tests {
         };
         let subgroup = groups.next().await.unwrap().unwrap();
         assert!(!subgroup.end_of_group);
+    }
+
+    #[test]
+    fn cold_join_without_a_cutoff_resumes_the_ordinary_live_path() {
+        let (mut recv, _reader) = joining_recv();
+        recv.begin_joining_fetch().unwrap();
+        recv.ok(&message::SubscribeOk {
+            id: 0,
+            track_alias: 0,
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        })
+        .unwrap();
+
+        recv.fall_back_to_live_without_fetch().unwrap();
+        assert!(!recv.has_joining_barrier());
+    }
+
+    #[tokio::test]
+    async fn cold_join_flushes_a_live_object_that_raced_subscribe_ok() {
+        let (mut recv, reader) = joining_recv();
+        recv.begin_joining_fetch().unwrap();
+        assert!(recv.claim_object(0, 0));
+        let mut raced = buffered(0, 0, b"raced-live");
+        raced.group_end = EndOfGroupState::Signaled;
+        recv.recv_joining_live_object(raced).unwrap();
+        recv.ok(&message::SubscribeOk {
+            id: 0,
+            track_alias: 0,
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        })
+        .unwrap();
+
+        recv.fall_back_to_live_without_fetch().unwrap();
+        let serve::TrackReaderMode::Subgroups(mut groups) = reader.mode().await.unwrap() else {
+            panic!("cold Joining fallback must preserve subgroup delivery");
+        };
+        let mut subgroup = groups.next().await.unwrap().unwrap();
+        assert!(subgroup.end_of_group);
+        assert_eq!(
+            subgroup
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .await
+                .unwrap(),
+            bytes::Bytes::from_static(b"raced-live")
+        );
     }
 
     #[test]

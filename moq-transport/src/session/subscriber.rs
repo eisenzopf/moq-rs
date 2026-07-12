@@ -634,7 +634,7 @@ impl Subscriber {
                     "Joining FETCH reference is not active in this Subscriber session",
                 )
             })?
-            .finish_joining_fetch()?;
+            .fall_back_to_live_without_fetch()?;
         Ok((subscribe, None))
     }
 
