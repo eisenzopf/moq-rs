@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::{net, path::PathBuf};
 
 use clap::Parser;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
@@ -156,6 +157,15 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 1_000)]
     pub pre_admission_cleanup_timeout_ms: u64,
+
+    /// Maximum wait for replay tombstoning and distributed admission-lease
+    /// release after an admitted session stops.
+    #[arg(
+        long,
+        default_value_t = 5_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub session_close_timeout_ms: u64,
 
     #[arg(long, default_value_t = 128)]
     pub max_pending_admissions: usize,
@@ -417,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
         setup_timeout: std::time::Duration::from_millis(cli.setup_timeout_ms),
         admission_timeout: std::time::Duration::from_millis(cli.admission_timeout_ms),
         cleanup_timeout: std::time::Duration::from_millis(cli.pre_admission_cleanup_timeout_ms),
+        session_close_timeout: std::time::Duration::from_millis(cli.session_close_timeout_ms),
         max_pending_admissions: cli.max_pending_admissions,
         max_active_sessions: cli.max_active_sessions,
         token_revalidation_interval: std::time::Duration::from_millis(
@@ -461,7 +472,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    relay.run().await
+    let shutdown = CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("shutdown signal received; draining admitted sessions");
+            signal_shutdown.cancel();
+        }
+    });
+
+    relay.run_until(shutdown).await
 }
 
 #[cfg(test)]
@@ -484,6 +504,19 @@ mod cli_tests {
         let limits = cli.relay_capacity.limits();
         assert_eq!(limits, RelayCapacityLimits::default());
         limits.validate().unwrap();
+    }
+
+    #[test]
+    fn admitted_session_close_timeout_is_positive_and_documented() {
+        let cli = Cli::try_parse_from(["moq-relay-ietf"]).unwrap();
+        assert_eq!(cli.session_close_timeout_ms, 5_000);
+        assert!(
+            Cli::try_parse_from(["moq-relay-ietf", "--session-close-timeout-ms", "0"]).is_err()
+        );
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--session-close-timeout-ms"));
+        assert!(help.contains("replay tombstoning"));
     }
 
     #[test]

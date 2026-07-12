@@ -12,11 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scoped and bounded upstream relay caches with supervised tasks, aggregate diagnostics, and idle eviction
 - configurable per-namespace track caches plus bounded API/file coordinator retention
 - process-shared transport request capacity with configurable per-session/process retained-byte budgets and metrics
+- server-generated admission session IDs plus atomic decision-and-lease admission for replay-safe token backends
+- lease-owned asynchronous revalidation and bounded, awaited session close with fixed close reasons, metrics, and fail-closed error reporting
+- graceful relay draining that stops accepts and finalizes every admitted session before releasing capacity
+- supervised late-admission and finalization reaping across client deadlines, task cancellation, and panic unwinds
 
 ### Changed
 
 - relay overloads now use retryable `EXCESSIVE_LOAD` responses; authenticated identity and resolved scope remain attached to long-lived handlers
 - file coordination uses versioned binary-safe tuple/scope keys and migrates legacy UTF-8 entries on the next write
+- production token listeners now require atomic admission, bounded leases, and awaited lifecycle close capabilities
+- production mTLS publisher listeners accept raw QUIC, token subscriber listeners accept WebTransport, and mismatched substrates are rejected before external admission state changes
 
 ## [0.7.18](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.17...moq-relay-ietf-v0.7.18) - 2026-05-20
 

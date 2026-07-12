@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use moq_native_ietf::tls::PeerIdentity;
 use moq_transport::session::{SessionTarget, SetupAuthorization, Transport};
+use ring::rand::SecureRandom;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum ListenerSecurityPolicy {
@@ -98,10 +99,60 @@ impl AdmissionDecision {
     }
 }
 
+/// Server-generated identifier for one accepted transport session.
+///
+/// This value is deliberately independent from QUIC connection IDs, request
+/// paths, and peer credentials. In particular, a QUIC original destination
+/// connection ID is selected by the client and is therefore not a safe replay
+/// binding. Relay-generated IDs contain 128 bits from the operating system
+/// CSPRNG and use a bounded canonical ASCII representation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AdmissionSessionId(Arc<str>);
+
+impl AdmissionSessionId {
+    pub const MAX_BYTES: usize = 128;
+
+    pub fn generate() -> anyhow::Result<Self> {
+        let mut random = [0_u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| anyhow::anyhow!("operating system CSPRNG unavailable"))?;
+        Self::new(hex::encode(random))
+    }
+
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        anyhow::ensure!(!value.is_empty(), "admission session ID cannot be empty");
+        anyhow::ensure!(
+            value.len() <= Self::MAX_BYTES,
+            "admission session ID exceeds 128 bytes"
+        );
+        anyhow::ensure!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'~')),
+            "admission session ID contains a non-canonical character"
+        );
+        Ok(Self(Arc::from(value)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AdmissionSessionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Immutable inputs available before a relay mutates coordinator or media
 /// state for an inbound session.
 #[derive(Clone, Copy)]
 pub struct AdmissionRequest<'a> {
+    pub session_id: &'a AdmissionSessionId,
     pub peer_identity: &'a PeerIdentity,
     pub target: &'a SessionTarget,
     pub substrate: Transport,
@@ -113,6 +164,7 @@ impl std::fmt::Debug for AdmissionRequest<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AdmissionRequest")
+            .field("session_id", self.session_id)
             .field("peer_identity", self.peer_identity)
             .field("target", &self.target.redacted_for_logging())
             .field("substrate", &self.substrate)
@@ -134,10 +186,98 @@ pub enum AdmissionError {
     CapacityExhausted,
 }
 
-/// An application-owned capacity grant held for the complete admitted
-/// session lifetime. Implementations can release tenant/account capacity in
-/// `Drop`; the relay guarantees that the guard is retained through teardown.
-pub trait AdmissionLease: Send + Sync {}
+/// Why an admitted session is being finalized.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AdmissionCloseReason {
+    PeerClosed,
+    LocalClosed,
+    ActivationFailed,
+    AdmissionRevalidationFailed,
+    ProtocolError,
+    RelayShutdown,
+}
+
+impl AdmissionCloseReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerClosed => "peer_closed",
+            Self::LocalClosed => "local_closed",
+            Self::ActivationFailed => "activation_failed",
+            Self::AdmissionRevalidationFailed => "admission_revalidation_failed",
+            Self::ProtocolError => "protocol_error",
+            Self::RelayShutdown => "relay_shutdown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionCloseContext {
+    pub reason: AdmissionCloseReason,
+    pub ended_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AdmissionCloseError {
+    #[error("admission replay state could not be finalized")]
+    ReplayFinalizeUnavailable,
+    #[error("admission quota lease could not be released")]
+    LeaseReleaseUnavailable,
+    #[error("admission lease ownership changed")]
+    OwnershipMismatch,
+    #[error("admission lease is in an invalid lifecycle state")]
+    InvalidState,
+}
+
+/// An application-owned authorization and capacity grant held for the complete
+/// admitted session lifetime.
+///
+/// `close` implementations must be idempotent and cancellation-safe. A store
+/// timeout or cancellation must leave replay and quota state fail-closed; it
+/// must never make the credential reusable. The relay awaits `close` with a
+/// configured bound while both its global permit and this lease remain held.
+#[async_trait]
+pub trait AdmissionLease: Send + Sync {
+    /// Revalidate expiry, revocation, replay ownership, and resource scopes.
+    /// The default denies so a production token policy cannot accidentally
+    /// retain the historical policy-only revalidation behavior.
+    async fn revalidate(&self, _now_unix_seconds: u64) -> Result<(), AdmissionError> {
+        Err(AdmissionError::PolicyDenied)
+    }
+
+    /// Atomically tombstone replay state and release any distributed lease.
+    /// Non-token and development leases may use the no-op default.
+    async fn close(&mut self, _context: AdmissionCloseContext) -> Result<(), AdmissionCloseError> {
+        Ok(())
+    }
+}
+
+/// Atomic admission result. The decision and its lifecycle lease are created
+/// together while the raw SETUP authorization material is still available.
+pub struct AdmittedSession {
+    decision: AdmissionDecision,
+    lease: Box<dyn AdmissionLease>,
+}
+
+impl AdmittedSession {
+    pub fn new(decision: AdmissionDecision, lease: Box<dyn AdmissionLease>) -> Self {
+        Self { decision, lease }
+    }
+
+    pub fn decision(&self) -> &AdmissionDecision {
+        &self.decision
+    }
+
+    pub async fn revalidate(&self, now_unix_seconds: u64) -> Result<(), AdmissionError> {
+        self.lease.revalidate(now_unix_seconds).await
+    }
+
+    pub async fn close(
+        &mut self,
+        context: AdmissionCloseContext,
+    ) -> Result<(), AdmissionCloseError> {
+        self.lease.close(context).await
+    }
+}
 
 #[derive(Debug)]
 struct UnmeteredAdmissionLease;
@@ -150,6 +290,26 @@ pub trait SessionAdmission: Send + Sync {
         &self,
         request: AdmissionRequest<'_>,
     ) -> Result<AdmissionDecision, AdmissionError>;
+
+    /// Authenticate, authorize, claim replay state, and reserve policy capacity
+    /// as one externally visible transaction. Legacy non-token policies use the
+    /// default composition. Production token policies must override this method
+    /// and advertise both lifecycle capability flags below.
+    ///
+    /// The relay supervises this future in an owned task and deliberately does
+    /// not cancel it when the client-facing admission deadline expires. A late
+    /// grant is immediately finalized through its lease. Implementations must
+    /// therefore use internally bounded I/O and eventually settle; they must
+    /// not depend on future cancellation to roll back claimed replay or quota
+    /// state.
+    async fn admit_session(
+        &self,
+        request: AdmissionRequest<'_>,
+    ) -> Result<AdmittedSession, AdmissionError> {
+        let decision = self.admit(request).await?;
+        let lease = self.acquire_session_lease(&decision).await?;
+        Ok(AdmittedSession::new(decision, lease))
+    }
 
     /// Marks a built-in policy that may only be installed when the relay is
     /// explicitly running in development mode.
@@ -168,6 +328,17 @@ pub trait SessionAdmission: Send + Sync {
     }
 
     fn supports_bounded_session_leases(&self) -> bool {
+        false
+    }
+
+    /// The policy overrides `admit_session` so a token claim and its capacity
+    /// lease cannot be separated by a cancellation window.
+    fn supports_atomic_token_admission(&self) -> bool {
+        false
+    }
+
+    /// The lease implements bounded, awaited replay tombstoning and release.
+    fn supports_awaited_session_close(&self) -> bool {
         false
     }
 
@@ -422,7 +593,8 @@ impl SessionAdmission for CertificateFingerprintAdmission {
 /// This intentionally cannot be used as a production browser admission
 /// policy: static digests provide no tenant/scope, expiry, replay, or JTI
 /// guarantees. Production integrations must implement [`SessionAdmission`]
-/// with `supports_production_token_leases()` and `revalidate()`.
+/// with atomic [`SessionAdmission::admit_session`], lease-owned revalidation
+/// and close hooks, and all production token lifecycle capability flags.
 #[derive(Debug)]
 pub struct SetupTokenAdmission {
     allowed: HashSet<[u8; 32]>,
@@ -504,11 +676,13 @@ mod tests {
     use super::*;
 
     fn request<'a>(
+        session_id: &'a AdmissionSessionId,
         peer_identity: &'a PeerIdentity,
         target: &'a SessionTarget,
         authorization: Option<&'a SetupAuthorization>,
     ) -> AdmissionRequest<'a> {
         AdmissionRequest {
+            session_id,
             peer_identity,
             target,
             substrate: Transport::RawQuic,
@@ -519,13 +693,14 @@ mod tests {
 
     #[tokio::test]
     async fn static_token_policy_is_subscribe_only_and_development_only() {
+        let session_id = AdmissionSessionId::new("test-session").unwrap();
         let token = SetupAuthorization::new(b"listener-token").unwrap();
         let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
         let policy = SetupTokenAdmission::new([hex::encode(digest.as_ref())]).unwrap();
         let target: SessionTarget = "moqt://relay.example/listen".parse().unwrap();
         let peer = PeerIdentity::Anonymous;
         let decision = policy
-            .admit(request(&peer, &target, Some(&token)))
+            .admit(request(&session_id, &peer, &target, Some(&token)))
             .await
             .unwrap();
 
@@ -536,6 +711,7 @@ mod tests {
         assert_eq!(decision.principal.method, AuthenticationMethod::SetupToken);
         assert!(policy
             .admit(request(
+                &session_id,
                 &peer,
                 &target,
                 Some(&SetupAuthorization::new(b"wrong").unwrap()),
@@ -546,26 +722,44 @@ mod tests {
 
     #[tokio::test]
     async fn deny_and_development_allow_all_are_explicit() {
+        let session_id = AdmissionSessionId::new("test-session").unwrap();
         let target: SessionTarget = "moqt://relay.example/".parse().unwrap();
         let peer = PeerIdentity::Anonymous;
         assert!(DenyAllAdmission
-            .admit(request(&peer, &target, None))
+            .admit(request(&session_id, &peer, &target, None))
             .await
             .is_err());
         let allow = DevelopmentAllowAllAdmission::explicitly_enabled();
         assert!(allow.allow_all());
         assert!(allow.development_only());
-        assert!(allow.admit(request(&peer, &target, None)).await.is_ok());
+        assert!(allow
+            .admit(request(&session_id, &peer, &target, None))
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn generated_session_ids_are_canonical_and_ignore_reused_client_odcid() {
+        let reused_client_odcid = "aabbccddeeff0011";
+        let first = AdmissionSessionId::generate().unwrap();
+        let second = AdmissionSessionId::generate().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first.as_str(), reused_client_odcid);
+        assert_ne!(second.as_str(), reused_client_odcid);
+        assert_eq!(first.as_str().len(), 32);
+        assert!(first.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(AdmissionSessionId::new("client/cid").is_err());
     }
 
     #[test]
     fn admission_request_debug_redacts_target_query_and_setup_token() {
+        let session_id = AdmissionSessionId::new("test-session").unwrap();
         let target: SessionTarget = "moqt://relay.example/live?token=query-secret"
             .parse()
             .unwrap();
         let peer = PeerIdentity::Anonymous;
         let token = SetupAuthorization::new(b"setup-secret").unwrap();
-        let debug = format!("{:?}", request(&peer, &target, Some(&token)));
+        let debug = format!("{:?}", request(&session_id, &peer, &target, Some(&token)));
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("query-secret"));
         assert!(!debug.contains("setup-secret"));

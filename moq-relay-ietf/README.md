@@ -43,9 +43,15 @@ Production relay embedders must now configure:
 - explicit listener security and a `SessionAdmission` policy;
 - fingerprint-to-scope mappings such as `SHA256=/tenant/live`, not independent fingerprint and scope lists;
 - a bounded `max_active_sessions` and policy-owned `AdmissionLease` capacity;
-- setup, admission, cleanup, and token-revalidation deadlines.
+- setup, admission, cleanup, token-revalidation, and admitted-session close deadlines.
 
-The built-in fingerprint policy supports `new_bindings_with_limit`. Production token listeners require an external replay-, expiry-, revocation-, and capacity-aware policy. Per-session qlog/mlog, TLS key logging, disabled stateless retry, anonymous development admission, and `--insecure-development` are rejected or explicitly local-only in production.
+The built-in fingerprint policy supports `new_bindings_with_limit`. Production token listeners require an external replay-, expiry-, revocation-, and capacity-aware policy. That policy must atomically return an `AdmittedSession` from `SessionAdmission::admit_session`, and its lease must implement periodic revalidation plus idempotent, cancellation-safe `close`. Admission runs in a supervised owned task: a client deadline does not cancel a policy after it may have claimed replay state, and a late grant is immediately sent through the same bounded finalizer. Policy I/O must be internally bounded and eventually settle. The relay keeps global and policy capacity held until the close hook either completes or reaches `session_close_timeout`; backend timeout and cancellation paths must remain fail-closed. A finalization guard transfers ownership to the reaper if a connection task is cancelled or unwinds. Legacy policies retain composed admission and no-op close defaults, but cannot advertise the capability flags required by a production token listener.
+
+Every accepted session receives a fresh 128-bit server-generated `AdmissionSessionId`. It is independent of peer-controlled QUIC connection IDs and is available to the admission backend for replay ownership. The listener/substrate matrix is intentionally strict: mTLS publisher listeners accept raw QUIC, token subscriber listeners accept WebTransport, and development listeners may accept either. A substrate mismatch is rejected before replay or distributed quota state is mutated.
+
+Use `Relay::run_until` with a `CancellationToken` to drain gracefully. Cancellation stops new accepts, closes active admitted sessions with `RelayShutdown`, awaits their bounded admission finalizers, and only then releases process capacity and shuts down relay dependencies. The CLI wires this path to Ctrl-C. Observe `moq_relay_admission_close_total{outcome,reason}` and the bounded admission-close error stages for finalizer health.
+
+Per-session qlog/mlog, TLS key logging, disabled stateless retry, anonymous development admission, and `--insecure-development` are rejected or explicitly local-only in production.
 
 Raw `SessionTarget` values retain queries for trusted routing and canonical serialization. Logs must use `SessionTarget::redacted_for_logging()` or `redact_url_for_logging()`; bearer query values and authorization parameters are never diagnostic output.
 

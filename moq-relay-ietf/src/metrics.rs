@@ -22,7 +22,8 @@
 //! |------|--------|-------------|
 //! | `moq_relay_connections_total` | - | Total incoming connections accepted |
 //! | `moq_relay_connections_closed_total` | - | Total connections that have closed (graceful or error) |
-//! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, session_run) |
+//! | `moq_relay_connection_errors_total` | `stage` | Connection failures by bounded internal stage |
+//! | `moq_relay_admission_close_total` | `outcome`, `reason` | Awaited admitted-session finalization outcomes by fixed close reason |
 //! | `moq_relay_publishers_total` | - | Total publishers (PUBLISH_NAMESPACE requests) received |
 //! | `moq_relay_published_tracks_total` | - | Total exact-track PUBLISH requests received |
 //! | `moq_relay_announce_ok_total` | - | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE |
@@ -83,7 +84,11 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_connection_errors_total",
-        "Connection failures by stage (session_accept, session_run)"
+        "Connection failures by bounded internal stage"
+    );
+    describe_counter!(
+        "moq_relay_admission_close_total",
+        "Awaited admitted-session finalization outcomes by fixed outcome and close reason"
     );
     describe_counter!(
         "moq_relay_publishers_total",
