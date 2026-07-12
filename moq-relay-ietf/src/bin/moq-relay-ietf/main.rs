@@ -341,7 +341,8 @@ async fn main() -> anyhow::Result<()> {
                 cli.publisher_session_cap,
             )?
         }
-        ListenerSecurityPolicy::TokenSubscriber => {
+        ListenerSecurityPolicy::TokenSubscriber
+        | ListenerSecurityPolicy::RawQuicTokenSubscriber => {
             anyhow::ensure!(
                 cli.dev,
                 "the built-in static token allowlist is non-production; embed Relay with an external replay- and lease-aware SessionAdmission policy"
@@ -496,6 +497,24 @@ mod cli_tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--insecure-development"));
         assert!(help.contains("Never enable it on a public relay"));
+    }
+
+    #[test]
+    fn raw_quic_token_subscriber_is_a_distinct_cli_policy() {
+        let cli = Cli::try_parse_from([
+            "moq-relay-ietf",
+            "--listener-security",
+            "raw-quic-token-subscriber",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.listener_security,
+            Some(ListenerSecurityPolicy::RawQuicTokenSubscriber)
+        );
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("raw-quic-token-subscriber"));
+        assert!(help.contains("token-subscriber"));
     }
 
     #[test]

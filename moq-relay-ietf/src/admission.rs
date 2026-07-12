@@ -16,8 +16,12 @@ use ring::rand::SecureRandom;
 pub enum ListenerSecurityPolicy {
     /// Relay/origin ingress: verified client certificate and publish claim.
     MutualTlsPublisher,
-    /// Public listener ingress: mandatory SETUP token and subscribe-only claim.
+    /// Browser listener ingress: mandatory SETUP token and subscribe-only
+    /// claim over WebTransport.
     TokenSubscriber,
+    /// Native listener ingress: mandatory SETUP token and subscribe-only
+    /// claim over raw QUIC with the draft-19 ALPN.
+    RawQuicTokenSubscriber,
     /// Explicitly insecure local development listener.
     Development,
 }

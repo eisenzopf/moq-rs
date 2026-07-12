@@ -152,10 +152,13 @@ fn listener_decision_is_valid(
     peer_identity: &moq_native_ietf::tls::PeerIdentity,
     setup_authorization: Option<&moq_transport::session::SetupAuthorization>,
     substrate: moq_transport::session::Transport,
+    negotiated_protocol: &str,
     decision: &AdmissionDecision,
     production: bool,
 ) -> bool {
-    if decision.claims.validate().is_err() || !listener_substrate_is_allowed(policy, substrate) {
+    if decision.claims.validate().is_err()
+        || !listener_session_is_allowed(policy, substrate, negotiated_protocol, setup_authorization)
+    {
         return false;
     }
     let now = std::time::SystemTime::now()
@@ -166,9 +169,9 @@ fn listener_decision_is_valid(
             peer_identity.is_authenticated()
                 && decision_matches_listener_role(policy, decision, production, now)
         }
-        ListenerSecurityPolicy::TokenSubscriber => {
-            setup_authorization.is_some_and(|token| !token.is_empty())
-                && decision_matches_listener_role(policy, decision, production, now)
+        ListenerSecurityPolicy::TokenSubscriber
+        | ListenerSecurityPolicy::RawQuicTokenSubscriber => {
+            decision_matches_listener_role(policy, decision, production, now)
         }
         ListenerSecurityPolicy::Development => {
             decision_matches_listener_role(policy, decision, production, now)
@@ -176,9 +179,11 @@ fn listener_decision_is_valid(
     }
 }
 
-fn listener_substrate_is_allowed(
+fn listener_session_is_allowed(
     policy: ListenerSecurityPolicy,
     substrate: moq_transport::session::Transport,
+    negotiated_protocol: &str,
+    setup_authorization: Option<&moq_transport::session::SetupAuthorization>,
 ) -> bool {
     match policy {
         ListenerSecurityPolicy::MutualTlsPublisher => {
@@ -186,6 +191,13 @@ fn listener_substrate_is_allowed(
         }
         ListenerSecurityPolicy::TokenSubscriber => {
             substrate == moq_transport::session::Transport::WebTransport
+                && negotiated_protocol.as_bytes() == moq_transport::setup::ALPN
+                && setup_authorization.is_some_and(|token| !token.is_empty())
+        }
+        ListenerSecurityPolicy::RawQuicTokenSubscriber => {
+            substrate == moq_transport::session::Transport::RawQuic
+                && negotiated_protocol.as_bytes() == moq_transport::setup::ALPN
+                && setup_authorization.is_some_and(|token| !token.is_empty())
         }
         ListenerSecurityPolicy::Development => true,
     }
@@ -204,7 +216,8 @@ fn decision_matches_listener_role(
                 && !decision.claims.subscribe
                 && decision.claims.scope.is_some()
         }
-        ListenerSecurityPolicy::TokenSubscriber => {
+        ListenerSecurityPolicy::TokenSubscriber
+        | ListenerSecurityPolicy::RawQuicTokenSubscriber => {
             let base = decision.principal.method == crate::AuthenticationMethod::SetupToken
                 && decision.claims.subscribe
                 && !decision.claims.publish;
@@ -821,6 +834,7 @@ async fn run_admitted_connection(
             &context.peer_identity,
             moq_session.peer_setup_authorization(),
             moq_session.transport(),
+            moq_session.negotiated_transport().protocol,
             &decision,
             context.production,
         ) {
@@ -899,8 +913,11 @@ async fn run_admitted_connection(
             return AdmittedClose::activation("invalid resolved scope");
         }
 
-        let production_token = context.listener_security == ListenerSecurityPolicy::TokenSubscriber
-            && context.production;
+        let production_token = matches!(
+            context.listener_security,
+            ListenerSecurityPolicy::TokenSubscriber
+                | ListenerSecurityPolicy::RawQuicTokenSubscriber
+        ) && context.production;
         if production_token {
             let now = unix_now();
             let validation = match admitted.admitted() {
@@ -1097,7 +1114,11 @@ impl Relay {
                 config.listener_security != ListenerSecurityPolicy::Development,
                 "development listener security cannot be used in production"
             );
-            if config.listener_security == ListenerSecurityPolicy::TokenSubscriber {
+            if matches!(
+                config.listener_security,
+                ListenerSecurityPolicy::TokenSubscriber
+                    | ListenerSecurityPolicy::RawQuicTokenSubscriber
+            ) {
                 anyhow::ensure!(
                     config.admission.supports_production_token_leases(),
                     "production token listeners require an external replay- and lease-aware admission policy"
@@ -1132,9 +1153,9 @@ impl Relay {
             ListenerSecurityPolicy::MutualTlsPublisher => {
                 moq_native_ietf::tls::ClientAuthMode::Required
             }
-            ListenerSecurityPolicy::TokenSubscriber | ListenerSecurityPolicy::Development => {
-                moq_native_ietf::tls::ClientAuthMode::Disabled
-            }
+            ListenerSecurityPolicy::TokenSubscriber
+            | ListenerSecurityPolicy::RawQuicTokenSubscriber
+            | ListenerSecurityPolicy::Development => moq_native_ietf::tls::ClientAuthMode::Disabled,
         };
         anyhow::ensure!(
             config.tls.client_auth_mode() == required_client_auth,
@@ -1485,20 +1506,22 @@ impl Relay {
 
                             let moq_session = session;
 
-                            if !listener_substrate_is_allowed(
+                            if !listener_session_is_allowed(
                                 listener_security,
                                 moq_session.transport(),
+                                moq_session.negotiated_transport().protocol,
+                                moq_session.peer_setup_authorization(),
                             ) {
                                 metrics::counter!(
                                     "moq_relay_connection_errors_total",
-                                    "stage" => "listener_substrate"
+                                    "stage" => "listener_requirements"
                                 )
                                 .increment(1);
                                 close_and_wait(
                                     &raw_conn,
                                     moq_transport::session::SessionTerminationCode::Unauthorized
                                         .as_u32(),
-                                    "listener substrate is not allowed for this role",
+                                    "listener transport or SETUP authorization is not allowed for this role",
                                     cleanup_timeout,
                                 )
                                 .await;
@@ -2038,6 +2061,7 @@ mod security_tests {
         ScopedUnknown,
         InvalidRole,
         ProductionToken,
+        ProductionPublishingToken,
     }
 
     struct LifecycleState {
@@ -2150,15 +2174,25 @@ mod security_tests {
                 LifecycleDecision::ProductionToken => {
                     (AuthenticationMethod::SetupToken, Some("/secure".into()))
                 }
+                LifecycleDecision::ProductionPublishingToken => {
+                    (AuthenticationMethod::SetupToken, Some("/secure".into()))
+                }
             };
             AdmissionDecision::new(
                 AdmissionPrincipal::new("lifecycle-test", method)
                     .map_err(|_| AdmissionError::PolicyDenied)?,
-                if matches!(self.decision, LifecycleDecision::ProductionToken) {
+                if matches!(
+                    self.decision,
+                    LifecycleDecision::ProductionToken
+                        | LifecycleDecision::ProductionPublishingToken
+                ) {
                     AdmissionClaims {
                         scope,
-                        publish: false,
-                        subscribe: true,
+                        publish: matches!(
+                            self.decision,
+                            LifecycleDecision::ProductionPublishingToken
+                        ),
+                        subscribe: matches!(self.decision, LifecycleDecision::ProductionToken),
                         expires_at_unix_seconds: Some(unix_now().saturating_add(60)),
                         token_id: Some("lifecycle-jti".into()),
                     }
@@ -2523,27 +2557,60 @@ mod security_tests {
             .unwrap()
             .as_secs();
         let valid = token_decision(Some(now + 60), Some("tenant/broadcast"), Some("jti-1"));
-
-        assert!(listener_decision_is_valid(
-            ListenerSecurityPolicy::TokenSubscriber,
-            &identity,
-            Some(&authorization),
-            moq_transport::session::Transport::WebTransport,
-            &valid,
-            true,
-        ));
-        for invalid in [
+        let invalid = [
             token_decision(None, Some("tenant/broadcast"), Some("jti-1")),
             token_decision(Some(now + 60), None, Some("jti-1")),
             token_decision(Some(now + 60), Some("tenant/broadcast"), None),
             token_decision(Some(now), Some("tenant/broadcast"), Some("jti-1")),
-        ] {
-            assert!(!listener_decision_is_valid(
+        ];
+
+        for (policy, substrate) in [
+            (
                 ListenerSecurityPolicy::TokenSubscriber,
+                moq_transport::session::Transport::WebTransport,
+            ),
+            (
+                ListenerSecurityPolicy::RawQuicTokenSubscriber,
+                moq_transport::session::Transport::RawQuic,
+            ),
+        ] {
+            assert!(listener_decision_is_valid(
+                policy,
                 &identity,
                 Some(&authorization),
-                moq_transport::session::Transport::WebTransport,
-                &invalid,
+                substrate,
+                std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
+                &valid,
+                true,
+            ));
+            for invalid in &invalid {
+                assert!(!listener_decision_is_valid(
+                    policy,
+                    &identity,
+                    Some(&authorization),
+                    substrate,
+                    std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
+                    invalid,
+                    true,
+                ));
+            }
+
+            assert!(!listener_decision_is_valid(
+                policy,
+                &identity,
+                None,
+                substrate,
+                std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
+                &valid,
+                true,
+            ));
+            assert!(!listener_decision_is_valid(
+                policy,
+                &identity,
+                Some(&authorization),
+                substrate,
+                "moqt-18",
+                &valid,
                 true,
             ));
         }
@@ -2564,6 +2631,7 @@ mod security_tests {
             &identity,
             Some(&authorization),
             moq_transport::session::Transport::WebTransport,
+            std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
             &malformed,
             true,
         ));
@@ -2573,9 +2641,51 @@ mod security_tests {
             &identity,
             Some(&authorization),
             moq_transport::session::Transport::RawQuic,
+            std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
             &valid,
             true,
         ));
+        assert!(!listener_decision_is_valid(
+            ListenerSecurityPolicy::RawQuicTokenSubscriber,
+            &identity,
+            Some(&authorization),
+            moq_transport::session::Transport::WebTransport,
+            std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
+            &valid,
+            true,
+        ));
+
+        let publishing = AdmissionDecision::new(
+            AdmissionPrincipal::new("publishing-token", AuthenticationMethod::SetupToken).unwrap(),
+            AdmissionClaims {
+                scope: Some("tenant/broadcast".into()),
+                publish: true,
+                subscribe: false,
+                expires_at_unix_seconds: Some(now + 60),
+                token_id: Some("jti-publisher".into()),
+            },
+        )
+        .unwrap();
+        for (policy, substrate) in [
+            (
+                ListenerSecurityPolicy::TokenSubscriber,
+                moq_transport::session::Transport::WebTransport,
+            ),
+            (
+                ListenerSecurityPolicy::RawQuicTokenSubscriber,
+                moq_transport::session::Transport::RawQuic,
+            ),
+        ] {
+            assert!(!listener_decision_is_valid(
+                policy,
+                &identity,
+                Some(&authorization),
+                substrate,
+                std::str::from_utf8(moq_transport::setup::ALPN).unwrap(),
+                &publishing,
+                true,
+            ));
+        }
     }
 
     #[test]
@@ -2832,13 +2942,39 @@ mod security_tests {
         policy: quic::SubstratePolicy,
         expected_code: moq_transport::session::SessionTerminationCode,
     ) -> anyhow::Result<()> {
+        expect_rejected_with_authorization_policy(
+            client,
+            target,
+            policy,
+            Some(SetupAuthorization::new(b"test-token")?),
+            expected_code,
+        )
+        .await
+    }
+
+    async fn expect_rejected_without_setup_authorization_policy(
+        client: &quic::Client,
+        target: &moq_transport::session::SessionTarget,
+        policy: quic::SubstratePolicy,
+        expected_code: moq_transport::session::SessionTerminationCode,
+    ) -> anyhow::Result<()> {
+        expect_rejected_with_authorization_policy(client, target, policy, None, expected_code).await
+    }
+
+    async fn expect_rejected_with_authorization_policy(
+        client: &quic::Client,
+        target: &moq_transport::session::SessionTarget,
+        policy: quic::SubstratePolicy,
+        authorization: Option<SetupAuthorization>,
+        expected_code: moq_transport::session::SessionTerminationCode,
+    ) -> anyhow::Result<()> {
         let connection = client.connect_target(target, policy, None).await?;
         let raw = connection.session.clone();
         let setup = moq_transport::session::Session::connect_with_authorization(
             connection.session,
             None,
             connection.negotiated,
-            Some(SetupAuthorization::new(b"test-token")?),
+            authorization,
         )
         .await;
         // Session framing may observe EOF before it observes the transport's
@@ -3051,7 +3187,16 @@ mod security_tests {
 
     async fn start_production_token_relay(
         admission: Arc<LifecycleAdmission>,
+        listener_security: ListenerSecurityPolicy,
     ) -> anyhow::Result<RunningRelay> {
+        anyhow::ensure!(
+            matches!(
+                listener_security,
+                ListenerSecurityPolicy::TokenSubscriber
+                    | ListenerSecurityPolicy::RawQuicTokenSubscriber
+            ),
+            "production token relay helper requires a token-subscriber policy"
+        );
         let pki = production_pki()?;
         let tls = tls::Args {
             cert: vec![pki.server_cert.clone()],
@@ -3087,7 +3232,7 @@ mod security_tests {
             coordinator: coordinator.clone(),
             admission,
             development: false,
-            listener_security: ListenerSecurityPolicy::TokenSubscriber,
+            listener_security,
             setup_timeout: Duration::from_secs(1),
             admission_timeout: Duration::from_secs(1),
             cleanup_timeout: Duration::from_millis(200),
@@ -3225,7 +3370,11 @@ mod security_tests {
     async fn production_token_subscriber_is_webtransport_only_and_revalidates() -> anyhow::Result<()>
     {
         let admission = LifecycleAdmission::new(LifecycleDecision::ProductionToken);
-        let relay = start_production_token_relay(admission.clone()).await?;
+        let relay = start_production_token_relay(
+            admission.clone(),
+            ListenerSecurityPolicy::TokenSubscriber,
+        )
+        .await?;
 
         // Native subscribers need a separately configured raw-QUIC token
         // listener; the browser listener rejects this substrate before policy
@@ -3277,11 +3426,124 @@ mod security_tests {
     }
 
     #[tokio::test]
+    async fn production_raw_quic_token_subscriber_requires_setup_and_revalidates(
+    ) -> anyhow::Result<()> {
+        let admission = LifecycleAdmission::new(LifecycleDecision::ProductionToken);
+        let relay = start_production_token_relay(
+            admission.clone(),
+            ListenerSecurityPolicy::RawQuicTokenSubscriber,
+        )
+        .await?;
+
+        // The native listener rejects WebTransport before the external policy
+        // can claim replay state or distributed capacity.
+        expect_rejected_with_setup_policy(
+            &relay.client,
+            &relay.target,
+            quic::SubstratePolicy::WebTransport,
+            moq_transport::session::SessionTerminationCode::Unauthorized,
+        )
+        .await?;
+        assert_eq!(admission.state.admissions.load(Ordering::SeqCst), 0);
+
+        // Raw QUIC still carries authorization in draft-19 SETUP. Anonymous
+        // TLS plus a missing SETUP credential is not an admitted listener.
+        expect_rejected_without_setup_authorization_policy(
+            &relay.client,
+            &relay.target,
+            quic::SubstratePolicy::RawQuic,
+            moq_transport::session::SessionTerminationCode::Unauthorized,
+        )
+        .await?;
+        assert_eq!(admission.state.admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(relay.coordinator.resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(relay.coordinator.mutation_calls.load(Ordering::SeqCst), 0);
+
+        let (_raw, client_task) = establish_with_setup_policy(
+            &relay.client,
+            &relay.target,
+            quic::SubstratePolicy::RawQuic,
+        )
+        .await?;
+        wait_for_counter(&admission.state.admissions, 1).await?;
+        assert_eq!(admission.state.active_leases.load(Ordering::SeqCst), 1);
+        assert_eq!(relay.coordinator.mutation_calls.load(Ordering::SeqCst), 0);
+
+        admission.state.revalidate_ok.store(false, Ordering::SeqCst);
+        wait_for_counter(&admission.state.close_calls, 1).await?;
+        wait_for_counter(&admission.state.active_leases, 0).await?;
+        expect_session_task_termination(
+            client_task,
+            moq_transport::session::SessionTerminationCode::Unauthorized,
+        )
+        .await?;
+        assert_eq!(
+            admission.state.close_reasons.lock().unwrap().as_slice(),
+            &[AdmissionCloseReason::AdmissionRevalidationFailed]
+        );
+
+        // A failed lease does not poison the listener; a new token session can
+        // be admitted and receives the same bounded, awaited close lifecycle.
+        admission.state.revalidate_ok.store(true, Ordering::SeqCst);
+        let (raw, task) = establish_with_setup_policy(
+            &relay.client,
+            &relay.target,
+            quic::SubstratePolicy::RawQuic,
+        )
+        .await?;
+        wait_for_counter(&admission.state.admissions, 2).await?;
+        close_established_session(raw, task, "production raw QUIC token health check").await?;
+        wait_for_counter(&admission.state.close_calls, 2).await?;
+        wait_for_counter(&admission.state.active_leases, 0).await?;
+        assert_eq!(relay.coordinator.mutation_calls.load(Ordering::SeqCst), 0);
+
+        relay.shutdown.cancel();
+        relay.task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_quic_token_subscriber_rejects_publish_claim_before_routing() -> anyhow::Result<()>
+    {
+        let admission = LifecycleAdmission::new(LifecycleDecision::ProductionPublishingToken);
+        let relay = start_production_token_relay(
+            admission.clone(),
+            ListenerSecurityPolicy::RawQuicTokenSubscriber,
+        )
+        .await?;
+
+        expect_rejected_with_setup_policy(
+            &relay.client,
+            &relay.target,
+            quic::SubstratePolicy::RawQuic,
+            moq_transport::session::SessionTerminationCode::Unauthorized,
+        )
+        .await?;
+        wait_for_counter(&admission.state.admissions, 1).await?;
+        wait_for_counter(&admission.state.close_calls, 1).await?;
+        wait_for_counter(&admission.state.active_leases, 0).await?;
+        assert_eq!(
+            admission.state.close_reasons.lock().unwrap().as_slice(),
+            &[AdmissionCloseReason::ActivationFailed]
+        );
+        assert_eq!(relay.coordinator.resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(relay.coordinator.mutation_calls.load(Ordering::SeqCst), 0);
+
+        relay.shutdown.cancel();
+        relay.task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn production_token_revalidation_failure_before_activation_still_closes(
     ) -> anyhow::Result<()> {
         let admission = LifecycleAdmission::new(LifecycleDecision::ProductionToken);
         admission.state.revalidate_ok.store(false, Ordering::SeqCst);
-        let relay = start_production_token_relay(admission.clone()).await?;
+        let relay = start_production_token_relay(
+            admission.clone(),
+            ListenerSecurityPolicy::TokenSubscriber,
+        )
+        .await?;
 
         let (_raw, client_task) = establish_with_setup_policy(
             &relay.client,
@@ -4112,25 +4374,40 @@ mod security_tests {
             .expect("zero admission close timeout must fail");
         assert!(error.to_string().contains("session-close timeout"));
 
-        let legacy_token = config(
-            development_tls().unwrap(),
-            Arc::new(LeaseAdmission::default()),
+        for listener_security in [
             ListenerSecurityPolicy::TokenSubscriber,
-        );
-        let error = Relay::new(legacy_token)
-            .err()
-            .expect("legacy split token admission must fail");
-        assert!(error.to_string().contains("atomic admission"));
+            ListenerSecurityPolicy::RawQuicTokenSubscriber,
+        ] {
+            let no_token_lifecycle = config(
+                development_tls().unwrap(),
+                Arc::new(crate::DenyAllAdmission),
+                listener_security,
+            );
+            let error = Relay::new(no_token_lifecycle)
+                .err()
+                .expect("token admission without production leases must fail");
+            assert!(error.to_string().contains("replay- and lease-aware"));
 
-        let atomic_without_close = config(
-            development_tls().unwrap(),
-            Arc::new(AtomicOnlyAdmission),
-            ListenerSecurityPolicy::TokenSubscriber,
-        );
-        let error = Relay::new(atomic_without_close)
-            .err()
-            .expect("token admission without awaited close must fail");
-        assert!(error.to_string().contains("awaited replay tombstoning"));
+            let legacy_token = config(
+                development_tls().unwrap(),
+                Arc::new(LeaseAdmission::default()),
+                listener_security,
+            );
+            let error = Relay::new(legacy_token)
+                .err()
+                .expect("legacy split token admission must fail");
+            assert!(error.to_string().contains("atomic admission"));
+
+            let atomic_without_close = config(
+                development_tls().unwrap(),
+                Arc::new(AtomicOnlyAdmission),
+                listener_security,
+            );
+            let error = Relay::new(atomic_without_close)
+                .err()
+                .expect("token admission without awaited close must fail");
+            assert!(error.to_string().contains("awaited replay tombstoning"));
+        }
 
         let mut diagnostics = config(
             development_tls().unwrap(),
