@@ -4,6 +4,8 @@
 
 mod error;
 mod publish_namespace;
+mod publish_received;
+mod published;
 mod published_namespace;
 mod publisher;
 mod reader;
@@ -17,6 +19,8 @@ mod writer;
 
 pub use error::*;
 pub use publish_namespace::*;
+pub use publish_received::*;
+pub use published::*;
 pub use published_namespace::*;
 pub use publisher::*;
 pub use request_id::RequestId;
@@ -31,7 +35,7 @@ use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::coding::{Encode, KeyValuePairs, Value};
 use crate::message::Message;
@@ -44,11 +48,118 @@ use std::path::PathBuf;
 /// When `run_send` pops a response message from the outgoing queue, it checks
 /// this map: if the response's target request ID has a registered sender, the
 /// response is forwarded to the bidi handler task that owns the Writer.
-type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Message>>>>;
+pub(super) enum BidiCommand {
+    Send(Message),
+    Cancel(u32),
+    RequestUpdate {
+        update: message::RequestUpdate,
+        forward: bool,
+        completion: tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+    },
+}
 
-/// Channel for spawned bidi response reader tasks. Publisher/Subscriber
-/// send handles here; Session::run collects and polls them.
-type BidiTaskSender = tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>;
+struct PendingReverseUpdate {
+    id: u64,
+    forward: bool,
+    completion: tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+}
+
+#[derive(Clone, Copy)]
+struct RequestUpdateLimits {
+    incoming: u64,
+    outgoing: u64,
+}
+
+struct SessionConfig {
+    transport: Transport,
+    connection_path: Option<String>,
+    peer_max_request_updates: u64,
+}
+
+type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<BidiCommand>>>>;
+
+/// Channel for spawned bidi response reader tasks. Publisher/Subscriber send
+/// handles here; `Session::run` collects and polls them.
+///
+/// A wrapper is used instead of exposing Tokio's sender directly so a task
+/// raced against session shutdown is aborted even when the caller ignores the
+/// send error. Dropping a bare `JoinHandle` would detach the task.
+#[derive(Clone)]
+pub(super) struct BidiTaskSender(tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>);
+
+struct BidiTaskSendError(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for BidiTaskSendError {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl BidiTaskSendError {
+    async fn abort_and_wait(mut self) {
+        let Some(task) = self.0.take() else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Err(error) if !error.is_cancelled() => {
+                tracing::warn!(%error, "request-stream task failed while joining raced shutdown");
+            }
+            _ => {}
+        }
+    }
+}
+
+impl BidiTaskSender {
+    fn channel() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self(tx), rx)
+    }
+
+    fn send(&self, task: tokio::task::JoinHandle<()>) -> Result<(), BidiTaskSendError> {
+        self.0
+            .send(task)
+            .map_err(|error| BidiTaskSendError(Some(error.0)))
+    }
+}
+
+/// Process-wide and per-session admission limits for peer-opened data streams.
+///
+/// QUIC's transport stream limit controls how many streams the peer may have
+/// open on the wire, while this separate bound controls how many application
+/// futures we retain and poll.
+struct DataStreamTaskLimits {
+    global: Arc<tokio::sync::Semaphore>,
+    per_session: usize,
+}
+
+impl DataStreamTaskLimits {
+    fn production() -> Self {
+        Self {
+            global: GLOBAL_DATA_STREAM_TASKS.clone(),
+            per_session: Session::MAX_CONCURRENT_DATA_STREAMS_PER_SESSION,
+        }
+    }
+
+    fn try_admit(&self, active_for_session: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if active_for_session >= self.per_session {
+            return None;
+        }
+
+        self.global.clone().try_acquire_owned().ok()
+    }
+}
+
+static GLOBAL_DATA_STREAM_TASKS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(
+        Session::MAX_CONCURRENT_DATA_STREAMS_GLOBAL,
+    ))
+});
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
@@ -110,11 +221,24 @@ pub struct Session {
 
     /// Per-request-stream update concurrency advertised to the peer.
     max_request_updates: u64,
+
+    /// Maximum concurrent reverse-direction REQUEST_UPDATEs advertised by the peer.
+    peer_max_request_updates: u64,
 }
 
 impl Session {
     const MAX_CONNECTION_PATH_LEN: usize = 1024;
     const DEFAULT_MAX_REQUEST_UPDATES: u64 = 16;
+    pub(super) const REQUEST_STREAM_CANCELLED: u32 = 0x1;
+
+    /// Application-level bounds for peer-opened unidirectional data stream
+    /// handlers. These are deliberately independent from the negotiated QUIC
+    /// stream count so peer behavior cannot create an unbounded task set.
+    const MAX_CONCURRENT_DATA_STREAMS_PER_SESSION: usize = 256;
+    const MAX_CONCURRENT_DATA_STREAMS_GLOBAL: usize = 4096;
+
+    /// Draft-19 stream reset code used when data-stream admission is exhausted.
+    const DATA_STREAM_EXCESSIVE_LOAD: u32 = 0x9;
 
     /// Normalize and validate a connection path.
     ///
@@ -397,17 +521,16 @@ impl Session {
         sender: Writer,
         recver: Reader,
         mlog: Option<mlog::MlogWriter>,
-        transport: Transport,
-        connection_path: Option<String>,
         request_id: RequestId,
+        config: SessionConfig,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
 
-        let (bidi_task_tx, bidi_task_rx) =
-            tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
+        let (bidi_task_tx, bidi_task_rx) = BidiTaskSender::channel();
+        let bidi_response_map = Arc::new(Mutex::new(HashMap::new()));
 
         let publisher = Some(Publisher::new(
             outgoing.0.clone(),
@@ -415,6 +538,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             bidi_task_tx.clone(),
+            bidi_response_map.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
@@ -422,6 +546,7 @@ impl Session {
             mlog_shared.clone(),
             request_id.clone(),
             bidi_task_tx,
+            bidi_response_map.clone(),
         ));
 
         let session = Self {
@@ -433,11 +558,12 @@ impl Session {
             outgoing: outgoing.1,
             request_id,
             mlog: mlog_shared,
-            transport,
-            connection_path,
+            transport: config.transport,
+            connection_path: config.connection_path,
             bidi_task_rx,
-            bidi_response_map: Arc::new(Mutex::new(HashMap::new())),
+            bidi_response_map,
             max_request_updates: Self::DEFAULT_MAX_REQUEST_UPDATES,
+            peer_max_request_updates: config.peer_max_request_updates,
         };
 
         (session, publisher, subscriber)
@@ -519,7 +645,7 @@ impl Session {
         let recv_stream = session.accept_uni().await?;
         let mut recver = Reader::new(recv_stream);
         let server: setup::Setup = recver.decode().await?;
-        let _peer_max_request_updates = server.max_request_updates()?;
+        let peer_max_request_updates = server.max_request_updates()?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
@@ -529,7 +655,18 @@ impl Session {
 
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, 1);
-        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
+        let session = Session::new(
+            session,
+            sender,
+            recver,
+            mlog,
+            request_id,
+            SessionConfig {
+                transport,
+                connection_path: path,
+                peer_max_request_updates,
+            },
+        );
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -558,7 +695,7 @@ impl Session {
         let mut recver = Reader::new(recv_stream);
 
         let client: setup::Setup = recver.decode().await?;
-        let _peer_max_request_updates = client.max_request_updates()?;
+        let peer_max_request_updates = client.max_request_updates()?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
@@ -620,9 +757,12 @@ impl Session {
             sender,
             recver,
             mlog,
-            transport,
-            connection_path,
             request_id,
+            SessionConfig {
+                transport,
+                connection_path,
+                peer_max_request_updates,
+            },
         ))
     }
 
@@ -636,11 +776,10 @@ impl Session {
         let result = tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
-            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.max_request_updates) => res,
+            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone(), self.max_request_updates, self.peer_max_request_updates) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
             // Collect bidi reader task handles and poll them to completion.
-            // Dropping FuturesUnordered on session exit aborts all remaining tasks.
             () = async {
                 loop {
                     tokio::select! {
@@ -656,11 +795,38 @@ impl Session {
             } => Ok(()),
         };
 
-        // Dropping reader_tasks (FuturesUnordered<JoinHandle>) aborts all
-        // spawned bidi reader tasks — no explicit abort loop needed.
-        drop(reader_tasks);
+        Self::shutdown_bidi_tasks(&mut bidi_task_rx, &mut reader_tasks).await;
 
         result
+    }
+
+    /// Stop and join every request-stream task owned by the session.
+    ///
+    /// Closing the receiver first creates a linearization point with racing
+    /// senders: a send either completed before the close and is drained below,
+    /// or it fails and `BidiTaskSendError` aborts the returned handle. Every
+    /// handle accepted by this collector is explicitly awaited after abort so
+    /// no request-stream task can outlive `Session::run`.
+    async fn shutdown_bidi_tasks(
+        bidi_task_rx: &mut tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+        reader_tasks: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
+    ) {
+        bidi_task_rx.close();
+        while let Some(task) = bidi_task_rx.recv().await {
+            reader_tasks.push(task);
+        }
+
+        for task in reader_tasks.iter() {
+            task.abort();
+        }
+
+        while let Some(result) = reader_tasks.next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    tracing::warn!(%error, "request-stream task failed during session shutdown");
+                }
+            }
+        }
     }
 
     /// Processes the outgoing control message queue. Response messages targeting
@@ -710,7 +876,7 @@ impl Session {
                     .get(&target_id)
                     .cloned();
                 if let Some(tx) = tx_opt {
-                    if tx.send(msg).is_err() {
+                    if tx.send(BidiCommand::Send(msg)).is_err() {
                         tracing::warn!(target_id, "bidi response channel closed, dropping message");
                     }
                 } else {
@@ -743,6 +909,7 @@ impl Session {
         request_id: RequestId,
         bidi_response_map: BidiResponseMap,
         max_request_updates: u64,
+        peer_max_request_updates: u64,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
 
@@ -759,11 +926,19 @@ impl Session {
                         Self::handle_bidi_request(
                             send_stream, recv_stream,
                             &mut pub_clone, &mut sub_clone, &rid, &map,
-                            max_request_updates,
+                            RequestUpdateLimits {
+                                incoming: max_request_updates,
+                                outgoing: peer_max_request_updates,
+                            },
                         ).await
                     });
                 }
-                Some(result) = tasks.next() => result?,
+                Some(result) = tasks.next() => match result {
+                    Err(error) if error.is_request_stream_cancelled() => {
+                        tracing::debug!(%error, "peer cancelled request stream");
+                    }
+                    other => other?,
+                },
             }
         }
     }
@@ -778,7 +953,7 @@ impl Session {
         subscriber: &mut Option<Subscriber>,
         request_id: &RequestId,
         bidi_response_map: &BidiResponseMap,
-        max_request_updates: u64,
+        update_limits: RequestUpdateLimits,
     ) -> Result<(), SessionError> {
         let mut reader = Reader::new(recv_stream);
         let mut writer = Writer::new(send_stream);
@@ -794,7 +969,7 @@ impl Session {
 
         request_id.validate_incoming(initial_id)?;
 
-        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<BidiCommand>();
         bidi_response_map
             .lock()
             .map_err(|_| SessionError::Internal)?
@@ -838,12 +1013,19 @@ impl Session {
 
         let mut requester_open = true;
         let mut update_ids = std::collections::HashSet::new();
-        let mut update_credits = RequestUpdateCredits::new(max_request_updates);
+        let mut update_credits = RequestUpdateCredits::new(update_limits.incoming);
+        let mut reverse_updates: std::collections::VecDeque<PendingReverseUpdate> =
+            std::collections::VecDeque::new();
 
         let result = async {
             loop {
                 tokio::select! {
-                incoming = reader.decode_optional::<Message>(), if requester_open => {
+                incoming = Self::decode_requester_followup(
+                    &mut reader,
+                    initial_id,
+                    request_kind,
+                    reverse_updates.front().map(|update| update.id),
+                ), if requester_open => {
                     match incoming? {
                         Some(Message::RequestUpdate(update)) => {
                             if !request_kind.accepts_request_updates() {
@@ -880,6 +1062,43 @@ impl Session {
                                 break Err(error);
                             }
                         }
+                        Some(Message::PublishDone(done)) if request_kind == RequestKind::Publish => {
+                            let subscriber = subscriber
+                                .as_mut()
+                                .ok_or(SessionError::RoleViolation)?;
+                            subscriber.recv_message(message::Publisher::PublishDone(done))?;
+                            subscriber.await_publish_done_cleanup(initial_id).await;
+                            break Ok(());
+                        }
+                        Some(Message::RequestOk(ok)) if request_kind == RequestKind::Publish => {
+                            let Some(update) = reverse_updates.pop_front() else {
+                                break Err(SessionError::ProtocolViolation(
+                                    "PUBLISH requester sent REQUEST_OK without a pending reverse update"
+                                        .to_string(),
+                                ));
+                            };
+                            debug_assert_eq!(ok.id, update.id);
+                            Self::validate_response_for_request(request_kind, true, &Message::RequestOk(ok))?;
+                            let result = subscriber
+                                .as_mut()
+                                .ok_or(SessionError::RoleViolation)?
+                                .set_publish_forward(initial_id, update.forward);
+                            let completion_result = result.clone();
+                            let _ = update.completion.send(completion_result);
+                            result?;
+                        }
+                        Some(Message::RequestError(error)) if request_kind == RequestKind::Publish => {
+                            let Some(update) = reverse_updates.pop_front() else {
+                                break Err(SessionError::ProtocolViolation(
+                                    "PUBLISH requester sent REQUEST_ERROR without a pending reverse update"
+                                        .to_string(),
+                                ));
+                            };
+                            debug_assert_eq!(error.id, update.id);
+                            let _ = update.completion.send(Err(SessionError::Serve(
+                                crate::serve::ServeError::Closed(error.error_code),
+                            )));
+                        }
                         Some(other) => {
                             break Err(SessionError::ProtocolViolation(format!(
                                 "unexpected {} after first request-stream message",
@@ -897,9 +1116,38 @@ impl Session {
                         }
                     }
                 }
-                response = response_rx.recv() => {
-                    let Some(response) = response else {
+                command = response_rx.recv() => {
+                    let Some(command) = command else {
                         break Err(SessionError::Internal);
+                    };
+                    let response = match command {
+                        BidiCommand::Cancel(code) => {
+                            reader.stop(code);
+                            writer.reset(code);
+                            break Ok(());
+                        }
+                        BidiCommand::RequestUpdate { update, forward, completion } => {
+                            if request_kind != RequestKind::Publish {
+                                let _ = completion.send(Err(SessionError::ProtocolViolation(
+                                    "reverse REQUEST_UPDATE is only valid for PUBLISH".to_string(),
+                                )));
+                                continue;
+                            }
+                            if update_limits.outgoing != 0
+                                && reverse_updates.len() as u64 >= update_limits.outgoing
+                            {
+                                let _ = completion.send(Err(SessionError::TooManyRequestUpdates));
+                                continue;
+                            }
+                            writer.encode(&Message::RequestUpdate(update.clone())).await?;
+                            reverse_updates.push_back(PendingReverseUpdate {
+                                id: update.id,
+                                forward,
+                                completion,
+                            });
+                            continue;
+                        }
+                        BidiCommand::Send(response) => response,
                     };
                     let response_id = response.response_target_id().ok_or_else(|| {
                         SessionError::ProtocolViolation(format!(
@@ -945,12 +1193,76 @@ impl Session {
                 map.remove(&update_id);
             }
         }
+        for update in reverse_updates {
+            let _ = update
+                .completion
+                .send(Err(SessionError::Serve(crate::serve::ServeError::Cancel)));
+        }
+
+        if request_kind == RequestKind::Publish {
+            if let Err(error) = &result {
+                if let Some(subscriber) = subscriber.as_mut() {
+                    let serve_error = if error.is_request_stream_cancelled() {
+                        crate::serve::ServeError::Cancel
+                    } else {
+                        crate::serve::ServeError::internal_ctx(error.to_string())
+                    };
+                    subscriber.fail_publish_received(initial_id, serve_error);
+                }
+            }
+        }
 
         // Explicitly finish the stream and yield for Quinn to flush.
         writer.finish();
         tokio::task::yield_now().await;
 
         result
+    }
+
+    /// Decode a message sent after the first request-stream message.
+    ///
+    /// `PUBLISH_DONE` omits its Request ID because the request stream already
+    /// identifies the publication. Other requester-side follow-ups currently
+    /// use their regular encoding (`REQUEST_UPDATE` carries its own new ID).
+    async fn decode_requester_followup(
+        reader: &mut Reader,
+        initial_id: u64,
+        request_kind: RequestKind,
+        pending_reverse_update: Option<u64>,
+    ) -> Result<Option<Message>, SessionError> {
+        if request_kind == RequestKind::Publish {
+            if reader.done().await? {
+                return Ok(None);
+            }
+            let (msg_type, payload) = Self::read_bidi_frame(reader).await?;
+            let response_id =
+                Self::publish_followup_request_id(msg_type, initial_id, pending_reverse_update)?;
+            return Self::decode_bidi_response_payload(
+                msg_type,
+                payload,
+                response_id,
+                request_kind,
+            )
+            .map(Some);
+        }
+        reader.decode_optional::<Message>().await
+    }
+
+    fn publish_followup_request_id(
+        msg_type: u64,
+        initial_id: u64,
+        pending_reverse_update: Option<u64>,
+    ) -> Result<u64, SessionError> {
+        match msg_type {
+            message::wire_id::PublishDone => Ok(initial_id),
+            message::wire_id::RequestOk | message::wire_id::RequestError => pending_reverse_update
+                .ok_or_else(|| {
+                    SessionError::ProtocolViolation(
+                        "PUBLISH response arrived without a pending reverse update".to_string(),
+                    )
+                }),
+            _ => Ok(initial_id),
+        }
     }
 
     fn validate_response_for_request(
@@ -1075,13 +1387,15 @@ impl Session {
         request_id: u64,
         request_kind: RequestKind,
     ) -> Result<Message, SessionError> {
-        use crate::coding::{Decode, DecodeError, ReasonPhrase};
-        use bytes::Buf as _;
+        let (msg_type, payload) = Self::read_bidi_frame(reader).await?;
+        Self::decode_bidi_response_payload(msg_type, payload, request_id, request_kind)
+    }
 
+    async fn read_bidi_frame(reader: &mut Reader) -> Result<(u64, bytes::BytesMut), SessionError> {
+        use crate::coding::DecodeError;
         let msg_type: u64 = reader.decode().await?;
         let msg_len: u16 = reader.decode().await?;
-        let len = msg_len as usize;
-
+        let len = usize::from(msg_len);
         let mut payload = bytes::BytesMut::new();
         while payload.len() < len {
             let remaining = len - payload.len();
@@ -1090,6 +1404,17 @@ impl Session {
                 None => return Err(DecodeError::More(remaining).into()),
             }
         }
+        Ok((msg_type, payload))
+    }
+
+    fn decode_bidi_response_payload(
+        msg_type: u64,
+        payload: bytes::BytesMut,
+        request_id: u64,
+        request_kind: RequestKind,
+    ) -> Result<Message, SessionError> {
+        use crate::coding::{Decode, ReasonPhrase};
+        use bytes::Buf as _;
         let mut buf = &payload[..];
 
         use message::wire_id;
@@ -1174,6 +1499,42 @@ impl Session {
         }
         Self::validate_response_for_request(request_kind, false, &message)?;
         Ok(message)
+    }
+
+    pub(super) async fn decode_publish_response(
+        reader: &mut Reader,
+        request_id: u64,
+    ) -> Result<Message, SessionError> {
+        let (msg_type, payload) = Self::read_bidi_frame(reader).await?;
+        Self::decode_publish_response_payload(msg_type, payload, request_id)
+    }
+
+    fn decode_publish_response_payload(
+        msg_type: u64,
+        payload: bytes::BytesMut,
+        request_id: u64,
+    ) -> Result<Message, SessionError> {
+        use crate::coding::Decode;
+        use bytes::Buf as _;
+
+        if msg_type != message::wire_id::RequestUpdate {
+            return Self::decode_bidi_response_payload(
+                msg_type,
+                payload,
+                request_id,
+                RequestKind::Publish,
+            );
+        }
+
+        let mut body = &payload[..];
+        let update = message::RequestUpdate::decode(&mut body)?;
+        if body.has_remaining() {
+            return Err(SessionError::ProtocolViolation(format!(
+                "REQUEST_UPDATE left {} unparsed body bytes",
+                body.remaining()
+            )));
+        }
+        Ok(Message::RequestUpdate(update))
     }
 
     /// Receives inbound messages from the control stream reader/receiver.
@@ -1286,20 +1647,37 @@ impl Session {
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
+        let limits = DataStreamTaskLimits::production();
 
         loop {
             tokio::select! {
+                // Reap completed handlers before accepting more streams. This
+                // keeps normal streams progressing even under an excess-open
+                // flood from the peer.
+                biased;
+                _ = tasks.next(), if !tasks.is_empty() => {},
                 res = webtransport.accept_uni() => {
-                    let stream = res?;
+                    let mut stream = res?;
                     let subscriber = subscriber.clone().ok_or(SessionError::RoleViolation)?;
+                    let Some(global_permit) = limits.try_admit(tasks.len()) else {
+                        stream.stop(Self::DATA_STREAM_EXCESSIVE_LOAD);
+                        tracing::warn!(
+                            active_for_session = tasks.len(),
+                            per_session_limit = limits.per_session,
+                            global_available = limits.global.available_permits(),
+                            error_code = Self::DATA_STREAM_EXCESSIVE_LOAD,
+                            "rejecting peer data stream: handler capacity exhausted"
+                        );
+                        continue;
+                    };
 
                     tasks.push(async move {
+                        let _global_permit = global_permit;
                         if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
                             tracing::warn!("failed to serve stream: {}", err);
                         };
                     });
                 },
-                _ = tasks.next(), if !tasks.is_empty() => {},
             };
         }
     }
@@ -1323,6 +1701,23 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TaskDropCounter(Arc<AtomicUsize>);
+
+    impl Drop for TaskDropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_task(dropped: Arc<AtomicUsize>) -> tokio::task::JoinHandle<()> {
+        let drop_counter = TaskDropCounter(dropped);
+        tokio::spawn(async move {
+            let _drop_counter = drop_counter;
+            futures::future::pending::<()>().await;
+        })
+    }
 
     // ========================================================================
     // normalize_connection_path
@@ -1392,6 +1787,89 @@ mod tests {
         // Exactly at the limit (1024 total including leading slash)
         let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
         assert!(Session::normalize_connection_path(&path).is_ok());
+    }
+
+    // ========================================================================
+    // task admission and shutdown
+    // ========================================================================
+
+    #[test]
+    fn data_stream_admission_enforces_per_session_and_global_limits() {
+        let per_session = DataStreamTaskLimits {
+            global: Arc::new(tokio::sync::Semaphore::new(8)),
+            per_session: 1,
+        };
+        let permit = per_session.try_admit(0).expect("first stream admitted");
+        assert!(per_session.try_admit(1).is_none());
+        drop(permit);
+
+        let global = Arc::new(tokio::sync::Semaphore::new(2));
+        let first_session = DataStreamTaskLimits {
+            global: global.clone(),
+            per_session: 8,
+        };
+        let second_session = DataStreamTaskLimits {
+            global,
+            per_session: 8,
+        };
+        let first = first_session.try_admit(0).expect("first global permit");
+        let second = second_session.try_admit(0).expect("second global permit");
+        assert!(first_session.try_admit(1).is_none());
+        drop(first);
+        assert!(first_session.try_admit(1).is_some());
+        drop(second);
+
+        assert_eq!(Session::DATA_STREAM_EXCESSIVE_LOAD, 0x9);
+    }
+
+    #[tokio::test]
+    async fn bidi_task_shutdown_drains_aborts_and_awaits_all_accepted_handles() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (sender, mut receiver) = BidiTaskSender::channel();
+        let mut collected = FuturesUnordered::new();
+
+        collected.push(pending_task(dropped.clone()));
+        assert!(sender.send(pending_task(dropped.clone())).is_ok());
+        assert!(sender.send(pending_task(dropped.clone())).is_ok());
+
+        Session::shutdown_bidi_tasks(&mut receiver, &mut collected).await;
+
+        assert!(collected.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert!(receiver.is_closed());
+    }
+
+    #[tokio::test]
+    async fn bidi_task_sender_aborts_handle_raced_after_collector_close() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (sender, mut receiver) = BidiTaskSender::channel();
+        receiver.close();
+
+        let result = sender.send(pending_task(dropped.clone()));
+        assert!(result.is_err());
+        drop(result);
+
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bidi_task_send_error_can_abort_and_join_raced_handle() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (sender, mut receiver) = BidiTaskSender::channel();
+        receiver.close();
+
+        let Err(error) = sender.send(pending_task(dropped.clone())) else {
+            panic!("closed task collector accepted a handle");
+        };
+        error.abort_and_wait().await;
+
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     // ========================================================================
@@ -1551,5 +2029,41 @@ mod tests {
             !bytes.contains(&88),
             "Request ID must not appear in bidi encoding"
         );
+    }
+
+    #[test]
+    fn publish_followups_keep_terminal_and_update_response_associations_distinct() {
+        assert_eq!(
+            Session::publish_followup_request_id(message::wire_id::PublishDone, 10, Some(12))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            Session::publish_followup_request_id(message::wire_id::RequestOk, 10, Some(12))
+                .unwrap(),
+            12
+        );
+        assert!(matches!(
+            Session::publish_followup_request_id(message::wire_id::RequestError, 10, None),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+    }
+
+    #[test]
+    fn publish_response_direction_decodes_full_request_update_id_and_forward() {
+        let mut params = KeyValuePairs::default();
+        params.set_forward(false);
+        let update = message::RequestUpdate { id: 14, params };
+        let mut payload = bytes::BytesMut::new();
+        update.encode(&mut payload).unwrap();
+
+        let decoded =
+            Session::decode_publish_response_payload(message::wire_id::RequestUpdate, payload, 10)
+                .unwrap();
+        let Message::RequestUpdate(decoded) = decoded else {
+            panic!("expected REQUEST_UPDATE");
+        };
+        assert_eq!(decoded.id, 14);
+        assert_eq!(decoded.params.forward().unwrap(), Some(false));
     }
 }

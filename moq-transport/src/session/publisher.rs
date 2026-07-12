@@ -10,19 +10,26 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-    coding::TrackNamespace,
+    coding::{KeyValuePairs, TrackNamespace},
     message::{self, Message},
     mlog,
-    serve::{FullTrackName, ServeError, TracksReader},
+    serve::{ServeError, TrackReader, TracksReader},
 };
 
 use crate::watch::Queue;
 
 use super::{
-    PublishNamespace, PublishNamespaceRecv, RequestId, Session, SessionError, Subscribed,
-    SubscribedRecv, TrackStatusRequested,
+    BidiCommand, BidiResponseMap, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
+    RequestId, RequestUpdateCredits, Session, SessionError, Subscribed, SubscribedRecv,
+    TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
+
+enum PublishRequestStreamEvent {
+    Response(Result<Option<Message>, SessionError>),
+    Command(Option<BidiCommand>),
+    SendStopped(Result<Option<u8>, SessionError>),
+}
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -36,8 +43,8 @@ pub struct Publisher {
     /// subscription is routed to that PublishNamespaceRecv.  Otherwise it goes here.
     subscribeds: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
 
-    /// Active inbound SUBSCRIBEs keyed by Full Track Name.
-    subscribed_names: Arc<Mutex<HashMap<FullTrackName, u64>>>,
+    /// Active outbound PUBLISH requests keyed by request ID.
+    published: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
 
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
@@ -61,27 +68,33 @@ pub struct Publisher {
 
     /// Channel for sending spawned bidi reader task handles to Session::run.
     bidi_task_tx: super::BidiTaskSender,
+
+    /// Request-stream writers used to deliver PUBLISH_DONE on the same bidi
+    /// stream as the original outbound PUBLISH.
+    bidi_response_map: BidiResponseMap,
 }
 
 impl Publisher {
-    pub(crate) fn new(
+    pub(super) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         bidi_task_tx: super::BidiTaskSender,
+        bidi_response_map: BidiResponseMap,
     ) -> Self {
         Self {
             webtransport,
             publish_namespaces: Default::default(),
             subscribeds: Default::default(),
-            subscribed_names: Default::default(),
+            published: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
             outgoing,
             request_id,
             mlog,
             bidi_task_tx,
+            bidi_response_map,
         }
     }
 
@@ -176,7 +189,13 @@ impl Publisher {
                 }
             }
         });
-        let _ = self.bidi_task_tx.send(handle);
+        if let Err(error) = self.bidi_task_tx.send(handle) {
+            error.abort_and_wait().await;
+            if let Ok(mut namespaces) = self.publish_namespaces.lock() {
+                namespaces.remove(&tracks.namespace);
+            }
+            return Err(SessionError::Internal);
+        }
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();
@@ -225,6 +244,304 @@ impl Publisher {
                 Some(res) = status_tasks.next() => res,
                 else => return Ok(()),
             }
+        }
+    }
+
+    /// Publish one exact track and serve it until the track or peer closes.
+    pub async fn publish(&mut self, track: TrackReader) -> Result<(), SessionError> {
+        self.publish_open(track).await?.serve().await
+    }
+
+    /// Open a publisher-initiated subscription for one exact track.
+    ///
+    /// The returned handle owns the track and retains the request-stream send
+    /// direction until it writes `PUBLISH_DONE` and FIN, as required by
+    /// draft-19.
+    pub async fn publish_open(&mut self, track: TrackReader) -> Result<Published, SessionError> {
+        let request_id = self.request_id.allocate()?;
+        // Request IDs are unique across both roles in a session; using the ID
+        // as the alias therefore cannot collide with aliases assigned to
+        // inbound SUBSCRIBE requests (which use the peer's opposite parity).
+        let track_alias = request_id;
+        let largest_location = track.largest_location();
+        let mut params = KeyValuePairs::default();
+        params.set_forward(true);
+        if let Some(largest) = largest_location {
+            params.set_largest_object(largest)?;
+        }
+        let publish = message::Publish {
+            id: request_id,
+            track_namespace: track.namespace.clone(),
+            track_name: track.name.clone(),
+            track_alias,
+            params,
+            track_extensions: Default::default(),
+        };
+        let (subscription, recv) =
+            Subscribed::new_published(self.clone(), &publish, self.mlog.clone())?;
+        self.published
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(request_id, recv);
+
+        let (send_stream, recv_stream) = match self.webtransport.open_bi().await {
+            Ok(streams) => streams,
+            Err(err) => {
+                self.reject_published_locally(
+                    request_id,
+                    ServeError::internal_ctx(err.to_string()),
+                );
+                return Err(err.into());
+            }
+        };
+        let mut writer = super::Writer::new(send_stream);
+        if let Err(err) = writer.encode(&Message::Publish(publish.clone())).await {
+            self.reject_published_locally(
+                request_id,
+                ServeError::internal_ctx("failed to write PUBLISH request"),
+            );
+            return Err(err);
+        }
+
+        let (terminal_tx, terminal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let previous = self
+            .bidi_response_map
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(request_id, terminal_tx);
+        if previous.is_some() {
+            self.reject_published_locally(request_id, ServeError::Duplicate);
+            return Err(SessionError::InvalidRequestId);
+        }
+
+        let mut this = self.clone();
+        let map = self.bidi_response_map.clone();
+        let handle = tokio::spawn(async move {
+            let result = Self::run_publish_request_stream(
+                request_id,
+                writer,
+                super::Reader::new(recv_stream),
+                terminal_rx,
+                &mut this,
+            )
+            .await;
+            if let Ok(mut responses) = map.lock() {
+                responses.remove(&request_id);
+            }
+            if let Err(err) = result {
+                tracing::warn!(request_id, error = %err, "outbound PUBLISH request stream failed");
+                let serve_error = if err.is_request_stream_cancelled() {
+                    ServeError::Cancel
+                } else {
+                    ServeError::internal_ctx(err.to_string())
+                };
+                this.reject_published_locally(request_id, serve_error);
+            }
+        });
+        if let Err(error) = self.bidi_task_tx.send(handle) {
+            error.abort_and_wait().await;
+            self.bidi_response_map
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .remove(&request_id);
+            self.reject_published_locally(
+                request_id,
+                ServeError::internal_ctx("session request task collector closed"),
+            );
+            return Err(SessionError::Internal);
+        }
+
+        let info = PublishedInfo {
+            id: request_id,
+            track_namespace: publish.track_namespace,
+            track_name: publish.track_name,
+            track_alias,
+            largest_location,
+        };
+        Ok(Published::new(subscription, track, info))
+    }
+
+    async fn run_publish_request_stream(
+        request_id: u64,
+        mut writer: super::Writer,
+        mut reader: super::Reader,
+        mut terminal_rx: tokio::sync::mpsc::UnboundedReceiver<BidiCommand>,
+        publisher: &mut Publisher,
+    ) -> Result<(), SessionError> {
+        let mut response_open = true;
+        let mut accepted = false;
+        let mut update_credits = RequestUpdateCredits::new(Session::DEFAULT_MAX_REQUEST_UPDATES);
+
+        loop {
+            let event = tokio::select! {
+                response = async {
+                    if response_open {
+                        if reader.done().await? {
+                            return Ok(None);
+                        }
+                        Session::decode_publish_response(&mut reader, request_id)
+                            .await
+                            .map(Some)
+                    } else {
+                        std::future::pending::<Result<Option<Message>, SessionError>>().await
+                    }
+                } => PublishRequestStreamEvent::Response(response),
+                command = terminal_rx.recv() => PublishRequestStreamEvent::Command(command),
+                stopped = writer.stopped() => PublishRequestStreamEvent::SendStopped(stopped),
+            };
+
+            match event {
+                PublishRequestStreamEvent::Response(response) => match response? {
+                    Some(Message::RequestOk(ok)) if !accepted => {
+                        publisher.recv_message(message::Subscriber::RequestOk(ok))?;
+                        accepted = true;
+                    }
+                    Some(Message::RequestError(error)) if !accepted => {
+                        publisher.recv_message(message::Subscriber::RequestError(error))?;
+                        writer.finish();
+                        tokio::task::yield_now().await;
+                        return Ok(());
+                    }
+                    Some(Message::RequestUpdate(update)) if accepted => {
+                        publisher.request_id.validate_incoming(update.id)?;
+                        update_credits.receive()?;
+                        let apply = publisher.apply_publish_update(request_id, &update);
+                        let response = match &apply {
+                            Ok(()) => Message::RequestOk(message::RequestOk {
+                                id: update.id,
+                                params: Default::default(),
+                                track_properties: Default::default(),
+                            }),
+                            Err(error) => Message::RequestError(message::RequestError {
+                                id: update.id,
+                                error_code: RequestErrorCode::NotSupported as u64,
+                                retry_interval: 0,
+                                reason: crate::coding::ReasonPhrase(error.to_string()),
+                                redirect: None,
+                            }),
+                        };
+                        Session::encode_bidi_response(&mut writer, &response).await?;
+                        update_credits.respond();
+                        if let Err(error) = apply {
+                            let mut published = publisher
+                                    .drop_published(request_id)
+                                    .ok_or_else(|| {
+                                        SessionError::ProtocolViolation(format!(
+                                            "failed update targeted inactive PUBLISH request {request_id}"
+                                        ))
+                                    })?;
+                            published.recv_update_failed()?;
+                            tracing::debug!(
+                                request_id,
+                                error = %error,
+                                "waiting for PUBLISH media streams before UPDATE_FAILED terminal"
+                            );
+                        }
+                    }
+                    Some(other) => {
+                        return Err(SessionError::ProtocolViolation(format!(
+                            "unexpected {} on outbound PUBLISH response direction",
+                            other.name()
+                        )));
+                    }
+                    None if accepted => response_open = false,
+                    None => {
+                        return Err(SessionError::ProtocolViolation(
+                            "PUBLISH response direction closed before REQUEST_OK or REQUEST_ERROR"
+                                .to_string(),
+                        ));
+                    }
+                },
+                PublishRequestStreamEvent::Command(command) => {
+                    let command = command.ok_or(SessionError::Internal)?;
+                    let BidiCommand::Send(terminal) = command else {
+                        if let BidiCommand::Cancel(code) = command {
+                            writer.reset(code);
+                            reader.stop(code);
+                            return Ok(());
+                        }
+                        return Err(SessionError::ProtocolViolation(
+                            "local reverse REQUEST_UPDATE was routed to an outbound PUBLISH"
+                                .to_string(),
+                        ));
+                    };
+                    if !matches!(terminal, Message::PublishDone(_)) {
+                        return Err(SessionError::ProtocolViolation(format!(
+                            "{} cannot terminate an outbound PUBLISH request",
+                            terminal.name()
+                        )));
+                    }
+                    Session::encode_bidi_response(&mut writer, &terminal).await?;
+                    writer.finish();
+                    tokio::task::yield_now().await;
+                    return Ok(());
+                }
+                PublishRequestStreamEvent::SendStopped(stopped) => {
+                    match stopped? {
+                        Some(code) => {
+                            tracing::debug!(
+                                request_id,
+                                stop_code = code,
+                                "peer cancelled outbound PUBLISH with STOP_SENDING"
+                            );
+                        }
+                        None => {
+                            tracing::debug!(
+                                request_id,
+                                "outbound PUBLISH send direction closed before terminal"
+                            );
+                        }
+                    }
+                    publisher.reject_published_locally(request_id, ServeError::Cancel);
+                    reader.stop(Session::REQUEST_STREAM_CANCELLED);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    pub(super) fn cancel_request_stream(&mut self, id: u64, code: u32) {
+        let command = self
+            .bidi_response_map
+            .lock()
+            .ok()
+            .and_then(|streams| streams.get(&id).cloned());
+        if let Some(command) = command {
+            let _ = command.send(BidiCommand::Cancel(code));
+        }
+        if let Some(mut published) = self.drop_published(id) {
+            let _ = published.recv_error(ServeError::Cancel);
+        }
+    }
+
+    fn apply_publish_update(
+        &mut self,
+        id: u64,
+        update: &message::RequestUpdate,
+    ) -> Result<(), SessionError> {
+        if update.params.0.iter().any(|pair| pair.key != 0x10) {
+            return Err(SessionError::ProtocolViolation(
+                "PUBLISH REQUEST_UPDATE contained unsupported parameters".to_string(),
+            ));
+        }
+        let forward = update.params.forward()?.ok_or_else(|| {
+            SessionError::ProtocolViolation(
+                "PUBLISH REQUEST_UPDATE omitted the FORWARD parameter".to_string(),
+            )
+        })?;
+        let mut published = self.published.lock().map_err(|_| SessionError::Internal)?;
+        let recv = published.get_mut(&id).ok_or_else(|| {
+            SessionError::ProtocolViolation(format!(
+                "REQUEST_UPDATE targeted inactive PUBLISH request {id}"
+            ))
+        })?;
+        recv.recv_forward_update(forward)?;
+        Ok(())
+    }
+
+    fn reject_published_locally(&mut self, id: u64, err: ServeError) {
+        if let Some(mut published) = self.drop_published(id) {
+            let _ = published.recv_error(err);
         }
     }
 
@@ -324,9 +641,17 @@ impl Publisher {
                 ));
             }
             // Draft-16: REQUEST_OK from subscriber is acceptance of PUBLISH_NAMESPACE.
-            message::Subscriber::RequestOk(msg) => self.recv_publish_namespace_ok(msg)?,
+            message::Subscriber::RequestOk(msg) => {
+                if !self.recv_publish_ok(&msg)? {
+                    self.recv_publish_namespace_ok(msg)?;
+                }
+            }
             // Draft-16: REQUEST_ERROR from subscriber is rejection of PUBLISH_NAMESPACE.
-            message::Subscriber::RequestError(msg) => self.recv_publish_namespace_error(msg)?,
+            message::Subscriber::RequestError(msg) => {
+                if !self.recv_publish_error(&msg)? {
+                    self.recv_publish_namespace_error(msg)?;
+                }
+            }
             // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::Fetch(msg) => {
                 self.send_not_supported(msg.id, "fetch");
@@ -413,6 +738,25 @@ impl Publisher {
         Ok(())
     }
 
+    fn recv_publish_ok(&mut self, msg: &message::RequestOk) -> Result<bool, SessionError> {
+        let mut published = self.published.lock().map_err(|_| SessionError::Internal)?;
+        let Some(recv) = published.get_mut(&msg.id) else {
+            return Ok(false);
+        };
+        self.log_request_ok_parsed("publish", msg);
+        recv.recv_publish_ok(msg)?;
+        Ok(true)
+    }
+
+    fn recv_publish_error(&mut self, msg: &message::RequestError) -> Result<bool, SessionError> {
+        let Some(mut recv) = self.drop_published(msg.id) else {
+            return Ok(false);
+        };
+        self.log_request_error_parsed("publish", msg);
+        recv.recv_error(ServeError::Closed(msg.error_code))?;
+        Ok(true)
+    }
+
     /// Handle REQUEST_ERROR from subscriber — rejection of our PUBLISH_NAMESPACE (draft-16 §9.8).
     fn recv_publish_namespace_error(
         &mut self,
@@ -427,10 +771,6 @@ impl Publisher {
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
-        let full_name = FullTrackName {
-            namespace: msg.track_namespace.clone(),
-            name: msg.track_name.clone(),
-        };
 
         let subscribed = {
             let mut subscribeds = self
@@ -439,46 +779,10 @@ impl Publisher {
                 .map_err(|_| SessionError::Internal)?;
 
             if subscribeds.contains_key(&msg.id) {
-                let id = msg.id;
-                drop(subscribeds);
-                // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
-                // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
-                self.send_request_error(
-                    "subscribe",
-                    message::RequestError {
-                        id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                        redirect: None,
-                    },
-                );
-                return Ok(());
-            }
-
-            let mut subscribed_names = self
-                .subscribed_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_key(&full_name) {
-                let id = msg.id;
-                drop(subscribed_names);
-                drop(subscribeds);
-                self.send_request_error(
-                    "subscribe",
-                    message::RequestError {
-                        id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
-                        redirect: None,
-                    },
-                );
-                return Ok(());
+                return Err(SessionError::InvalidRequestId);
             }
 
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
-            subscribed_names.insert(full_name, send.info.id);
             subscribeds.insert(send.info.id, recv);
 
             send
@@ -539,6 +843,7 @@ impl Publisher {
         let msg = msg.into();
         if let message::Publisher::PublishDone(m) = &msg {
             self.drop_subscribe(m.id);
+            self.drop_published(m.id);
         }
         msg
     }
@@ -570,18 +875,6 @@ impl Publisher {
             .lock()
             .map_err(|_| SessionError::Internal)?
             .remove(&id);
-        Self::drop_subscribed_name(&self.subscribed_names, id)
-    }
-
-    fn drop_subscribed_name(
-        subscribed_names: &Arc<Mutex<HashMap<FullTrackName, u64>>>,
-        id: u64,
-    ) -> Result<(), SessionError> {
-        subscribed_names
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .retain(|_, request_id| *request_id != id);
-
         Ok(())
     }
 
@@ -598,52 +891,15 @@ impl Publisher {
         None
     }
 
+    pub(super) fn drop_published(&mut self, id: u64) -> Option<SubscribedRecv> {
+        self.published.lock().ok()?.remove(&id)
+    }
+
     pub(super) async fn open_uni(&mut self) -> Result<web_transport::SendStream, SessionError> {
         Ok(self.webtransport.open_uni().await?)
     }
 
     pub(super) async fn send_datagram(&mut self, data: bytes::Bytes) -> Result<(), SessionError> {
         Ok(self.webtransport.send_datagram(data).await?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
-
-    use crate::{
-        coding::{TrackName, TrackNamespace},
-        serve::FullTrackName,
-    };
-
-    use super::Publisher;
-
-    fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
-        FullTrackName {
-            namespace: TrackNamespace::from_utf8_path(namespace),
-            name: TrackName::from(name),
-        }
-    }
-
-    #[test]
-    fn drop_subscribed_name_removes_only_matching_request_id() {
-        let subscribed_names = Arc::new(Mutex::new(HashMap::new()));
-        let unsubscribed_track = full_track_name("bb1", "video.m4s");
-        let active_track = full_track_name("bb1", "audio.m4s");
-
-        {
-            let mut names = subscribed_names.lock().unwrap();
-            names.insert(unsubscribed_track.clone(), 6);
-            names.insert(active_track.clone(), 8);
-        }
-
-        Publisher::drop_subscribed_name(&subscribed_names, 6).unwrap();
-
-        let names = subscribed_names.lock().unwrap();
-        assert!(!names.contains_key(&unsubscribed_track));
-        assert_eq!(names.get(&active_track), Some(&8));
     }
 }

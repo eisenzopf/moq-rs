@@ -146,4 +146,9 @@ impl Reader {
 
         Ok(self.stream.read_buf(&mut self.buffer).await?.is_none())
     }
+
+    /// Cancel this receive direction with STOP_SENDING.
+    pub fn stop(&mut self, code: u32) {
+        self.stream.stop(code);
+    }
 }

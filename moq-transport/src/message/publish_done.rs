@@ -3,7 +3,7 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, ReasonPhrase};
 
-/// Draft-16 §13.4.3 PUBLISH_DONE codes.
+/// Draft-19 PUBLISH_DONE codes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 pub enum PublishDoneCode {
@@ -12,9 +12,10 @@ pub enum PublishDoneCode {
     TrackEnded = 0x2,
     SubscriptionEnded = 0x3,
     GoingAway = 0x4,
-    Expired = 0x5,
-    TooFarBehind = 0x6,
+    TooFarBehind = 0x5,
+    Expired = 0x6,
     UpdateFailed = 0x8,
+    ExcessiveLoad = 0x9,
     MalformedTrack = 0x12,
 }
 
@@ -85,5 +86,13 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = PublishDone::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn draft_19_status_code_assignments_are_stable() {
+        assert_eq!(PublishDoneCode::TrackEnded as u64, 0x2);
+        assert_eq!(PublishDoneCode::TooFarBehind as u64, 0x5);
+        assert_eq!(PublishDoneCode::Expired as u64, 0x6);
+        assert_eq!(PublishDoneCode::ExcessiveLoad as u64, 0x9);
     }
 }

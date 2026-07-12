@@ -22,12 +22,27 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session, SessionError,
-    Subscribe, SubscribeRecv, Writer,
+    BidiCommand, BidiResponseMap, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe, SubscribeRecv,
+    Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
+const MAX_STREAMS_PER_PUBLICATION: u64 = 64;
+const PUBLISH_DONE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AliasBinding {
+    Subscribe(u64),
+    Publish(u64),
+}
+
+#[derive(Clone, Debug)]
+struct AliasEntry {
+    full_name: serve::FullTrackName,
+    bindings: Vec<AliasBinding>,
+}
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -41,11 +56,18 @@ pub struct Subscriber {
     /// The currently active outbound subscribes, keyed by request id.
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
 
-    /// Map of track alias to subscription id for quick lookup when receiving streams/datagrams.
-    subscribe_alias_map: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Session-scoped aliases. One alias may fan out to multiple requests only
+    /// when every request names the exact same track.
+    alias_map: Arc<Mutex<HashMap<u64, AliasEntry>>>,
 
     /// Notify when subscribe alias map is updated
     subscribe_alias_notify: Arc<Notify>,
+
+    /// Active inbound PUBLISH requests, keyed by request ID.
+    publishes_received: Arc<Mutex<HashMap<u64, PublishReceivedRecv>>>,
+
+    /// Inbound publications waiting for application policy and registration.
+    publish_received_queue: Queue<PublishReceived>,
 
     /// The queue we will write any outbound control messages we want to send, the session run_send task
     /// will process the queue and send the message on the control stream.
@@ -67,6 +89,9 @@ pub struct Subscriber {
 
     /// Channel for sending spawned bidi reader task handles to Session::run.
     bidi_task_tx: super::BidiTaskSender,
+
+    /// Request-stream command channels, used for cancellation and reverse updates.
+    bidi_response_map: BidiResponseMap,
 }
 
 impl Subscriber {
@@ -76,19 +101,87 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         bidi_task_tx: super::BidiTaskSender,
+        bidi_response_map: BidiResponseMap,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
             published_namespace_queue: Default::default(),
             subscribes: Default::default(),
-            subscribe_alias_map: Default::default(),
+            alias_map: Default::default(),
+            publishes_received: Default::default(),
+            publish_received_queue: Default::default(),
             outgoing,
             webtransport,
             request_id,
             mlog,
             subscribe_alias_notify: Arc::new(Notify::new()),
             bidi_task_tx,
+            bidi_response_map,
         }
+    }
+
+    pub(super) fn cancel_publish_received(&mut self, request_id: u64, code: u32) {
+        self.fail_publish_received(request_id, ServeError::Cancel);
+        let command = self
+            .bidi_response_map
+            .lock()
+            .ok()
+            .and_then(|streams| streams.get(&request_id).cloned());
+        if let Some(command) = command {
+            let _ = command.send(BidiCommand::Cancel(code));
+        }
+    }
+
+    pub(super) async fn update_publish_received(
+        &mut self,
+        request_id: u64,
+        forward: bool,
+    ) -> Result<(), SessionError> {
+        let update_id = self.request_id.allocate()?;
+        let mut params = crate::coding::KeyValuePairs::default();
+        params.set_forward(forward);
+        let update = message::RequestUpdate {
+            id: update_id,
+            params,
+        };
+        let command = self
+            .bidi_response_map
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "PUBLISH request stream {request_id} is no longer active"
+                ))
+            })?;
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        command
+            .send(BidiCommand::RequestUpdate {
+                update,
+                forward,
+                completion,
+            })
+            .map_err(|_| SessionError::Internal)?;
+        completed.await.map_err(|_| SessionError::Internal)?
+    }
+
+    pub(super) fn set_publish_forward(
+        &mut self,
+        request_id: u64,
+        forward: bool,
+    ) -> Result<(), SessionError> {
+        let mut publishes = self
+            .publishes_received
+            .lock()
+            .map_err(|_| SessionError::Internal)?;
+        let publish = publishes.get_mut(&request_id).ok_or_else(|| {
+            SessionError::ProtocolViolation(format!(
+                "PUBLISH request stream {request_id} is no longer active"
+            ))
+        })?;
+        publish.set_forward(forward);
+        Ok(())
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
@@ -112,6 +205,11 @@ impl Subscriber {
     /// Wait for the next inbound PUBLISH_NAMESPACE from the peer, if any.
     pub async fn published_namespace(&mut self) -> Option<PublishedNamespace> {
         self.published_namespace_queue.pop().await
+    }
+
+    /// Wait for an inbound publisher-initiated subscription.
+    pub async fn publish_received(&mut self) -> Option<PublishReceived> {
+        self.publish_received_queue.pop().await
     }
 
     fn add_mlog_event<F>(&self, make_event: F)
@@ -252,7 +350,13 @@ impl Subscriber {
                 }
             }
         });
-        let _ = self.bidi_task_tx.send(handle);
+        if let Err(error) = self.bidi_task_tx.send(handle) {
+            error.abort_and_wait().await;
+            self.remove_subscribe(request_id);
+            return Err(ServeError::internal_ctx(
+                "session request task collector closed",
+            ));
+        }
 
         send.ok().await?;
         Ok(send)
@@ -270,11 +374,7 @@ impl Subscriber {
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         match &msg {
             message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,
-            // PUBLISH (publisher-initiated subscription) not yet implemented.
-            // Send REQUEST_ERROR NOT_SUPPORTED so the publisher knows we cannot accept it.
-            message::Publisher::Publish(msg) => {
-                self.send_not_supported(msg.id, "publish");
-            }
+            message::Publisher::Publish(msg) => self.recv_publish(msg)?,
             message::Publisher::RequestUpdate(_) => {
                 return Err(SessionError::ProtocolViolation(
                     "REQUEST_UPDATE was not associated with a request stream".to_string(),
@@ -375,24 +475,30 @@ impl Subscriber {
 
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
-        if let Some(subscribe) = self
+        let full_name = self
+            .subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&msg.id)
+            .map(SubscribeRecv::full_name);
+        let Some(full_name) = full_name else {
+            return Ok(());
+        };
+
+        self.register_alias(msg.track_alias, full_name, AliasBinding::Subscribe(msg.id))?;
+        let result = self
             .subscribes
             .lock()
             .map_err(|_| SessionError::Internal)?
             .get_mut(&msg.id)
-        {
-            // Map track alias to subscription id for quick lookup when receiving streams/datagrams
-            self.subscribe_alias_map
-                .lock()
-                .map_err(|_| SessionError::Internal)?
-                .insert(msg.track_alias, msg.id);
-
-            // Notify waiting tasks that the alias map has been updated
-            self.subscribe_alias_notify.notify_waiters();
-
-            // Notify the subscribe of the successful subscription
-            subscribe.ok(msg.track_alias)?;
+            .ok_or(SessionError::Internal)?
+            .ok(msg);
+        if let Err(err) = result {
+            self.unregister_alias_binding(msg.track_alias, AliasBinding::Subscribe(msg.id));
+            return Err(err.into());
         }
+
+        self.subscribe_alias_notify.notify_waiters();
 
         Ok(())
     }
@@ -402,21 +508,126 @@ impl Subscriber {
         let subscribe = self.subscribes.lock().ok().and_then(|mut s| s.remove(&id));
         if let Some(ref sub) = subscribe {
             if let Some(track_alias) = sub.track_alias() {
-                if let Ok(mut alias_map) = self.subscribe_alias_map.lock() {
-                    alias_map.remove(&track_alias);
-                }
+                self.unregister_alias_binding(track_alias, AliasBinding::Subscribe(id));
             }
         }
         subscribe
     }
 
+    fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
+        // The serve model cannot yet retain Track Properties. Rejecting them
+        // avoids silently stripping relay-visible metadata.
+        if !msg.track_extensions.is_empty() {
+            self.send_request_error(
+                "publish",
+                message::RequestError {
+                    id: msg.id,
+                    error_code: message::RequestErrorCode::NotSupported as u64,
+                    retry_interval: 0,
+                    reason: crate::coding::ReasonPhrase(
+                        "track properties are not supported by this media model".to_string(),
+                    ),
+                    redirect: None,
+                },
+            );
+            return Ok(());
+        }
+
+        let initial_forward = msg.params.forward()?.unwrap_or(true);
+        let largest_location = msg.params.largest_object()?;
+        let publish = {
+            let mut publications = self
+                .publishes_received
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if publications.contains_key(&msg.id) {
+                return Err(SessionError::InvalidRequestId);
+            }
+
+            let (writer, reader) =
+                serve::Track::new(msg.track_namespace.clone(), msg.track_name.clone()).produce();
+            let (publish, recv) = PublishReceivedRecv::produce(
+                self.clone(),
+                msg.id,
+                msg.track_alias,
+                msg.track_namespace.clone(),
+                msg.track_name.clone(),
+                initial_forward,
+                largest_location,
+                writer,
+                reader,
+            );
+            self.register_alias(
+                msg.track_alias,
+                recv.full_name(),
+                AliasBinding::Publish(msg.id),
+            )?;
+            publications.insert(msg.id, recv);
+            publish
+        };
+
+        self.subscribe_alias_notify.notify_waiters();
+
+        if let Err(publish) = self.publish_received_queue.push(publish) {
+            drop(publish);
+        }
+        Ok(())
+    }
+
     /// Handle the reception of a PublishDone message from the publisher.
     fn recv_publish_done(&mut self, msg: &message::PublishDone) -> Result<(), SessionError> {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
-            subscribe.error(ServeError::Closed(msg.status_code))?;
+            let result = if msg.status_code == message::PublishDoneCode::TrackEnded as u64 {
+                ServeError::Done
+            } else {
+                ServeError::Closed(msg.status_code)
+            };
+            subscribe.error(result)?;
+            return Ok(());
+        }
+
+        let complete = {
+            let mut publications = self
+                .publishes_received
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            match publications.get_mut(&msg.id) {
+                Some(publish) => publish.recv_done(msg.status_code, msg.stream_count)?,
+                None => false,
+            }
+        };
+        if complete {
+            self.remove_publish_received(msg.id);
         }
 
         Ok(())
+    }
+
+    /// Keep the supervised request-stream task alive until every stream
+    /// declared by PUBLISH_DONE is accounted for, with a hard upper bound.
+    pub(super) async fn await_publish_done_cleanup(&mut self, request_id: u64) {
+        let deadline = tokio::time::sleep(PUBLISH_DONE_CLEANUP_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            let progress = self.publishes_received.lock().ok().and_then(|publishes| {
+                publishes
+                    .get(&request_id)
+                    .and_then(|publish| publish.awaiting_streams().then(|| publish.progress()))
+            });
+            let Some(progress) = progress else {
+                return;
+            };
+            tokio::select! {
+                _ = progress.notified() => {}
+                _ = &mut deadline => {
+                    self.fail_publish_received(
+                        request_id,
+                        ServeError::internal_ctx("timed out waiting for declared PUBLISH streams"),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     /// Handle REQUEST_OK from the publisher.
@@ -473,7 +684,6 @@ impl Subscriber {
             c if c == RequestErrorCode::InternalError as u64 => {
                 ServeError::internal_ctx(msg.reason.0.clone())
             }
-            c if c == RequestErrorCode::DuplicateSubscription as u64 => ServeError::Duplicate,
             c if c == RequestErrorCode::NotSupported as u64 => {
                 ServeError::NotImplemented(msg.reason.0.clone())
             }
@@ -494,57 +704,149 @@ impl Subscriber {
         None
     }
 
-    /// Get a subscribe id by track alias, waiting up to the specified timeout if not present.
-    /// If timeout_ms is None, only check if already present and return None if not.
-    async fn get_subscribe_id_by_alias(
+    pub(super) fn remove_publish_received(&mut self, id: u64) {
+        if let Ok(mut publishes) = self.publishes_received.lock() {
+            publishes.remove(&id);
+        }
+        self.remove_publish_indexes(id);
+    }
+
+    pub(super) fn fail_publish_received(&mut self, id: u64, err: ServeError) {
+        let publish = self
+            .publishes_received
+            .lock()
+            .ok()
+            .and_then(|mut publishes| publishes.remove(&id));
+        if let Some(mut publish) = publish {
+            publish.recv_stream_error(err);
+        }
+        self.remove_publish_indexes(id);
+    }
+
+    fn remove_publish_indexes(&self, id: u64) {
+        if let Ok(mut aliases) = self.alias_map.lock() {
+            aliases.retain(|_, entry| {
+                entry
+                    .bindings
+                    .retain(|binding| *binding != AliasBinding::Publish(id));
+                !entry.bindings.is_empty()
+            });
+        }
+    }
+
+    fn finish_publish_stream(&mut self, id: u64) -> Result<(), SessionError> {
+        let complete = {
+            let mut publications = self
+                .publishes_received
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            match publications.get_mut(&id) {
+                Some(publish) => publish.finish_stream()?,
+                None => false,
+            }
+        };
+        if complete {
+            self.remove_publish_received(id);
+        }
+        Ok(())
+    }
+
+    fn begin_publish_stream(&mut self, id: u64) -> Result<(), SessionError> {
+        self.publishes_received
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&id)
+            .ok_or_else(|| {
+                SessionError::Serve(ServeError::not_found_ctx(format!(
+                    "publish_id={id} not found"
+                )))
+            })?
+            .begin_stream(MAX_STREAMS_PER_PUBLICATION)?;
+        Ok(())
+    }
+
+    fn register_alias(
+        &self,
+        track_alias: u64,
+        full_name: serve::FullTrackName,
+        binding: AliasBinding,
+    ) -> Result<(), SessionError> {
+        let mut aliases = self.alias_map.lock().map_err(|_| SessionError::Internal)?;
+        Self::insert_alias(&mut aliases, track_alias, full_name, binding)
+    }
+
+    fn insert_alias(
+        aliases: &mut HashMap<u64, AliasEntry>,
+        track_alias: u64,
+        full_name: serve::FullTrackName,
+        binding: AliasBinding,
+    ) -> Result<(), SessionError> {
+        match aliases.entry(track_alias) {
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(AliasEntry {
+                    full_name,
+                    bindings: vec![binding],
+                });
+            }
+            hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().full_name != full_name {
+                    return Err(SessionError::Duplicate);
+                }
+                if entry.get().bindings.contains(&binding) {
+                    return Err(SessionError::Duplicate);
+                }
+                entry.get_mut().bindings.push(binding);
+            }
+        }
+        Ok(())
+    }
+
+    fn unregister_alias_binding(&self, track_alias: u64, binding: AliasBinding) {
+        if let Ok(mut aliases) = self.alias_map.lock() {
+            Self::remove_alias_binding(&mut aliases, track_alias, binding);
+        }
+    }
+
+    fn remove_alias_binding(
+        aliases: &mut HashMap<u64, AliasEntry>,
+        track_alias: u64,
+        binding: AliasBinding,
+    ) {
+        if let hash_map::Entry::Occupied(mut entry) = aliases.entry(track_alias) {
+            entry.get_mut().bindings.retain(|value| *value != binding);
+            if entry.get().bindings.is_empty() {
+                entry.remove();
+            }
+        }
+    }
+
+    /// Resolve every request sharing a session-scoped exact-track alias.
+    async fn resolve_alias(
         &self,
         track_alias: u64,
         timeout_ms: Option<u64>,
-    ) -> Result<Option<u64>, SessionError> {
-        // If no timeout specified, don't wait
-        let timeout_ms = match timeout_ms {
-            Some(ms) => ms,
-            None => {
-                // Just check once
-                return match self.subscribe_alias_map.lock() {
-                    Ok(aliases) => Ok(aliases.get(&track_alias).cloned()),
-                    Err(_) => {
-                        tracing::error!(
-                            target: "moq_transport::control",
-                            track_alias,
-                            "subscribe alias map lock poisoned"
-                        );
-                        Err(SessionError::Internal)
-                    }
-                };
-            }
+    ) -> Result<Option<Vec<AliasBinding>>, SessionError> {
+        let lookup = || -> Result<Option<Vec<AliasBinding>>, SessionError> {
+            Ok(self
+                .alias_map
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .get(&track_alias)
+                .map(|entry| entry.bindings.clone()))
         };
 
-        // Wait for it to appear, checking after each notification
+        let timeout_ms = match timeout_ms {
+            Some(ms) => ms,
+            None => return lookup(),
+        };
+
         let timeout_duration = Duration::from_millis(timeout_ms);
         tokio::time::timeout(timeout_duration, async {
             loop {
-                // Register for notification before checking map
                 let notified = self.subscribe_alias_notify.notified();
-
-                // Check Map for alias
-                let id = match self.subscribe_alias_map.lock() {
-                    Ok(aliases) => aliases.get(&track_alias).cloned(),
-                    Err(_) => {
-                        tracing::error!(
-                            target: "moq_transport::control",
-                            track_alias,
-                            "subscribe alias map lock poisoned"
-                        );
-                        return Err(SessionError::Internal);
-                    }
-                };
-
-                if let Some(id) = id {
-                    return Ok(Some(id));
+                if let Some(binding) = lookup()? {
+                    return Ok(Some(binding));
                 }
-
-                // Alias not present yet, wait for notification
                 notified.await;
             }
         })
@@ -592,7 +894,11 @@ impl Subscriber {
 
         let mlog = self.mlog.clone();
         let res = self.recv_stream_inner(reader, stream_header, mlog).await;
-        if let Err(SessionError::Serve(err)) = &res {
+        if let Err(error) = &res {
+            let err = match error {
+                SessionError::Serve(err) => err.clone(),
+                _ => ServeError::internal_ctx(error.to_string()),
+            };
             tracing::warn!(
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
                 track_alias,
@@ -600,9 +906,20 @@ impl Subscriber {
             );
             // The writer is closed, so we should terminate.
             // TODO it would be nice to do this immediately when the Writer is closed.
-            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias, None).await? {
-                if let Some(subscribe) = self.remove_subscribe(subscribe_id) {
-                    subscribe.error(err.clone())?;
+            for binding in self
+                .resolve_alias(track_alias, None)
+                .await?
+                .unwrap_or_default()
+            {
+                match binding {
+                    AliasBinding::Subscribe(id) => {
+                        if let Some(subscribe) = self.remove_subscribe(id) {
+                            subscribe.error(err.clone())?;
+                        }
+                    }
+                    AliasBinding::Publish(id) => {
+                        self.fail_publish_received(id, err.clone());
+                    }
                 }
             }
         }
@@ -613,7 +930,7 @@ impl Subscriber {
     /// Continue handling the reception of a new stream from the QUIC session.
     async fn recv_stream_inner(
         &mut self,
-        reader: Reader,
+        mut reader: Reader,
         stream_header: data::StreamHeader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
@@ -623,8 +940,8 @@ impl Subscriber {
             track_alias
         );
 
-        let Some(subscribe_id) = self
-            .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+        let Some(bindings) = self
+            .resolve_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
             .await?
         else {
             return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
@@ -634,14 +951,49 @@ impl Subscriber {
         };
 
         tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
-        self.recv_subgroup(
-            stream_header.header_type,
-            stream_header.subgroup_header.unwrap(),
-            subscribe_id,
-            reader,
-            mlog,
-        )
-        .await?;
+        let mut active_bindings = Vec::with_capacity(bindings.len());
+        let mut publish_ids = Vec::new();
+        for binding in bindings {
+            if let AliasBinding::Publish(id) = binding {
+                if self.begin_publish_stream(id).is_err() {
+                    self.cancel_publish_received(
+                        id,
+                        message::RequestErrorCode::ExcessiveLoad as u32,
+                    );
+                    continue;
+                }
+                publish_ids.push(id);
+            }
+            active_bindings.push(binding);
+        }
+        if active_bindings.is_empty() {
+            reader.stop(message::RequestErrorCode::ExcessiveLoad as u32);
+            return Ok(());
+        }
+
+        let result = self
+            .recv_subgroup(
+                stream_header.header_type,
+                stream_header.subgroup_header.unwrap(),
+                &active_bindings,
+                reader,
+                mlog,
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                for id in publish_ids {
+                    self.finish_publish_stream(id)?;
+                }
+            }
+            Err(error) => {
+                for id in publish_ids {
+                    self.fail_publish_received(id, ServeError::internal_ctx(error.to_string()));
+                }
+                return Err(error);
+            }
+        }
 
         tracing::trace!(
             "[SUBSCRIBER] recv_stream_inner: completed processing stream for track_alias={}",
@@ -650,12 +1002,70 @@ impl Subscriber {
         Ok(())
     }
 
+    fn binding_claims_object(
+        &mut self,
+        binding: AliasBinding,
+        group_id: u64,
+        object_id: u64,
+    ) -> Result<bool, SessionError> {
+        match binding {
+            AliasBinding::Subscribe(id) => Ok(self
+                .subscribes
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .get_mut(&id)
+                .is_some_and(|subscribe| subscribe.claim_object(group_id, object_id))),
+            AliasBinding::Publish(id) => Ok(self
+                .publishes_received
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .get_mut(&id)
+                .is_some_and(|publish| publish.claim_object(group_id, object_id))),
+        }
+    }
+
+    fn fail_alias_binding(&mut self, binding: AliasBinding, err: ServeError) {
+        match binding {
+            AliasBinding::Subscribe(id) => {
+                if let Some(subscribe) = self.remove_subscribe(id) {
+                    let _ = subscribe.error(err);
+                }
+            }
+            AliasBinding::Publish(id) => {
+                self.cancel_publish_received(id, Session::REQUEST_STREAM_CANCELLED);
+            }
+        }
+    }
+
+    fn binding_subgroup(
+        &mut self,
+        binding: AliasBinding,
+        header: data::SubgroupHeader,
+    ) -> Result<Option<serve::SubgroupWriter>, SessionError> {
+        match binding {
+            AliasBinding::Subscribe(id) => self
+                .subscribes
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .get_mut(&id)
+                .map(|subscribe| subscribe.subgroup(header).map_err(SessionError::from))
+                .transpose(),
+            AliasBinding::Publish(id) => self
+                .publishes_received
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .get_mut(&id)
+                .map(|publish| publish.subgroup(header).map_err(SessionError::from))
+                .transpose(),
+        }
+    }
+
     /// If new stream is a Subgroup stream, handle reception of subgroup objects and payloads.
     async fn recv_subgroup(
         &mut self,
         stream_header_type: data::StreamHeaderType,
         mut subgroup_header: data::SubgroupHeader,
-        subscribe_id: u64,
+        bindings: &[AliasBinding],
         mut reader: Reader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
@@ -668,7 +1078,7 @@ impl Subscriber {
 
         let mut object_count = 0;
         let mut previous_object_id: Option<u64> = None;
-        let mut subgroup_writer: Option<serve::SubgroupWriter> = None;
+        let mut subgroup_writers: Vec<(AliasBinding, serve::SubgroupWriter)> = Vec::new();
         while !reader.done().await? {
             tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading object #{} (has_ext_headers={})",
@@ -773,20 +1183,36 @@ impl Subscriber {
                 ));
             }
 
-            if subgroup_writer.is_none() {
-                if stream_header_type.uses_first_object_id_as_subgroup_id() {
-                    subgroup_header.subgroup_id = Some(current_object_id);
+            if stream_header_type.uses_first_object_id_as_subgroup_id()
+                && subgroup_header.subgroup_id.is_none()
+            {
+                subgroup_header.subgroup_id = Some(current_object_id);
+            }
+
+            let mut claimed_bindings = Vec::new();
+            for binding in bindings {
+                if !self.binding_claims_object(
+                    *binding,
+                    subgroup_header.group_id,
+                    current_object_id,
+                )? {
+                    continue;
                 }
-
-                let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
-                let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
-                    ServeError::not_found_ctx(format!(
-                        "subscribe_id={} not found for track_alias={}",
-                        subscribe_id, subgroup_header.track_alias
-                    ))
-                })?;
-
-                subgroup_writer = Some(subscribe.subgroup(subgroup_header.clone())?);
+                claimed_bindings.push(*binding);
+                if subgroup_writers
+                    .iter()
+                    .any(|(existing, _)| existing == binding)
+                {
+                    continue;
+                }
+                match self.binding_subgroup(*binding, subgroup_header.clone()) {
+                    Ok(Some(writer)) => subgroup_writers.push((*binding, writer)),
+                    Ok(None) => {}
+                    Err(SessionError::Serve(err)) => {
+                        self.fail_alias_binding(*binding, err);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
             // Log subgroup object parsed/received
@@ -826,8 +1252,24 @@ impl Subscriber {
             // Pass extension headers through to the serve layer
             // TODO SLG - object_id_delta and object status are still being ignored
 
-            let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
-            let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
+            let mut object_writers = Vec::with_capacity(claimed_bindings.len());
+            let mut failed_bindings = Vec::new();
+            for binding in claimed_bindings {
+                let Some((_, subgroup_writer)) = subgroup_writers
+                    .iter_mut()
+                    .find(|(existing, _)| *existing == binding)
+                else {
+                    continue;
+                };
+                match subgroup_writer.create(remaining_bytes, extension_headers.clone()) {
+                    Ok(writer) => object_writers.push((binding, writer)),
+                    Err(err) => failed_bindings.push((binding, err)),
+                }
+            }
+            for (binding, err) in failed_bindings {
+                subgroup_writers.retain(|(existing, _)| *existing != binding);
+                self.fail_alias_binding(binding, err);
+            }
             tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading payload for object #{} ({} bytes)",
                 object_count + 1,
@@ -855,7 +1297,17 @@ impl Subscriber {
                     remaining_bytes - data.len()
                 );
                 remaining_bytes -= data.len();
-                object_writer.write(data)?;
+                let mut failed_bindings = Vec::new();
+                for (binding, object_writer) in &mut object_writers {
+                    if let Err(err) = object_writer.write(data.clone()) {
+                        failed_bindings.push((*binding, err));
+                    }
+                }
+                for (binding, err) in failed_bindings {
+                    object_writers.retain(|(existing, _)| *existing != binding);
+                    subgroup_writers.retain(|(existing, _)| *existing != binding);
+                    self.fail_alias_binding(binding, err);
+                }
                 chunks_read += 1;
             }
 
@@ -927,30 +1379,10 @@ impl Subscriber {
             }
         }
 
-        // Look up the subscribe id for this track alias
-        if let Some(subscribe_id) = self
-            .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await?
-        {
-            // Look up the subscribe by id
-            if let Some(subscribe) = self
-                .subscribes
-                .lock()
-                .ok()
-                .as_mut()
-                .and_then(|s| s.get_mut(&subscribe_id))
-            {
-                tracing::trace!(
-                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
-                    datagram.track_alias,
-                    datagram.group_id,
-                    datagram.object_id.unwrap_or(0),
-                    datagram.publisher_priority,
-                    datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                    datagram.payload.as_ref().map_or(0, |p| p.len()));
-                subscribe.datagram(datagram)?;
-            }
-        } else {
+        let bindings = self
+            .resolve_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+            .await?;
+        let Some(bindings) = bindings else {
             tracing::warn!(
                 "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
                 datagram.track_alias,
@@ -959,9 +1391,110 @@ impl Subscriber {
                 datagram.publisher_priority,
                 datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
                 datagram.payload.as_ref().map_or(0, |p| p.len()));
+            return Ok(());
+        };
+
+        let object_id = datagram.object_id.unwrap_or(0);
+        for binding in bindings {
+            if !self.binding_claims_object(binding, datagram.group_id, object_id)? {
+                continue;
+            }
+            match binding {
+                AliasBinding::Subscribe(id) => {
+                    let result = self
+                        .subscribes
+                        .lock()
+                        .map_err(|_| SessionError::Internal)?
+                        .get_mut(&id)
+                        .map(|subscribe| subscribe.datagram(datagram.clone()));
+                    if let Some(Err(err)) = result {
+                        self.fail_alias_binding(binding, err);
+                    }
+                }
+                AliasBinding::Publish(id) => {
+                    let result = self
+                        .publishes_received
+                        .lock()
+                        .map_err(|_| SessionError::Internal)?
+                        .get_mut(&id)
+                        .map(|publish| publish.datagram(datagram.clone()));
+                    if let Some(Err(err)) = result {
+                        self.fail_alias_binding(binding, err);
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    fn full(namespace: &str, name: &str) -> serve::FullTrackName {
+        serve::FullTrackName {
+            namespace: TrackNamespace::from_utf8_path(namespace),
+            name: TrackName::from(name),
+        }
+    }
+
+    #[test]
+    fn alias_fans_out_only_for_the_same_full_track_name() {
+        let mut aliases = HashMap::new();
+        Subscriber::insert_alias(
+            &mut aliases,
+            7,
+            full("live", "audio"),
+            AliasBinding::Subscribe(1),
+        )
+        .unwrap();
+        Subscriber::insert_alias(
+            &mut aliases,
+            7,
+            full("live", "audio"),
+            AliasBinding::Publish(3),
+        )
+        .unwrap();
+
+        assert_eq!(aliases[&7].bindings.len(), 2);
+        assert!(matches!(
+            Subscriber::insert_alias(
+                &mut aliases,
+                7,
+                full("live", "video"),
+                AliasBinding::Publish(5),
+            ),
+            Err(SessionError::Duplicate)
+        ));
+        assert_eq!(aliases[&7].bindings.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_request_binding_is_rejected_atomically() {
+        let mut aliases = HashMap::new();
+        let binding = AliasBinding::Publish(3);
+        Subscriber::insert_alias(&mut aliases, 7, full("live", "audio"), binding).unwrap();
+        assert!(matches!(
+            Subscriber::insert_alias(&mut aliases, 7, full("live", "audio"), binding),
+            Err(SessionError::Duplicate)
+        ));
+        assert_eq!(aliases[&7].bindings, vec![binding]);
+    }
+
+    #[test]
+    fn removing_one_shared_binding_preserves_the_other_alias_route() {
+        let mut aliases = HashMap::new();
+        let subscribe = AliasBinding::Subscribe(1);
+        let publish = AliasBinding::Publish(3);
+        Subscriber::insert_alias(&mut aliases, 7, full("live", "audio"), subscribe).unwrap();
+        Subscriber::insert_alias(&mut aliases, 7, full("live", "audio"), publish).unwrap();
+
+        Subscriber::remove_alias_binding(&mut aliases, 7, subscribe);
+        assert_eq!(aliases[&7].bindings, vec![publish]);
+        Subscriber::remove_alias_binding(&mut aliases, 7, publish);
+        assert!(!aliases.contains_key(&7));
     }
 }
 
@@ -972,8 +1505,8 @@ impl Subscriber {
 // mock constructor on `web_transport::Session` — it wraps
 // `web_transport_quinn::Session` which holds a `quinn::Connection`).
 // The tests verified that `Subscribe::Drop` removes the subscribes-map
-// entry, and that `remove_subscribe` clears both `subscribes` and
-// `subscribe_alias_map`. To restore them, either:
+// entry, and that `remove_subscribe` clears both `subscribes` and the
+// shared exact-track alias registry. To restore them, either:
 //   1. Add a `#[cfg(test)] pub fn stub(url: Url) -> Session` constructor
 //      to `web_transport` (upstream crate) that creates a disconnected
 //      session, or

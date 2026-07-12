@@ -48,6 +48,7 @@ impl Publisher {
                         group_id: next_group_id as u64,
                         subgroup_id: 0,
                         priority: 0,
+                        first_object: true,
                     })
                     .context("failed to create minute segment")?;
 

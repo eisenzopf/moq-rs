@@ -98,6 +98,7 @@ impl SubgroupsWriter {
             group_id,
             subgroup_id,
             priority,
+            first_object: true,
         })
     }
 
@@ -108,6 +109,7 @@ impl SubgroupsWriter {
             group_id: subgroup.group_id,
             subgroup_id: subgroup.subgroup_id,
             priority: subgroup.priority,
+            first_object: subgroup.first_object,
         };
         let (writer, reader) = subgroup.produce();
 
@@ -231,6 +233,11 @@ pub struct Subgroup {
 
     // The priority of the group within the track.
     pub priority: u8,
+
+    /// Whether this stream begins with the first Object ever published in the
+    /// Subgroup. Draft-19 requires original publishers, and relays that retain
+    /// that first Object, to preserve this signal.
+    pub first_object: bool,
 }
 
 /// Static information about the group
@@ -248,6 +255,9 @@ pub struct SubgroupInfo {
 
     // The priority of the group within the track.
     pub priority: u8,
+
+    /// Whether this stream begins with the original first Object.
+    pub first_object: bool,
 }
 
 impl SubgroupInfo {
@@ -630,5 +640,30 @@ impl Deref for SubgroupObjectReader {
 
     fn deref(&self) -> &Self::Target {
         &self.info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    #[test]
+    fn first_object_semantics_survive_the_serve_model() {
+        let (track, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("live"), "audio").produce();
+        let mut groups = track.subgroups().unwrap();
+        let relayed = groups
+            .create(Subgroup {
+                group_id: 1,
+                subgroup_id: 2,
+                priority: 3,
+                first_object: false,
+            })
+            .unwrap();
+        assert!(!relayed.first_object);
+
+        let original = groups.append(3).unwrap();
+        assert!(original.first_object);
     }
 }

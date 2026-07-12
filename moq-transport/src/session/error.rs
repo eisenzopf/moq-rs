@@ -143,6 +143,19 @@ impl SessionError {
             _ => false,
         }
     }
+
+    /// True when a peer cancelled only the current request/data stream.
+    /// Stream resets are request scoped and must not tear down the session.
+    pub fn is_request_stream_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::WebTransport(web_transport::Error::Read(
+                web_transport::quinn::ReadError::Reset(_)
+            )) | Self::WebTransport(web_transport::Error::Write(
+                web_transport::quinn::WriteError::Stopped(_)
+            ))
+        )
+    }
 }
 
 impl From<SessionError> for serve::ServeError {
@@ -218,5 +231,16 @@ mod tests {
     #[test]
     fn too_many_request_updates_uses_draft_19_code() {
         assert_eq!(SessionError::TooManyRequestUpdates.code(), 0x1B);
+    }
+
+    #[test]
+    fn request_stream_reset_is_scoped_cancellation() {
+        let error = SessionError::WebTransport(web_transport::Error::Read(
+            web_transport::quinn::ReadError::Reset(1),
+        ));
+        assert!(error.is_request_stream_cancelled());
+        assert!(
+            !SessionError::ProtocolViolation("bad frame".to_string()).is_request_stream_cancelled()
+        );
     }
 }

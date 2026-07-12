@@ -3,7 +3,7 @@
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::{ServeError, TracksReader},
+    serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
@@ -42,6 +42,11 @@ impl Producer {
     /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
         self.publisher.publish_namespace(tracks).await
+    }
+
+    /// Send PUBLISH for one exact track.
+    pub async fn publish(&mut self, track: TrackReader) -> Result<(), SessionError> {
+        self.publisher.publish(track).await
     }
 
     /// Run the producer to serve subscribe requests.
@@ -110,6 +115,21 @@ impl Producer {
 
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
+
+        let full_name = FullTrackName {
+            namespace: namespace.clone(),
+            name: track_name.clone(),
+        };
+        if let Some(track) = self
+            .locals
+            .retrieve_track(self.scope.as_deref(), &full_name)
+        {
+            let ns = namespace.to_utf8_path();
+            tracing::info!(namespace = %ns, track = %track_name, source = "local_publish", "serving subscribe from exact PUBLISH track");
+            timing_guard.set_label("source", "local_publish");
+            let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+            return Ok(subscribed.serve(track).await?);
+        }
 
         // Check local tracks first, and serve from local if possible
         if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
@@ -188,6 +208,17 @@ impl Producer {
         self,
         mut track_status_requested: TrackStatusRequested,
     ) -> Result<(), anyhow::Error> {
+        let full_name = FullTrackName {
+            namespace: track_status_requested.request_msg.track_namespace.clone(),
+            name: track_status_requested.request_msg.track_name.clone(),
+        };
+        if let Some(track) = self
+            .locals
+            .retrieve_track(self.scope.as_deref(), &full_name)
+        {
+            return Ok(track_status_requested.respond_ok(&track)?);
+        }
+
         // Check local tracks first, and serve from local if possible
         if let Some(mut local_tracks) = self.locals.retrieve(
             self.scope.as_deref(),

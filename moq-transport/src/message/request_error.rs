@@ -27,7 +27,6 @@ pub enum RequestErrorCode {
     DoesNotExist = 0x10,
     InvalidRange = 0x11,
     MalformedTrack = 0x12,
-    DuplicateSubscription = 0x19,
     Uninterested = 0x20,
     PrefixOverlap = 0x30,
     NamespaceTooLarge = 0x31,
@@ -225,27 +224,6 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = RequestError::decode(&mut buf).unwrap();
         assert_eq!(decoded.error_code, RequestErrorCode::DoesNotExist as u64);
-        assert!(decoded.is_fatal());
-    }
-
-    #[test]
-    fn duplicate_subscription_rejection() {
-        // Verify DUPLICATE_SUBSCRIPTION can be encoded and decoded.
-        let mut buf = bytes::BytesMut::new();
-        let msg = RequestError::new(
-            4,
-            RequestErrorCode::DuplicateSubscription,
-            0,
-            "duplicate subscription",
-        );
-        msg.encode(&mut buf).unwrap();
-        let decoded = RequestError::decode(&mut buf).unwrap();
-        assert_eq!(decoded.id, 4);
-        assert_eq!(
-            decoded.error_code,
-            RequestErrorCode::DuplicateSubscription as u64
-        );
-        assert_eq!(decoded.retry_interval, 0);
         assert!(decoded.is_fatal());
     }
 

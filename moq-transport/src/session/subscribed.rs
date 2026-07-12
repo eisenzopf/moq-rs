@@ -23,6 +23,9 @@ use super::{DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
 struct SubscribedState {
     largest_location: Option<Location>,
     stream_count: u64,
+    accepted: bool,
+    forward: bool,
+    peer_rejected: bool,
     closed: Result<(), ServeError>,
 }
 
@@ -48,9 +51,18 @@ impl Default for SubscribedState {
         Self {
             largest_location: None,
             stream_count: 0,
+            accepted: false,
+            forward: true,
+            peer_rejected: false,
             closed: Ok(()),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionInitiator {
+    Subscriber,
+    Publisher,
 }
 
 pub struct Subscribed {
@@ -67,23 +79,40 @@ pub struct Subscribed {
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
 
+    initiator: SubscriptionInitiator,
+
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
 
 impl Subscribed {
+    fn subgroup_header_type(first_object: bool) -> data::StreamHeaderType {
+        data::StreamHeaderType::subgroup(
+            true,
+            data::SubgroupIdMode::Explicit,
+            false,
+            false,
+            first_object,
+        )
+    }
+
     pub(super) fn new(
         publisher: Publisher,
         msg: message::Subscribe,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(Self, SubscribedRecv), SessionError> {
-        let (send, recv) = State::default().split();
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
+        let initial = SubscribedState {
+            forward: info.forward,
+            ..Default::default()
+        };
+        let (send, recv) = State::new(initial).split();
         let send = Self {
             publisher,
             state: send,
             info,
             ok: false,
+            initiator: SubscriptionInitiator::Subscriber,
             mlog,
         };
 
@@ -91,6 +120,36 @@ impl Subscribed {
         let recv = SubscribedRecv { state: recv };
 
         Ok((send, recv))
+    }
+
+    /// Build the data-plane state for an outbound PUBLISH request.
+    pub(super) fn new_published(
+        publisher: Publisher,
+        msg: &message::Publish,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(Self, SubscribedRecv), SessionError> {
+        let synthetic = message::Subscribe {
+            id: msg.id,
+            track_namespace: msg.track_namespace.clone(),
+            track_name: msg.track_name.clone(),
+            params: msg.params.clone(),
+        };
+        let info = SubscribeInfo::new_from_subscribe(&synthetic)?;
+        let forward = msg.params.forward()?.unwrap_or(true);
+        let initial = SubscribedState {
+            forward,
+            ..Default::default()
+        };
+        let (send, recv) = State::new(initial).split();
+        let published = Self {
+            publisher,
+            state: send,
+            info,
+            ok: false,
+            initiator: SubscriptionInitiator::Publisher,
+            mlog,
+        };
+        Ok((published, SubscribedRecv { state: recv }))
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
@@ -131,10 +190,16 @@ impl Subscribed {
 
         self.ok = true; // So we send SubscribeDone on drop
 
-        let delivery_filter = self.info.delivery_filter(largest_location);
+        let mut delivery_filter = self.info.delivery_filter(largest_location);
+        // FORWARD is mutable via REQUEST_UPDATE and is enforced from shared state.
+        delivery_filter.forward = true;
 
         // Serve based on track mode
-        match track.mode().await? {
+        let mode = tokio::select! {
+            mode = track.mode() => mode?,
+            closed = self.closed() => return Ok(closed?),
+        };
+        match mode {
             // TODO cancel track/datagrams on closed
             TrackReaderMode::Stream(_stream) => panic!("deprecated"),
             TrackReaderMode::Subgroups(subgroups) => {
@@ -146,7 +211,84 @@ impl Subscribed {
         }
     }
 
+    pub(super) async fn publish_ok(&self) -> Result<(), ServeError> {
+        loop {
+            {
+                let state = self.state.lock();
+                state.closed.clone()?;
+                if state.accepted {
+                    return Ok(());
+                }
+                match state.modified() {
+                    Some(notify) => notify,
+                    None => return Err(ServeError::Done),
+                }
+            }
+            .await;
+        }
+    }
+
+    pub(super) async fn serve_published(
+        &mut self,
+        track: serve::TrackReader,
+    ) -> Result<(), SessionError> {
+        let result = self.serve_published_inner(track).await;
+        if let Err(err) = &result {
+            self.close_state(err.clone().into())?;
+        }
+        result
+    }
+
+    async fn serve_published_inner(
+        &mut self,
+        track: serve::TrackReader,
+    ) -> Result<(), SessionError> {
+        debug_assert_eq!(self.initiator, SubscriptionInitiator::Publisher);
+        self.publish_ok().await?;
+        self.ok = true;
+
+        let largest_location = track.largest_location();
+        {
+            let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+            state.largest_location = largest_location;
+        }
+        let delivery_filter = DeliveryFilter {
+            forward: true,
+            start_location: None,
+            end_group_id: None,
+        };
+
+        let mode = tokio::select! {
+            mode = track.mode() => mode?,
+            closed = self.closed() => return Ok(closed?),
+        };
+        match mode {
+            TrackReaderMode::Stream(_stream) => Err(SessionError::Serve(
+                ServeError::not_implemented_ctx("stream track reader mode"),
+            )),
+            TrackReaderMode::Subgroups(subgroups) => {
+                self.serve_subgroups(subgroups, delivery_filter).await
+            }
+            TrackReaderMode::Datagrams(datagrams) => {
+                self.serve_datagrams(datagrams, delivery_filter).await
+            }
+        }
+    }
+
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
+        self.close_state(err)
+    }
+
+    pub(super) fn cancel_request_stream(&mut self) {
+        if let Some(mut state) = self.state.lock_mut() {
+            state.peer_rejected = true;
+            state.closed = Err(ServeError::Cancel);
+        }
+        self.publisher
+            .cancel_request_stream(self.info.id, super::Session::REQUEST_STREAM_CANCELLED);
+    }
+
+    fn close_state(&self, err: ServeError) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
 
@@ -190,9 +332,21 @@ impl Drop for Subscribed {
             .cloned()
             .unwrap_or(ServeError::Done);
         let stream_count = state.stream_count;
+        let peer_rejected = state.peer_rejected;
         drop(state); // Important to avoid a deadlock
 
-        if self.ok {
+        if self.initiator == SubscriptionInitiator::Publisher {
+            if peer_rejected {
+                self.publisher.drop_published(self.info.id);
+                return;
+            }
+            self.publisher.send_message(message::PublishDone {
+                id: self.info.id,
+                status_code: Self::publish_done_code(&err),
+                stream_count,
+                reason: ReasonPhrase(err.to_string()),
+            });
+        } else if self.ok {
             self.publisher.send_message(message::PublishDone {
                 id: self.info.id,
                 status_code: Self::publish_done_code(&err),
@@ -232,7 +386,9 @@ impl Subscribed {
             ServeError::NotFound | ServeError::NotFoundWithId(_, _) => {
                 RequestErrorCode::DoesNotExist as u64
             }
-            ServeError::Duplicate => RequestErrorCode::DuplicateSubscription as u64,
+            // Duplicate is an application policy result in draft-19; the
+            // protocol explicitly allows multiple subscriptions per track.
+            ServeError::Duplicate => RequestErrorCode::Uninterested as u64,
             ServeError::Cancel | ServeError::Done => RequestErrorCode::Uninterested as u64,
             ServeError::Mode
             | ServeError::Size
@@ -264,7 +420,7 @@ impl Subscribed {
                 res = subgroups.next(), if done.is_none() => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
-                            header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
+                            header_type: Self::subgroup_header_type(subgroup.first_object),
                             track_alias: self.info.id, // use subscription id as track_alias
                             group_id: subgroup.group_id,
                             subgroup_id: Some(subgroup.subgroup_id),
@@ -287,12 +443,26 @@ impl Subscribed {
                         });
                     },
                     Ok(None) => done = Some(Ok(())),
-                    Err(err) => done = Some(Err(err)),
+                    Err(err) => return Err(err.into()),
                 },
-                res = self.closed(), if done.is_none() => done = Some(res),
+                res = self.closed(), if done.is_none() => return Ok(res?),
                 _ = tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(done.unwrap()?),
             }
+        }
+    }
+
+    async fn wait_until_forward(state: &State<SubscribedState>) -> Result<(), ServeError> {
+        loop {
+            let notified = {
+                let state = state.lock();
+                state.closed.clone()?;
+                if state.forward {
+                    return Ok(());
+                }
+                state.modified().ok_or(ServeError::Done)?
+            };
+            notified.await;
         }
     }
 
@@ -313,7 +483,13 @@ impl Subscribed {
 
         let mut writer: Option<Writer> = None;
         let mut object_count = 0;
-        while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+        loop {
+            Self::wait_until_forward(&state).await?;
+            let Some(mut subgroup_object_reader) = subgroup_reader.next().await? else {
+                break;
+            };
+            // FORWARD may have changed while waiting for the next object.
+            Self::wait_until_forward(&state).await?;
             if !delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: filtered object group_id={}, object_id={}",
@@ -336,6 +512,7 @@ impl Subscribed {
                 send_stream.set_priority(subgroup_reader.priority as i32);
 
                 let mut new_writer = Writer::new(send_stream);
+                new_writer.reset_on_drop(super::Session::REQUEST_STREAM_CANCELLED);
 
                 tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
@@ -444,6 +621,10 @@ impl Subscribed {
             object_count
         );
 
+        if let Some(mut writer) = writer {
+            writer.finish();
+        }
+
         Ok(())
     }
 
@@ -455,7 +636,17 @@ impl Subscribed {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
-        while let Some(datagram) = datagrams.read().await? {
+        loop {
+            Self::wait_until_forward(&self.state).await?;
+            let next = tokio::select! {
+                value = datagrams.read() => value,
+                closed = self.closed() => return Ok(closed?),
+            }?;
+            let Some(datagram) = next else {
+                break;
+            };
+            // FORWARD may have changed while waiting for the next datagram.
+            Self::wait_until_forward(&self.state).await?;
             if !delivery_filter.allows(datagram.group_id, datagram.object_id) {
                 tracing::trace!(
                     "[PUBLISHER] serve_datagrams: filtered datagram group_id={}, object_id={}",
@@ -548,6 +739,28 @@ pub(super) struct SubscribedRecv {
 }
 
 impl SubscribedRecv {
+    pub fn recv_publish_ok(&mut self, msg: &message::RequestOk) -> Result<(), ServeError> {
+        let forward = msg
+            .params
+            .forward()
+            .map_err(|_| ServeError::internal_ctx("invalid FORWARD in PUBLISH_OK"))?;
+        if let Some(mut state) = self.state.lock_mut() {
+            state.accepted = true;
+            if let Some(forward) = forward {
+                state.forward = forward;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn recv_error(&mut self, err: ServeError) -> Result<(), ServeError> {
+        if let Some(mut state) = self.state.lock_mut() {
+            state.peer_rejected = true;
+            state.closed = Err(err);
+        }
+        Ok(())
+    }
+
     pub fn recv_update_failed(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
@@ -557,6 +770,13 @@ impl SubscribedRecv {
                 message::PublishDoneCode::UpdateFailed as u64,
             ));
         }
+        Ok(())
+    }
+
+    pub fn recv_forward_update(&mut self, forward: bool) -> Result<(), ServeError> {
+        let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
+        state.closed.clone()?;
+        state.forward = forward;
         Ok(())
     }
 }
@@ -575,6 +795,84 @@ mod tests {
 
         state.record_stream_opened();
         assert_eq!(state.stream_count, 2);
+    }
+
+    #[test]
+    fn publish_ok_updates_forward_and_acceptance() {
+        let state = State::<SubscribedState>::default();
+        let (_send, recv) = state.split();
+        let mut recv = SubscribedRecv { state: recv };
+        let mut params = KeyValuePairs::default();
+        params.set_forward(false);
+        recv.recv_publish_ok(&message::RequestOk {
+            id: 7,
+            params,
+            track_properties: Default::default(),
+        })
+        .unwrap();
+        assert!(recv.state.lock().accepted);
+        assert!(!recv.state.lock().forward);
+    }
+
+    #[test]
+    fn reverse_request_update_changes_live_forward_state() {
+        let state = State::<SubscribedState>::default();
+        let (_send, recv) = state.split();
+        let mut recv = SubscribedRecv { state: recv };
+        recv.recv_forward_update(false).unwrap();
+        assert!(!recv.state.lock().forward);
+        recv.recv_forward_update(true).unwrap();
+        assert!(recv.state.lock().forward);
+    }
+
+    #[test]
+    fn failed_reverse_update_marks_terminal_state_without_snapshotting_early() {
+        let mut initial = SubscribedState::default();
+        initial.record_stream_opened();
+        let state = State::new(initial);
+        let (_send, recv) = state.split();
+        let mut recv = SubscribedRecv { state: recv };
+
+        recv.recv_update_failed().unwrap();
+        let state = recv.state.lock();
+        assert_eq!(state.stream_count, 1);
+        assert!(matches!(
+            state.closed,
+            Err(ServeError::Closed(code))
+                if code == message::PublishDoneCode::UpdateFailed as u64
+        ));
+    }
+
+    #[test]
+    fn subgroup_header_preserves_first_object_semantics() {
+        assert!(Subscribed::subgroup_header_type(true).is_first_object());
+        assert!(!Subscribed::subgroup_header_type(false).is_first_object());
+    }
+
+    #[test]
+    fn publish_rejection_is_terminal_before_acceptance() {
+        let state = State::<SubscribedState>::default();
+        let (_send, recv) = state.split();
+        let mut recv = SubscribedRecv { state: recv };
+        recv.recv_error(ServeError::Closed(RequestErrorCode::Uninterested as u64))
+            .unwrap();
+        let state = recv.state.lock();
+        assert!(state.peer_rejected);
+        assert!(matches!(
+            state.closed,
+            Err(ServeError::Closed(code)) if code == RequestErrorCode::Uninterested as u64
+        ));
+    }
+
+    #[test]
+    fn peer_cancellation_closes_shared_media_state() {
+        let state = State::<SubscribedState>::default();
+        let (_send, recv) = state.split();
+        let mut recv = SubscribedRecv { state: recv };
+        recv.recv_error(ServeError::Cancel).unwrap();
+        let state = recv.state.lock();
+        assert!(state.peer_rejected);
+        assert!(matches!(state.closed, Err(ServeError::Cancel)));
     }
 
     #[test]
@@ -609,7 +907,7 @@ mod tests {
         );
         assert_eq!(
             Subscribed::request_error_code(&ServeError::Duplicate),
-            RequestErrorCode::DuplicateSubscription as u64
+            RequestErrorCode::Uninterested as u64
         );
         assert_eq!(
             Subscribed::request_error_code(&ServeError::NotImplemented("fetch".to_string())),

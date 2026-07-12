@@ -38,7 +38,9 @@ impl RequestKind {
     }
 
     pub(super) fn accepts_request_updates(self) -> bool {
-        !matches!(self, Self::TrackStatus)
+        // The subscriber, not the requester/publisher, updates a PUBLISH.
+        // Reverse-direction update decoding is a later PUBLISH tranche.
+        !matches!(self, Self::TrackStatus | Self::Publish)
     }
 
     pub(super) fn is_publisher_message(self) -> bool {
@@ -115,6 +117,20 @@ mod tests {
             track_namespace: TrackNamespace::from_utf8_path("live"),
             track_name: TrackName::from("audio"),
             params: KeyValuePairs::default(),
+        });
+        let kind = RequestKind::from_first_message(&first).unwrap();
+        assert!(!kind.accepts_request_updates());
+    }
+
+    #[test]
+    fn publish_requester_cannot_send_request_update() {
+        let first = Message::Publish(crate::message::Publish {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("live"),
+            track_name: TrackName::from("audio"),
+            track_alias: 0,
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
         });
         let kind = RequestKind::from_first_message(&first).unwrap();
         assert!(!kind.accepts_request_updates());

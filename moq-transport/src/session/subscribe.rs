@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{collections::HashSet, ops};
 
 use crate::{
     coding::{KeyValuePairs, Location, TrackName, TrackNamespace},
@@ -238,6 +238,9 @@ impl Subscribe {
         let recv = SubscribeRecv {
             state: recv,
             writer: Some(track.into()),
+            info: send.info.clone(),
+            delivery_filter: None,
+            seen_objects: HashSet::new(),
         };
 
         (send, recv)
@@ -297,10 +300,13 @@ impl ops::Deref for Subscribe {
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
     writer: Option<TrackWriterMode>,
+    info: SubscribeInfo,
+    delivery_filter: Option<DeliveryFilter>,
+    seen_objects: HashSet<(u64, u64)>,
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
+    pub fn ok(&mut self, msg: &message::SubscribeOk) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
@@ -308,10 +314,34 @@ impl SubscribeRecv {
 
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
-            state.track_alias = Some(alias);
+            state.track_alias = Some(msg.track_alias);
         }
+        self.delivery_filter = Some(self.info.delivery_filter(
+            msg.params.largest_object().map_err(|err| {
+                ServeError::internal_ctx(format!("invalid largest object: {err}"))
+            })?,
+        ));
 
         Ok(())
+    }
+
+    pub fn full_name(&self) -> serve::FullTrackName {
+        serve::FullTrackName {
+            namespace: self.info.track_namespace.clone(),
+            name: self.info.track_name.clone(),
+        }
+    }
+
+    pub fn allows(&self, group_id: u64, object_id: u64) -> bool {
+        self.delivery_filter
+            .unwrap_or_else(|| self.info.delivery_filter(None))
+            .allows(group_id, object_id)
+    }
+
+    /// Claim an Object for this subscription, applying its filter and
+    /// suppressing duplicate wire copies caused by shared Track Aliases.
+    pub fn claim_object(&mut self, group_id: u64, object_id: u64) -> bool {
+        self.allows(group_id, object_id) && self.seen_objects.insert((group_id, object_id))
     }
 
     pub fn track_alias(&self) -> Option<u64> {
@@ -346,11 +376,19 @@ impl SubscribeRecv {
             _ => return Err(ServeError::Mode),
         };
 
+        let subgroup_id = header
+            .resolved_subgroup_id()
+            .map_err(|err| ServeError::internal_ctx(format!("invalid subgroup id: {err}")))?
+            .ok_or_else(|| {
+                ServeError::internal_ctx(
+                    "FIRST_OBJECT subgroup id was not resolved before creating the subgroup",
+                )
+            })?;
         let writer = subgroups.create(serve::Subgroup {
             group_id: header.group_id,
-            // When subgroup_id is not present in the header type, it implicitly means subgroup 0
-            subgroup_id: header.subgroup_id.unwrap_or(0),
+            subgroup_id,
             priority: header.publisher_priority,
+            first_object: header.header_type.is_first_object(),
         })?;
 
         self.writer = Some(subgroups.into());

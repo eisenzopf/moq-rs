@@ -12,6 +12,7 @@ use bytes::Buf;
 pub struct Writer {
     stream: web_transport::SendStream,
     buffer: bytes::BytesMut,
+    reset_on_drop: Option<u32>,
 }
 
 impl Writer {
@@ -19,6 +20,7 @@ impl Writer {
         Self {
             stream,
             buffer: Default::default(),
+            reset_on_drop: None,
         }
     }
 
@@ -92,6 +94,33 @@ impl Writer {
 
     /// Signal that no more data will be written (sends QUIC FIN).
     pub fn finish(&mut self) {
+        self.reset_on_drop = None;
         let _ = self.stream.finish();
+    }
+
+    /// Cancel this send direction with RESET_STREAM.
+    pub fn reset(&mut self, code: u32) {
+        self.reset_on_drop = None;
+        self.stream.reset(code);
+    }
+
+    /// Reset, instead of gracefully finishing, if this writer is dropped
+    /// before [`finish`](Self::finish) is called.
+    pub fn reset_on_drop(&mut self, code: u32) {
+        self.reset_on_drop = Some(code);
+    }
+
+    /// Wait until the peer sends STOP_SENDING, or until a locally-finished
+    /// stream is fully acknowledged.
+    pub async fn stopped(&mut self) -> Result<Option<u8>, SessionError> {
+        Ok(self.stream.closed().await?)
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Some(code) = self.reset_on_drop.take() {
+            self.stream.reset(code);
+        }
     }
 }
