@@ -87,7 +87,14 @@ impl PublishedNamespace {
     /// Wait until the peer closes or cancels the namespace request stream.
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
-            let Some(modified) = self.state.lock().modified() else {
+            let modified = {
+                let state = self.state.lock();
+                if state.done {
+                    return Ok(());
+                }
+                state.modified()
+            };
+            let Some(modified) = modified else {
                 return Ok(());
             };
 
@@ -124,7 +131,7 @@ impl Drop for PublishedNamespace {
                 self.info.request_id,
                 super::Session::REQUEST_STREAM_CANCELLED,
             );
-            if let Some(recv) = self.session.drop_publish_namespace(self.info.request_id) {
+            if let Some(mut recv) = self.session.drop_publish_namespace(self.info.request_id) {
                 let _ = recv.recv_done();
             }
         } else {
@@ -166,13 +173,21 @@ pub(super) struct PublishedNamespaceRecv {
 }
 
 impl PublishedNamespaceRecv {
-    pub fn recv_done(self) -> Result<(), ServeError> {
+    pub fn recv_done(&mut self) -> Result<(), ServeError> {
         if let Some(mut state) = self.state.lock_mut() {
             state.done = true;
         }
-
-        // Dropping the state signals the PublishedNamespace that the peer is done.
         Ok(())
+    }
+
+    /// Wait for the application-facing namespace handle to acknowledge the
+    /// completion notification by dropping its producer-side state.
+    pub async fn acknowledged(&self) {
+        loop {
+            let modified = self.state.lock().modified();
+            let Some(modified) = modified else { return };
+            modified.await;
+        }
     }
 }
 
@@ -195,9 +210,12 @@ mod tests {
 
         assert!(!send_state.lock().done);
 
+        let mut recv = recv;
         recv.recv_done().unwrap();
 
         assert!(send_state.lock().done);
+        assert!(send_state.lock().modified().is_some());
+        drop(recv);
         assert!(send_state.lock().modified().is_none());
     }
 

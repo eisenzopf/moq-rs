@@ -1160,11 +1160,29 @@ impl Subscriber {
     /// Remove every retained representation of a peer-opened
     /// PUBLISH_NAMESPACE and mark any application handle complete.
     pub(super) fn cleanup_inbound_publish_namespace(&mut self, id: u64) {
-        if let Some(recv) = self.drop_publish_namespace(id) {
+        if let Some(mut recv) = self.drop_publish_namespace(id) {
             let _ = recv.recv_done();
         }
         self.published_namespace_queue
             .remove_where(|namespace| namespace.info.request_id == id);
+    }
+
+    /// Mark an inbound namespace request complete, then wait until the
+    /// application has observed that completion and released its handle.
+    pub(super) async fn finish_inbound_publish_namespace(
+        &mut self,
+        id: u64,
+    ) -> Result<(), SessionError> {
+        let mut recv = self.drop_publish_namespace(id).ok_or_else(|| {
+            SessionError::ProtocolViolation(format!(
+                "PUBLISH_NAMESPACE request {id} completed without retained state"
+            ))
+        })?;
+        recv.recv_done()?;
+        self.published_namespace_queue
+            .remove_where(|namespace| namespace.info.request_id == id);
+        recv.acknowledged().await;
+        Ok(())
     }
 
     /// Remove every retained representation of a peer-opened PUBLISH and

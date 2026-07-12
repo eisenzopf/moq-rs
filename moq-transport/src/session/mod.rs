@@ -1541,6 +1541,11 @@ impl Session {
                                 // direction and drops the inbound namespace
                                 // registration, which provides an observable
                                 // peer-acceptance barrier to the origin.
+                                subscriber
+                                    .as_mut()
+                                    .ok_or(SessionError::RoleViolation)?
+                                    .finish_inbound_publish_namespace(initial_id)
+                                    .await?;
                                 break Ok(());
                             }
                             requester_open = false;
