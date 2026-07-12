@@ -141,6 +141,15 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub publisher_session_cap: usize,
 
+    /// Bind an mTLS relay client fingerprint to one subscribe-only upstream
+    /// scope as SHA256=/path. Repeat for additional relay principals/scopes.
+    #[arg(long = "admit-relay-subscriber")]
+    pub admitted_relay_subscribers: Vec<String>,
+
+    /// Maximum active sessions for each admitted relay-subscriber fingerprint.
+    #[arg(long, default_value_t = 100)]
+    pub relay_subscriber_session_cap: usize,
+
     /// SHA-256 digest of a SETUP bearer token admitted for subscribe-only listeners.
     #[arg(long = "admit-subscribe-token-sha256")]
     pub admitted_subscribe_token_sha256: Vec<String>,
@@ -336,9 +345,27 @@ async fn main() -> anyhow::Result<()> {
                 cli.admitted_subscribe_token_sha256.is_empty(),
                 "subscribe token digests are only valid for token-subscriber listeners"
             );
+            anyhow::ensure!(
+                cli.admitted_relay_subscribers.is_empty(),
+                "relay-subscriber bindings are only valid for mTLS relay-subscriber listeners"
+            );
             CertificateFingerprintAdmission::new_bindings_with_limit(
                 cli.admitted_publishers.clone(),
                 cli.publisher_session_cap,
+            )?
+        }
+        ListenerSecurityPolicy::MutualTlsRelaySubscriber => {
+            anyhow::ensure!(
+                cli.admitted_subscribe_token_sha256.is_empty(),
+                "subscribe token digests are only valid for token-subscriber listeners"
+            );
+            anyhow::ensure!(
+                cli.admitted_publishers.is_empty(),
+                "publisher bindings are only valid for mTLS publisher listeners"
+            );
+            CertificateFingerprintAdmission::new_relay_subscriber_bindings_with_limit(
+                cli.admitted_relay_subscribers.clone(),
+                cli.relay_subscriber_session_cap,
             )?
         }
         ListenerSecurityPolicy::TokenSubscriber
@@ -348,8 +375,8 @@ async fn main() -> anyhow::Result<()> {
                 "the built-in static token allowlist is non-production; embed Relay with an external replay- and lease-aware SessionAdmission policy"
             );
             anyhow::ensure!(
-                cli.admitted_publishers.is_empty(),
-                "mTLS publisher bindings are only valid for mTLS publisher listeners"
+                cli.admitted_publishers.is_empty() && cli.admitted_relay_subscribers.is_empty(),
+                "mTLS certificate bindings are only valid for mTLS listeners"
             );
             SetupTokenAdmission::new(cli.admitted_subscribe_token_sha256.clone())?
         }
@@ -357,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(cli.dev, "development listener policy requires --dev");
             anyhow::ensure!(
                 cli.admitted_publishers.is_empty()
+                    && cli.admitted_relay_subscribers.is_empty()
                     && cli.admitted_subscribe_token_sha256.is_empty(),
                 "development allow-all cannot be combined with production identity allowlists"
             );
@@ -515,6 +543,33 @@ mod cli_tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("raw-quic-token-subscriber"));
         assert!(help.contains("token-subscriber"));
+    }
+
+    #[test]
+    fn mtls_relay_subscriber_has_distinct_bindings_and_capacity_flags() {
+        let binding = format!("{}=/tenant/live", "42".repeat(32));
+        let cli = Cli::try_parse_from([
+            "moq-relay-ietf",
+            "--listener-security",
+            "mutual-tls-relay-subscriber",
+            "--admit-relay-subscriber",
+            &binding,
+            "--relay-subscriber-session-cap",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.listener_security,
+            Some(ListenerSecurityPolicy::MutualTlsRelaySubscriber)
+        );
+        assert_eq!(cli.admitted_relay_subscribers, vec![binding]);
+        assert_eq!(cli.relay_subscriber_session_cap, 7);
+        assert!(cli.admitted_publishers.is_empty());
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("mutual-tls-relay-subscriber"));
+        assert!(help.contains("--admit-relay-subscriber"));
+        assert!(help.contains("--relay-subscriber-session-cap"));
     }
 
     #[test]

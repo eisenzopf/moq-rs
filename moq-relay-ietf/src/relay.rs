@@ -165,7 +165,8 @@ fn listener_decision_is_valid(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(u64::MAX, |duration| duration.as_secs());
     match policy {
-        ListenerSecurityPolicy::MutualTlsPublisher => {
+        ListenerSecurityPolicy::MutualTlsPublisher
+        | ListenerSecurityPolicy::MutualTlsRelaySubscriber => {
             peer_identity.is_authenticated()
                 && decision_matches_listener_role(policy, decision, production, now)
         }
@@ -188,6 +189,11 @@ fn listener_session_is_allowed(
     match policy {
         ListenerSecurityPolicy::MutualTlsPublisher => {
             substrate == moq_transport::session::Transport::RawQuic
+        }
+        ListenerSecurityPolicy::MutualTlsRelaySubscriber => {
+            substrate == moq_transport::session::Transport::RawQuic
+                && negotiated_protocol.as_bytes() == moq_transport::setup::ALPN
+                && setup_authorization.is_none()
         }
         ListenerSecurityPolicy::TokenSubscriber => {
             substrate == moq_transport::session::Transport::WebTransport
@@ -215,6 +221,14 @@ fn decision_matches_listener_role(
                 && decision.claims.publish
                 && !decision.claims.subscribe
                 && decision.claims.scope.is_some()
+        }
+        ListenerSecurityPolicy::MutualTlsRelaySubscriber => {
+            decision.principal.method == crate::AuthenticationMethod::MutualTls
+                && decision.claims.subscribe
+                && !decision.claims.publish
+                && decision.claims.scope.is_some()
+                && decision.claims.expires_at_unix_seconds.is_none()
+                && decision.claims.token_id.is_none()
         }
         ListenerSecurityPolicy::TokenSubscriber
         | ListenerSecurityPolicy::RawQuicTokenSubscriber => {
@@ -1167,7 +1181,8 @@ impl Relay {
         }
 
         let required_client_auth = match config.listener_security {
-            ListenerSecurityPolicy::MutualTlsPublisher => {
+            ListenerSecurityPolicy::MutualTlsPublisher
+            | ListenerSecurityPolicy::MutualTlsRelaySubscriber => {
                 moq_native_ietf::tls::ClientAuthMode::Required
             }
             ListenerSecurityPolicy::TokenSubscriber
@@ -1788,6 +1803,7 @@ mod security_tests {
     struct CountingCoordinator {
         resolve_calls: AtomicUsize,
         mutation_calls: AtomicUsize,
+        lookup_calls: AtomicUsize,
         resolved_scope: Option<&'static str>,
         resolve_started: Option<Arc<tokio::sync::Semaphore>>,
         resolve_release: Option<Arc<tokio::sync::Semaphore>>,
@@ -1843,6 +1859,7 @@ mod security_tests {
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
         ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
             Err(CoordinatorError::NamespaceNotFound)
         }
     }
@@ -2704,7 +2721,7 @@ mod security_tests {
     }
 
     #[test]
-    fn mtls_publisher_role_rejects_custom_subscribe_claim() {
+    fn mtls_certificate_roles_enforce_exact_least_privilege_claims() {
         let principal =
             || AdmissionPrincipal::new("custom-mtls", AuthenticationMethod::MutualTls).unwrap();
         let publisher = AdmissionDecision::new(
@@ -2738,6 +2755,73 @@ mod security_tests {
             &bidirectional,
             true,
             0,
+        ));
+
+        let subscriber = AdmissionDecision::new(
+            principal(),
+            AdmissionClaims {
+                scope: Some("/tenant/live".into()),
+                publish: false,
+                subscribe: true,
+                expires_at_unix_seconds: None,
+                token_id: None,
+            },
+        )
+        .unwrap();
+        assert!(decision_matches_listener_role(
+            ListenerSecurityPolicy::MutualTlsRelaySubscriber,
+            &subscriber,
+            true,
+            0,
+        ));
+        assert!(!decision_matches_listener_role(
+            ListenerSecurityPolicy::MutualTlsRelaySubscriber,
+            &publisher,
+            true,
+            0,
+        ));
+        assert!(!decision_matches_listener_role(
+            ListenerSecurityPolicy::MutualTlsRelaySubscriber,
+            &bidirectional,
+            true,
+            0,
+        ));
+
+        let token_metadata = AdmissionDecision::new(
+            principal(),
+            AdmissionClaims {
+                token_id: Some("unexpected-token".into()),
+                ..subscriber.claims.clone()
+            },
+        )
+        .unwrap();
+        assert!(!decision_matches_listener_role(
+            ListenerSecurityPolicy::MutualTlsRelaySubscriber,
+            &token_metadata,
+            true,
+            0,
+        ));
+    }
+
+    #[test]
+    fn mtls_relay_subscriber_requires_raw_quic_draft_19_without_setup_token() {
+        let policy = ListenerSecurityPolicy::MutualTlsRelaySubscriber;
+        let raw = moq_transport::session::Transport::RawQuic;
+        let webtransport = moq_transport::session::Transport::WebTransport;
+        let protocol = std::str::from_utf8(moq_transport::setup::ALPN).unwrap();
+        assert!(listener_session_is_allowed(policy, raw, protocol, None));
+        assert!(!listener_session_is_allowed(
+            policy,
+            webtransport,
+            protocol,
+            None
+        ));
+        assert!(!listener_session_is_allowed(policy, raw, "moqt-18", None));
+        assert!(!listener_session_is_allowed(
+            policy,
+            raw,
+            protocol,
+            Some(&SetupAuthorization::new(b"ambiguous-auth").unwrap()),
         ));
     }
 
@@ -3124,6 +3208,20 @@ mod security_tests {
     }
 
     async fn start_production_mtls_relay() -> anyhow::Result<(RunningRelay, quic::Client)> {
+        start_production_mtls_relay_with_role(ListenerSecurityPolicy::MutualTlsPublisher).await
+    }
+
+    async fn start_production_mtls_relay_with_role(
+        listener_security: ListenerSecurityPolicy,
+    ) -> anyhow::Result<(RunningRelay, quic::Client)> {
+        anyhow::ensure!(
+            matches!(
+                listener_security,
+                ListenerSecurityPolicy::MutualTlsPublisher
+                    | ListenerSecurityPolicy::MutualTlsRelaySubscriber
+            ),
+            "production mTLS helper requires a certificate listener"
+        );
         let pki = production_pki()?;
         let tls = tls::Args {
             cert: vec![pki.server_cert.clone()],
@@ -3149,10 +3247,18 @@ mod security_tests {
             resolved_scope: Some("/secure"),
             ..Default::default()
         });
-        let admission = crate::CertificateFingerprintAdmission::new_bindings_with_limit(
-            [format!("{}=/secure", pki.client_fingerprint)],
-            4,
-        )?;
+        let bindings = [format!("{}=/secure", pki.client_fingerprint)];
+        let admission = match listener_security {
+            ListenerSecurityPolicy::MutualTlsPublisher => {
+                crate::CertificateFingerprintAdmission::new_bindings_with_limit(bindings, 4)?
+            }
+            ListenerSecurityPolicy::MutualTlsRelaySubscriber => {
+                crate::CertificateFingerprintAdmission::new_relay_subscriber_bindings_with_limit(
+                    bindings, 4,
+                )?
+            }
+            _ => unreachable!("mTLS helper role was validated above"),
+        };
         let relay = Relay::new(RelayConfig {
             bind: None,
             endpoints: vec![endpoint],
@@ -3164,7 +3270,7 @@ mod security_tests {
             coordinator: coordinator.clone(),
             admission,
             development: false,
-            listener_security: ListenerSecurityPolicy::MutualTlsPublisher,
+            listener_security,
             setup_timeout: Duration::from_secs(1),
             admission_timeout: Duration::from_secs(1),
             cleanup_timeout: Duration::from_millis(200),
@@ -3297,6 +3403,28 @@ mod security_tests {
         Ok((raw, tokio::spawn(session.run())))
     }
 
+    async fn connect_production_full_session(
+        client: &quic::Client,
+        target: &moq_transport::session::SessionTarget,
+    ) -> anyhow::Result<(
+        web_transport::Session,
+        moq_transport::session::Publisher,
+        moq_transport::session::Subscriber,
+        tokio::task::JoinHandle<Result<(), moq_transport::session::SessionError>>,
+    )> {
+        let connection = client
+            .connect_target(target, quic::SubstratePolicy::RawQuic, None)
+            .await?;
+        let raw = connection.session.clone();
+        let (session, publisher, subscriber) = moq_transport::session::Session::connect(
+            connection.session,
+            None,
+            connection.negotiated,
+        )
+        .await?;
+        Ok((raw, publisher, subscriber, tokio::spawn(session.run())))
+    }
+
     #[tokio::test]
     async fn admission_denial_precedes_coordinator_mutation_and_cleans_up() -> anyhow::Result<()> {
         let admission = RecordingAdmission::deny();
@@ -3375,6 +3503,72 @@ mod security_tests {
                 .await?;
         wait_for_counter(&relay.coordinator.resolve_calls, 2).await?;
         close_established_session(raw, task, "production mTLS listener health check").await?;
+
+        relay.shutdown.cancel();
+        relay.task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_mtls_relay_subscriber_can_subscribe_but_cannot_publish(
+    ) -> anyhow::Result<()> {
+        let (relay, client) =
+            start_production_mtls_relay_with_role(ListenerSecurityPolicy::MutualTlsRelaySubscriber)
+                .await?;
+
+        let (raw, mut publisher, mut subscriber, task) =
+            connect_production_full_session(&client, &relay.target).await?;
+        wait_for_counter(&relay.coordinator.resolve_calls, 1).await?;
+
+        let namespace = TrackNamespace::from_utf8_path("tenant/live");
+        let (track_writer, _track_reader) =
+            moq_transport::serve::Track::new(namespace.clone(), "audio/main").produce();
+        // The test coordinator deliberately has no origin. Reaching lookup
+        // proves the subscribe request traversed the authorized Producer path
+        // rather than the disabled-role rejection loop.
+        assert!(subscriber.subscribe_open(track_writer).await.is_err());
+        wait_for_counter(&relay.coordinator.lookup_calls, 1).await?;
+
+        let publication = publisher.publish_namespace_open(namespace.clone()).await?;
+        assert!(publication
+            .accepted_with_timeout(Duration::from_secs(1))
+            .await
+            .is_err());
+        assert_eq!(relay.coordinator.mutation_calls.load(Ordering::SeqCst), 0);
+
+        // Publish rejection is request-scoped: the authenticated subscriber
+        // connection remains usable for a later subscription.
+        let (track_writer, _track_reader) =
+            moq_transport::serve::Track::new(namespace, "catalog").produce();
+        assert!(subscriber.subscribe_open(track_writer).await.is_err());
+        wait_for_counter(&relay.coordinator.lookup_calls, 2).await?;
+
+        drop(publication);
+        drop(publisher);
+        drop(subscriber);
+        close_established_session(raw, task, "mTLS relay subscriber test complete").await?;
+
+        expect_rejected_without_setup_authorization_policy(
+            &client,
+            &relay.target,
+            quic::SubstratePolicy::WebTransport,
+            moq_transport::session::SessionTerminationCode::Unauthorized,
+        )
+        .await?;
+        let cross_scope: moq_transport::session::SessionTarget = format!(
+            "moqt://localhost:{}/other-tenant",
+            relay.target.port().unwrap()
+        )
+        .parse()?;
+        expect_rejected_without_setup_authorization_policy(
+            &client,
+            &cross_scope,
+            quic::SubstratePolicy::RawQuic,
+            moq_transport::session::SessionTerminationCode::Unauthorized,
+        )
+        .await?;
+        assert_eq!(relay.coordinator.resolve_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(relay.coordinator.mutation_calls.load(Ordering::SeqCst), 0);
 
         relay.shutdown.cancel();
         relay.task.await??;
@@ -4475,12 +4669,17 @@ mod security_tests {
         }
         .load()
         .unwrap();
-        assert!(Relay::new(config(
-            optional,
-            Arc::new(crate::DenyAllAdmission),
+        for listener_security in [
             ListenerSecurityPolicy::MutualTlsPublisher,
-        ))
-        .is_err());
+            ListenerSecurityPolicy::MutualTlsRelaySubscriber,
+        ] {
+            assert!(Relay::new(config(
+                optional.clone(),
+                Arc::new(crate::DenyAllAdmission),
+                listener_security,
+            ))
+            .is_err());
+        }
 
         let development = development_tls().unwrap();
         assert!(Relay::new(config(

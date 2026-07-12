@@ -16,6 +16,11 @@ use ring::rand::SecureRandom;
 pub enum ListenerSecurityPolicy {
     /// Relay/origin ingress: verified client certificate and publish claim.
     MutualTlsPublisher,
+    /// Relay-to-relay upstream ingress: verified client certificate and an
+    /// exact subscribe-only claim. This is deliberately distinct from the
+    /// origin publisher role so a relay pulling media cannot publish into the
+    /// upstream namespace.
+    MutualTlsRelaySubscriber,
     /// Browser listener ingress: mandatory SETUP token and subscribe-only
     /// claim over WebTransport.
     TokenSubscriber,
@@ -427,6 +432,38 @@ impl SessionAdmission for DevelopmentAllowAllAdmission {
 pub struct CertificateFingerprintAdmission {
     bindings: HashMap<[u8; 32], HashSet<String>>,
     capacity: HashMap<[u8; 32], Arc<tokio::sync::Semaphore>>,
+    role: CertificateAdmissionRole,
+}
+
+/// Least-privilege capability profile attached to a certificate allowlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CertificateAdmissionRole {
+    /// Origin or gateway may publish, but cannot subscribe.
+    Publisher,
+    /// Downstream relay may subscribe or fetch, but cannot publish.
+    RelaySubscriber,
+}
+
+impl CertificateAdmissionRole {
+    const fn claims(self, scope: String) -> AdmissionClaims {
+        AdmissionClaims {
+            scope: Some(scope),
+            publish: matches!(self, Self::Publisher),
+            subscribe: matches!(self, Self::RelaySubscriber),
+            expires_at_unix_seconds: None,
+            token_id: None,
+        }
+    }
+
+    fn matches(self, decision: &AdmissionDecision) -> bool {
+        decision.principal.method == AuthenticationMethod::MutualTls
+            && decision.claims.scope.is_some()
+            && decision.claims.publish == matches!(self, Self::Publisher)
+            && decision.claims.subscribe == matches!(self, Self::RelaySubscriber)
+            && decision.claims.expires_at_unix_seconds.is_none()
+            && decision.claims.token_id.is_none()
+    }
 }
 
 struct FingerprintAdmissionLease {
@@ -472,15 +509,52 @@ impl CertificateFingerprintAdmission {
         bindings: impl IntoIterator<Item = String>,
         max_active_sessions_per_fingerprint: usize,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::new_bindings_for_role_with_limit(
+            bindings,
+            CertificateAdmissionRole::Publisher,
+            max_active_sessions_per_fingerprint,
+        )
+    }
+
+    /// Create subscribe-only relay/upstream certificate bindings.
+    pub fn new_relay_subscriber_bindings(
+        bindings: impl IntoIterator<Item = String>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_relay_subscriber_bindings_with_limit(bindings, 100)
+    }
+
+    /// Create subscribe-only relay/upstream certificate bindings with an
+    /// explicit per-fingerprint active-session bound.
+    pub fn new_relay_subscriber_bindings_with_limit(
+        bindings: impl IntoIterator<Item = String>,
+        max_active_sessions_per_fingerprint: usize,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_bindings_for_role_with_limit(
+            bindings,
+            CertificateAdmissionRole::RelaySubscriber,
+            max_active_sessions_per_fingerprint,
+        )
+    }
+
+    /// Create bindings for one explicit certificate capability profile.
+    ///
+    /// A single policy instance cannot mix publisher and relay-subscriber
+    /// certificates. Deploy them on role-separated listeners so TLS posture,
+    /// request routing, and capacity remain independently auditable.
+    pub fn new_bindings_for_role_with_limit(
+        bindings: impl IntoIterator<Item = String>,
+        role: CertificateAdmissionRole,
+        max_active_sessions_per_fingerprint: usize,
+    ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(
             max_active_sessions_per_fingerprint > 0,
             "per-fingerprint active-session limit must be positive"
         );
         let mut allowed = HashMap::<[u8; 32], HashSet<String>>::new();
         for binding in bindings {
-            let (fingerprint, scope) = binding
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("publisher bindings must use SHA256=/path/scope"))?;
+            let (fingerprint, scope) = binding.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("certificate bindings must use SHA256=/path/scope")
+            })?;
             let normalized = fingerprint.trim().to_ascii_lowercase();
             anyhow::ensure!(
                 normalized.len() == 64,
@@ -496,13 +570,13 @@ impl CertificateFingerprintAdmission {
                 scope.starts_with('/')
                     && !scope.contains(['?', '#'])
                     && scope.len() <= AdmissionClaims::MAX_SCOPE_BYTES,
-                "publisher scopes must be bounded path-only values beginning with '/'"
+                "certificate scopes must be bounded path-only values beginning with '/'"
             );
             allowed.entry(fingerprint).or_default().insert(scope);
         }
         anyhow::ensure!(
             !allowed.is_empty(),
-            "at least one publisher binding is required"
+            "at least one certificate binding is required"
         );
         let capacity = allowed
             .keys()
@@ -518,6 +592,7 @@ impl CertificateFingerprintAdmission {
         Ok(Arc::new(Self {
             bindings: allowed,
             capacity,
+            role,
         }))
     }
 
@@ -542,13 +617,7 @@ impl CertificateFingerprintAdmission {
                 AuthenticationMethod::MutualTls,
             )
             .map_err(|_| AdmissionError::PolicyDenied)?,
-            AdmissionClaims {
-                scope: Some(target.path().to_string()),
-                publish: true,
-                subscribe: false,
-                expires_at_unix_seconds: None,
-                token_id: None,
-            },
+            self.role.claims(target.path().to_string()),
         )
         .map_err(|_| AdmissionError::PolicyDenied)
     }
@@ -575,6 +644,9 @@ impl SessionAdmission for CertificateFingerprintAdmission {
         &self,
         decision: &AdmissionDecision,
     ) -> Result<Box<dyn AdmissionLease>, AdmissionError> {
+        if !self.role.matches(decision) {
+            return Err(AdmissionError::PolicyDenied);
+        }
         let fingerprint: [u8; 32] = decision
             .principal
             .subject()
@@ -582,6 +654,18 @@ impl SessionAdmission for CertificateFingerprintAdmission {
             .and_then(|value| hex::decode(value).ok())
             .and_then(|value| value.try_into().ok())
             .ok_or(AdmissionError::PolicyDenied)?;
+        let scope = decision
+            .claims
+            .scope
+            .as_deref()
+            .ok_or(AdmissionError::PolicyDenied)?;
+        if !self
+            .bindings
+            .get(&fingerprint)
+            .is_some_and(|scopes| scopes.contains(scope))
+        {
+            return Err(AdmissionError::PolicyDenied);
+        }
         let permit = self
             .capacity
             .get(&fingerprint)
@@ -797,6 +881,75 @@ mod tests {
         assert_eq!(
             policy.admit_verified_fingerprint(&fingerprint, &query),
             Err(AdmissionError::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn relay_subscriber_certificate_policy_is_scope_bound_and_subscribe_only() {
+        let fingerprint = [0x24; 32];
+        let policy = CertificateFingerprintAdmission::new_relay_subscriber_bindings([format!(
+            "{}=/tenant-a/live",
+            hex::encode(fingerprint)
+        )])
+        .unwrap();
+        let allowed: SessionTarget = "moqt://relay.example/tenant-a/live".parse().unwrap();
+        let decision = policy
+            .admit_verified_fingerprint(&fingerprint, &allowed)
+            .unwrap();
+        assert_eq!(decision.claims.scope.as_deref(), Some("/tenant-a/live"));
+        assert!(!decision.claims.publish);
+        assert!(decision.claims.subscribe);
+        assert_eq!(decision.principal.method, AuthenticationMethod::MutualTls);
+
+        let cross_scope: SessionTarget = "moqt://relay.example/tenant-b/live".parse().unwrap();
+        assert_eq!(
+            policy.admit_verified_fingerprint(&fingerprint, &cross_scope),
+            Err(AdmissionError::PolicyDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_lease_rejects_capability_or_scope_escalation() {
+        let fingerprint = [0x24; 32];
+        let policy = CertificateFingerprintAdmission::new_relay_subscriber_bindings([format!(
+            "{}=/tenant-a/live",
+            hex::encode(fingerprint)
+        )])
+        .unwrap();
+        let allowed: SessionTarget = "moqt://relay.example/tenant-a/live".parse().unwrap();
+        let decision = policy
+            .admit_verified_fingerprint(&fingerprint, &allowed)
+            .unwrap();
+        assert!(policy.acquire_session_lease(&decision).await.is_ok());
+
+        let publish_escalation = AdmissionDecision::new(
+            decision.principal.clone(),
+            AdmissionClaims {
+                publish: true,
+                subscribe: false,
+                ..decision.claims.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policy
+                .acquire_session_lease(&publish_escalation)
+                .await
+                .err(),
+            Some(AdmissionError::PolicyDenied)
+        );
+
+        let scope_escalation = AdmissionDecision::new(
+            decision.principal,
+            AdmissionClaims {
+                scope: Some("/tenant-b/live".to_owned()),
+                ..decision.claims
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policy.acquire_session_lease(&scope_escalation).await.err(),
+            Some(AdmissionError::PolicyDenied)
         );
     }
 

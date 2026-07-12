@@ -60,9 +60,49 @@ Production relay embedders must now configure:
 - a bounded `max_active_sessions` and policy-owned `AdmissionLease` capacity;
 - setup, admission, cleanup, token-revalidation, and admitted-session close deadlines.
 
-The built-in fingerprint policy supports `new_bindings_with_limit`. Production token listeners require an external replay-, expiry-, revocation-, and capacity-aware policy. That policy must atomically return an `AdmittedSession` from `SessionAdmission::admit_session`, and its lease must implement periodic revalidation plus idempotent, cancellation-safe `close`. Admission runs in a supervised owned task: a client deadline does not cancel a policy after it may have claimed replay state, and a late grant is immediately sent through the same bounded finalizer. Policy I/O must be internally bounded and eventually settle. The relay keeps global and policy capacity held until the close hook either completes or reaches `session_close_timeout`; backend timeout and cancellation paths must remain fail-closed. A finalization guard transfers ownership to the reaper if a connection task is cancelled or unwinds. Legacy policies retain composed admission and no-op close defaults, but cannot advertise the capability flags required by a production token listener.
+The built-in fingerprint policy supports publisher bindings through
+`new_bindings_with_limit` and subscribe-only relay/upstream bindings through
+`new_relay_subscriber_bindings_with_limit`. These are deliberately separate
+certificate roles: a publisher certificate cannot subscribe, a relay
+subscriber certificate cannot publish, and neither role can be elevated by a
+forged admission decision or scope. Production token listeners require an
+external replay-, expiry-, revocation-, and capacity-aware policy. That policy
+must atomically return an `AdmittedSession` from
+`SessionAdmission::admit_session`, and its lease must implement periodic
+revalidation plus idempotent, cancellation-safe `close`. Admission runs in a
+supervised owned task: a client deadline does not cancel a policy after it may
+have claimed replay state, and a late grant is immediately sent through the
+same bounded finalizer. Policy I/O must be internally bounded and eventually
+settle. The relay keeps global and policy capacity held until the close hook
+either completes or reaches `session_close_timeout`; backend timeout and
+cancellation paths must remain fail-closed. A finalization guard transfers
+ownership to the reaper if a connection task is cancelled or unwinds. Legacy
+policies retain composed admission and no-op close defaults, but cannot
+advertise the capability flags required by a production token listener.
 
-Every accepted session receives a fresh 128-bit server-generated `AdmissionSessionId`. It is independent of peer-controlled QUIC connection IDs and is available to the admission backend for replay ownership. The listener/substrate matrix is intentionally strict: mTLS publisher listeners accept raw QUIC; `token-subscriber` listeners accept WebTransport; `raw-quic-token-subscriber` listeners accept native raw QUIC; and development listeners may accept either. Both token listener variants require a non-empty SETUP authorization value, subscribe-only claims, and the pinned `moqt-19` protocol. A substrate, protocol, or authorization mismatch is rejected before replay or distributed quota state is mutated.
+Every accepted session receives a fresh 128-bit server-generated
+`AdmissionSessionId`. It is independent of peer-controlled QUIC connection IDs
+and is available to the admission backend for replay ownership. The
+listener/substrate matrix is intentionally strict: mTLS publisher listeners
+accept raw QUIC; mTLS relay-subscriber listeners accept raw QUIC with the
+pinned `moqt-19` ALPN and no SETUP authorization; `token-subscriber` listeners
+accept WebTransport; `raw-quic-token-subscriber` listeners accept native raw
+QUIC; and development listeners may accept either. The certificate roles use
+verified peer fingerprints and exact scope bindings. Both token listener
+variants require a non-empty SETUP authorization value, subscribe-only claims,
+and the pinned `moqt-19` protocol. A substrate, protocol, authorization, role,
+or scope mismatch is rejected before replay or distributed quota state is
+mutated.
+
+For an external relay tier, run the upstream listener with
+`--listener-security mutual-tls-relay-subscriber`, one or more
+`--admit-relay-subscriber SHA256=/tenant/broadcast` bindings, required client
+authentication, and a relay-specific session cap. Configure the downstream
+relay's native QUIC client with the matching client certificate/key and verified
+upstream roots. Keep this endpoint separate from the origin publisher endpoint;
+the relay-subscriber identity is receive-only and cannot announce or publish a
+namespace. The outbound `RemoteManager` subscriber session is the intended
+integration seam for rvoip.
 
 The two production token modes deliberately use the same atomic admission and lease lifecycle. The raw-QUIC variant does not enable publishing for an anonymous TLS peer: an admitted decision containing a publish claim is rejected and its lease is finalized before coordinator or media mutation. Run browser and native subscriber listeners as separate relay processes or endpoints when their exposure or rate limits differ.
 
